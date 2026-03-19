@@ -13,7 +13,6 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class SpoutPollingService : IAsyncDisposable
 {
     private readonly object _startGate = new();
-    private static readonly long PollingIntervalTicks = (long)Math.Round(Stopwatch.Frequency / 120.0);
 
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
@@ -111,7 +110,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
                     }
 
-                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
                 }
 
@@ -119,7 +118,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 var senderHeight = receiver.SenderHeight;
                 if (senderWidth == 0 || senderHeight == 0)
                 {
-                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
                 }
 
@@ -155,13 +154,13 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         receiver.SenderFps,
                         message));
 
-                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
                 }
 
                 if (!receiver.IsFrameNew)
                 {
-                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
                 }
 
@@ -193,7 +192,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             width = 0;
                             height = 0;
                             ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
-                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                            WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                             continue;
                         }
 
@@ -202,7 +201,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             width = receiveWidth;
                             height = receiveHeight;
                             ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
-                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                            WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                             continue;
                         }
                     }
@@ -231,7 +230,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     receiver.SenderFps,
                     Stopwatch.GetTimestamp(),
                     DateTimeOffset.UtcNow));
-                WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -274,9 +273,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         receiveBufferLength = 0;
     }
 
-    private static void WaitUntilNextPoll(ref long nextPollTicks, CancellationToken cancellationToken)
+    private static void WaitUntilNextPoll(ref long nextPollTicks, double senderFps, CancellationToken cancellationToken)
     {
-        nextPollTicks += PollingIntervalTicks;
+        nextPollTicks += GetPollingIntervalTicks(senderFps);
 
         while (true)
         {
@@ -297,5 +296,13 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
             Thread.SpinWait(128);
         }
+    }
+
+    private static long GetPollingIntervalTicks(double senderFps)
+    {
+        var targetFps = senderFps > 1.0
+            ? Math.Min(senderFps, 120.0)
+            : 120.0;
+        return (long)Math.Round(Stopwatch.Frequency / targetFps);
     }
 }

@@ -39,9 +39,9 @@ internal sealed class EncoderOption
         return Kind switch
         {
             EncoderProfileKind.PngMov =>
-                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode vfr -c:v png -pred mixed -pix_fmt rgba -movflags +faststart {Quote(outputPath)}",
+                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode passthrough -enc_time_base:v 1:120000 -c:v png -pred mixed -pix_fmt rgba -movflags +faststart -video_track_timescale 120000 {Quote(outputPath)}",
             EncoderProfileKind.Ffv1Mkv =>
-                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode vfr -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
+                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode passthrough -enc_time_base:v 1:120000 -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
             _ => throw new InvalidOperationException($"Unknown encoder kind: {Kind}")
         };
     }

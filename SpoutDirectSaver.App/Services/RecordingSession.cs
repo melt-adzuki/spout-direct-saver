@@ -19,6 +19,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly EncoderOption _encoderOption;
     private readonly string _outputPath;
     private readonly string _temporaryDirectory;
+    private readonly string _spoolPath;
     private readonly List<RecordedFrame> _frames = [];
     private readonly Channel<FrameWriteRequest> _writeChannel;
     private readonly Task _writerTask;
@@ -39,10 +40,11 @@ internal sealed class RecordingSession : IAsyncDisposable
             Path.GetTempPath(),
             "SpoutDirectSaver",
             Guid.NewGuid().ToString("N"));
+        _spoolPath = Path.Combine(_temporaryDirectory, "frames.rgba");
 
         Directory.CreateDirectory(_temporaryDirectory);
 
-        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(2)
+        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(8)
         {
             SingleReader = true,
             SingleWriter = true,
@@ -150,13 +152,9 @@ internal sealed class RecordingSession : IAsyncDisposable
     private void RegisterFrame(FramePacket frame)
     {
         _frameCounter++;
-        var fileName = $"frame_{_frameCounter:D6}.tga";
-        var absolutePath = Path.Combine(_temporaryDirectory, fileName);
-
         var recordedFrame = new RecordedFrame
         {
-            FileName = fileName,
-            AbsolutePath = absolutePath,
+            FrameIndex = _frameCounter,
             StopwatchTicks = frame.StopwatchTicks,
             TimestampUtc = frame.TimestampUtc
         };
@@ -165,7 +163,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _currentFrame = recordedFrame;
         _lastUniqueFrame = frame.PixelData;
 
-        var request = new FrameWriteRequest(absolutePath, frame.PixelData, frame.Width, frame.Height);
+        var request = new FrameWriteRequest(frame.PixelData);
         if (!_writeChannel.Writer.TryWrite(request))
         {
             _writeChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
@@ -185,58 +183,109 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private async Task WriteFramesAsync()
     {
+        await using var fileStream = new FileStream(
+            _spoolPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.Read,
+            1024 * 1024,
+            FileOptions.SequentialScan);
+
         await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            SaveRgbaFrameAsTga(request);
+            await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
         }
-    }
 
-    private static void SaveRgbaFrameAsTga(FrameWriteRequest request)
-    {
-        var pixelCount = checked((int)(request.Width * request.Height * 4));
-        var rented = ArrayPool<byte>.Shared.Rent(pixelCount);
-
-        try
-        {
-            PixelConversion.ConvertRgbaToBgra(request.PixelData, rented);
-            using var fileStream = new FileStream(request.AbsolutePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072);
-            Span<byte> header = stackalloc byte[18];
-            header[2] = 2;
-            header[12] = (byte)(request.Width & 0xFF);
-            header[13] = (byte)((request.Width >> 8) & 0xFF);
-            header[14] = (byte)(request.Height & 0xFF);
-            header[15] = (byte)((request.Height >> 8) & 0xFF);
-            header[16] = 32;
-            header[17] = 0x28;
-
-            fileStream.Write(header);
-            fileStream.Write(rented, 0, pixelCount);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rented);
-        }
+        await fileStream.FlushAsync().ConfigureAwait(false);
     }
 
     private async Task<string> CreateConcatManifestAsync(IReadOnlyList<RecordedFrame> frames, CancellationToken cancellationToken)
     {
         var manifestPath = Path.Combine(_temporaryDirectory, "frames.ffconcat");
+        var frameSize = checked((int)(_recordedWidth * _recordedHeight * 4));
+        var rgbaBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+        var bgraBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
 
-        await using var writer = new StreamWriter(manifestPath, false);
-        await writer.WriteLineAsync("ffconcat version 1.0").ConfigureAwait(false);
-
-        foreach (var frame in frames)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            await writer.WriteLineAsync($"file '{frame.FileName}'").ConfigureAwait(false);
-            await writer.WriteLineAsync($"duration {frame.DurationSeconds:0.000000}").ConfigureAwait(false);
+            await using var spoolStream = new FileStream(
+                _spoolPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                1024 * 1024,
+                FileOptions.SequentialScan);
+            await using var writer = new StreamWriter(manifestPath, false);
+
+            await writer.WriteLineAsync("ffconcat version 1.0").ConfigureAwait(false);
+
+            foreach (var frame in frames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var imageName = $"frame_{frame.FrameIndex:D6}.tga";
+                var imagePath = Path.Combine(_temporaryDirectory, imageName);
+
+                await ReadExactAsync(spoolStream, rgbaBuffer, frameSize, cancellationToken).ConfigureAwait(false);
+                PixelConversion.ConvertRgbaToBgra(
+                    rgbaBuffer.AsSpan(0, frameSize),
+                    bgraBuffer.AsSpan(0, frameSize));
+                await SaveBgraFrameAsTgaAsync(imagePath, bgraBuffer, frameSize, cancellationToken).ConfigureAwait(false);
+
+                await writer.WriteLineAsync($"file '{imageName}'").ConfigureAwait(false);
+                await writer.WriteLineAsync($"duration {frame.DurationSeconds:0.000000}").ConfigureAwait(false);
+            }
+
+            var lastFrame = frames.Last();
+            await writer.WriteLineAsync($"file 'frame_{lastFrame.FrameIndex:D6}.tga'").ConfigureAwait(false);
+            await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+            return manifestPath;
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rgbaBuffer);
+            ArrayPool<byte>.Shared.Return(bgraBuffer);
+        }
+    }
 
-        var lastFrame = frames.Last();
-        await writer.WriteLineAsync($"file '{lastFrame.FileName}'").ConfigureAwait(false);
-        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+    private async Task SaveBgraFrameAsTgaAsync(string absolutePath, byte[] bgraBuffer, int pixelCount, CancellationToken cancellationToken)
+    {
+        await using var fileStream = new FileStream(
+            absolutePath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            131072,
+            FileOptions.SequentialScan);
+        Span<byte> header = stackalloc byte[18];
+        header[2] = 2;
+        header[12] = (byte)(_recordedWidth & 0xFF);
+        header[13] = (byte)((_recordedWidth >> 8) & 0xFF);
+        header[14] = (byte)(_recordedHeight & 0xFF);
+        header[15] = (byte)((_recordedHeight >> 8) & 0xFF);
+        header[16] = 32;
+        header[17] = 0x28;
 
-        return manifestPath;
+        await fileStream.WriteAsync(header.ToArray(), cancellationToken).ConfigureAwait(false);
+        await fileStream.WriteAsync(bgraBuffer.AsMemory(0, pixelCount), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ReadExactAsync(FileStream stream, byte[] buffer, int bytesToRead, CancellationToken cancellationToken)
+    {
+        var totalRead = 0;
+        while (totalRead < bytesToRead)
+        {
+            var read = await stream.ReadAsync(
+                buffer.AsMemory(totalRead, bytesToRead - totalRead),
+                cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                throw new EndOfStreamException("一時フレームスプールの読み込みが途中で終了しました。");
+            }
+
+            totalRead += read;
+        }
     }
 
     private void ThrowIfCompleted()
@@ -264,9 +313,5 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private sealed record FrameWriteRequest(
-        string AbsolutePath,
-        byte[] PixelData,
-        uint Width,
-        uint Height);
+    private sealed record FrameWriteRequest(byte[] PixelData);
 }
