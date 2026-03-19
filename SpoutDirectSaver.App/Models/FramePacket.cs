@@ -8,4 +8,5 @@ internal sealed record FramePacket(
     uint Height,
     string SenderName,
     double SenderFps,
+    long StopwatchTicks,
     DateTimeOffset TimestampUtc);

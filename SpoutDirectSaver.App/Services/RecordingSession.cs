@@ -1,12 +1,12 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
-using System.Windows.Media.Imaging;
 using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
@@ -42,10 +42,11 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         Directory.CreateDirectory(_temporaryDirectory);
 
-        _writeChannel = Channel.CreateUnbounded<FrameWriteRequest>(new UnboundedChannelOptions
+        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(2)
         {
             SingleReader = true,
-            SingleWriter = false
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
         _writerTask = Task.Run(WriteFramesAsync);
@@ -76,7 +77,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 return;
             }
 
-            FinalizeCurrentFrame(frame.TimestampUtc);
+            FinalizeCurrentFrame(frame.StopwatchTicks);
             RegisterFrame(frame);
         }
     }
@@ -95,7 +96,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 throw new InvalidOperationException("録画中にフレームを受信できませんでした。");
             }
 
-            FinalizeCurrentFrame(DateTimeOffset.UtcNow);
+            FinalizeCurrentFrame(Stopwatch.GetTimestamp());
             _writeChannel.Writer.TryComplete();
             framesToEncode = _frames.ToArray();
         }
@@ -149,13 +150,14 @@ internal sealed class RecordingSession : IAsyncDisposable
     private void RegisterFrame(FramePacket frame)
     {
         _frameCounter++;
-        var fileName = $"frame_{_frameCounter:D6}.png";
+        var fileName = $"frame_{_frameCounter:D6}.tga";
         var absolutePath = Path.Combine(_temporaryDirectory, fileName);
 
         var recordedFrame = new RecordedFrame
         {
             FileName = fileName,
             AbsolutePath = absolutePath,
+            StopwatchTicks = frame.StopwatchTicks,
             TimestampUtc = frame.TimestampUtc
         };
 
@@ -163,21 +165,21 @@ internal sealed class RecordingSession : IAsyncDisposable
         _currentFrame = recordedFrame;
         _lastUniqueFrame = frame.PixelData;
 
-        _writeChannel.Writer.TryWrite(new FrameWriteRequest(
-            absolutePath,
-            frame.PixelData,
-            frame.Width,
-            frame.Height));
+        var request = new FrameWriteRequest(absolutePath, frame.PixelData, frame.Width, frame.Height);
+        if (!_writeChannel.Writer.TryWrite(request))
+        {
+            _writeChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
+        }
     }
 
-    private void FinalizeCurrentFrame(DateTimeOffset completedAtUtc)
+    private void FinalizeCurrentFrame(long completedStopwatchTicks)
     {
         if (_currentFrame is null)
         {
             return;
         }
 
-        var duration = (completedAtUtc - _currentFrame.TimestampUtc).TotalSeconds;
+        var duration = (completedStopwatchTicks - _currentFrame.StopwatchTicks) / (double)Stopwatch.Frequency;
         _currentFrame.DurationSeconds = Math.Max(duration, MinimumFrameDurationSeconds);
     }
 
@@ -185,11 +187,11 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            SaveRgbaFrameAsPng(request);
+            SaveRgbaFrameAsTga(request);
         }
     }
 
-    private static void SaveRgbaFrameAsPng(FrameWriteRequest request)
+    private static void SaveRgbaFrameAsTga(FrameWriteRequest request)
     {
         var pixelCount = checked((int)(request.Width * request.Height * 4));
         var rented = ArrayPool<byte>.Shared.Rent(pixelCount);
@@ -197,26 +199,18 @@ internal sealed class RecordingSession : IAsyncDisposable
         try
         {
             PixelConversion.ConvertRgbaToBgra(request.PixelData, rented);
+            using var fileStream = new FileStream(request.AbsolutePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072);
+            Span<byte> header = stackalloc byte[18];
+            header[2] = 2;
+            header[12] = (byte)(request.Width & 0xFF);
+            header[13] = (byte)((request.Width >> 8) & 0xFF);
+            header[14] = (byte)(request.Height & 0xFF);
+            header[15] = (byte)((request.Height >> 8) & 0xFF);
+            header[16] = 32;
+            header[17] = 0x28;
 
-            var bitmap = BitmapSource.Create(
-                (int)request.Width,
-                (int)request.Height,
-                96,
-                96,
-                System.Windows.Media.PixelFormats.Bgra32,
-                null,
-                rented,
-                (int)request.Width * 4);
-
-            bitmap.Freeze();
-
-            using var fileStream = File.Create(request.AbsolutePath);
-            var encoder = new PngBitmapEncoder
-            {
-                Interlace = PngInterlaceOption.Off
-            };
-            encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            encoder.Save(fileStream);
+            fileStream.Write(header);
+            fileStream.Write(rented, 0, pixelCount);
         }
         finally
         {

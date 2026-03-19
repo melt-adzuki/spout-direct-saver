@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Spout.Interop;
@@ -10,7 +11,7 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class SpoutPollingService : IAsyncDisposable
 {
     private readonly object _startGate = new();
-    private const int PollingIntervalMs = (int)(1000.0 / 120.0);
+    private static readonly long PollingIntervalTicks = (long)Math.Round(Stopwatch.Frequency / 120.0);
 
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
@@ -86,6 +87,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         string senderName = string.Empty;
         uint width = 0;
         uint height = 0;
+        long nextPollTicks = Stopwatch.GetTimestamp();
 
         try
         {
@@ -108,7 +110,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             receiveBuffer = null;
                         }
 
-                        Thread.Sleep(PollingIntervalMs);
+                        WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                         continue;
                     }
                     else if (connected || receiver.IsConnected)
@@ -118,7 +120,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         height = receiver.SenderHeight;
                         if (width == 0 || height == 0)
                         {
-                            Thread.Sleep(PollingIntervalMs);
+                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                             continue;
                         }
                         receiveBuffer = new byte[checked((int)(width * height * 4))];
@@ -137,7 +139,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                 if (receiveBuffer is null)
                 {
-                    Thread.Sleep(PollingIntervalMs);
+                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
                 }
 
@@ -154,7 +156,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             width = 0;
                             height = 0;
                             receiveBuffer = null;
-                            Thread.Sleep(PollingIntervalMs);
+                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                             continue;
                         }
                     }
@@ -174,13 +176,13 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         receiver.SenderFps,
                         $"sender の解像度が更新されました: {width} x {height}"));
 
-                    Thread.Sleep(PollingIntervalMs);
+                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
                 }
 
                 if (!receiver.IsFrameNew)
                 {
-                    Thread.Sleep(PollingIntervalMs);
+                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
                 }
 
@@ -205,9 +207,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     height,
                     senderName,
                     receiver.SenderFps,
+                    Stopwatch.GetTimestamp(),
                     DateTimeOffset.UtcNow));
-
-                Thread.Sleep(PollingIntervalMs);
+                WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -224,5 +226,30 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     private void RaiseStatus(CaptureStatus status)
     {
         StatusChanged?.Invoke(this, status);
+    }
+
+    private static void WaitUntilNextPoll(ref long nextPollTicks, CancellationToken cancellationToken)
+    {
+        nextPollTicks += PollingIntervalTicks;
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remainingTicks = nextPollTicks - Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0)
+            {
+                return;
+            }
+
+            var remainingMs = remainingTicks * 1000.0 / Stopwatch.Frequency;
+            if (remainingMs >= 2.0)
+            {
+                Thread.Sleep(1);
+                continue;
+            }
+
+            Thread.SpinWait(128);
+        }
     }
 }
