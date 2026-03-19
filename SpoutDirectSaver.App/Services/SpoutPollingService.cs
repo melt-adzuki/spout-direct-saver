@@ -10,6 +10,7 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class SpoutPollingService : IAsyncDisposable
 {
     private readonly object _startGate = new();
+    private const int PollingIntervalMs = (int)(1000.0 / 120.0);
 
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
@@ -29,10 +30,10 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
             _cancellationTokenSource = new CancellationTokenSource();
             _workerTask = Task.Factory.StartNew(
-                () => RunPollingLoopAsync(_cancellationTokenSource.Token),
+                () => RunPollingLoop(_cancellationTokenSource.Token),
                 _cancellationTokenSource.Token,
                 TaskCreationOptions.LongRunning,
-                TaskScheduler.Default).Unwrap();
+                TaskScheduler.Default);
         }
 
         return Task.CompletedTask;
@@ -70,7 +71,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
     }
 
-    private async Task RunPollingLoopAsync(CancellationToken cancellationToken)
+    private void RunPollingLoop(CancellationToken cancellationToken)
     {
         using var receiver = new SpoutReceiver();
 
@@ -88,10 +89,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
         try
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1.0 / 120.0));
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender を待っています。"));
 
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            while (!cancellationToken.IsCancellationRequested)
             {
                 if (!receiver.IsConnected || width == 0 || height == 0)
                 {
@@ -108,31 +108,36 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             receiveBuffer = null;
                         }
 
+                        Thread.Sleep(PollingIntervalMs);
                         continue;
                     }
-
-                    width = receiver.SenderWidth;
-                    height = receiver.SenderHeight;
-                    if (width == 0 || height == 0)
+                    else if (connected || receiver.IsConnected)
                     {
-                        continue;
+                        // Immediately sync state to prevent re-entry
+                        width = receiver.SenderWidth;
+                        height = receiver.SenderHeight;
+                        if (width == 0 || height == 0)
+                        {
+                            Thread.Sleep(PollingIntervalMs);
+                            continue;
+                        }
+                        receiveBuffer = new byte[checked((int)(width * height * 4))];
+                        senderName = receiver.SenderName;
+                        wasConnected = true;
+                        
+                        RaiseStatus(new CaptureStatus(
+                            true,
+                            senderName,
+                            width,
+                            height,
+                            receiver.SenderFps,
+                            $"Spout sender \"{senderName}\" に接続しました。"));
                     }
-
-                    receiveBuffer = new byte[checked((int)(width * height * 4))];
-                    senderName = receiver.SenderName;
-                    wasConnected = true;
-
-                    RaiseStatus(new CaptureStatus(
-                        true,
-                        senderName,
-                        width,
-                        height,
-                        receiver.SenderFps,
-                        $"Spout sender \"{senderName}\" に接続しました。"));
                 }
 
                 if (receiveBuffer is null)
                 {
+                    Thread.Sleep(PollingIntervalMs);
                     continue;
                 }
 
@@ -149,6 +154,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             width = 0;
                             height = 0;
                             receiveBuffer = null;
+                            Thread.Sleep(PollingIntervalMs);
                             continue;
                         }
                     }
@@ -168,11 +174,13 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         receiver.SenderFps,
                         $"sender の解像度が更新されました: {width} x {height}"));
 
+                    Thread.Sleep(PollingIntervalMs);
                     continue;
                 }
 
                 if (!receiver.IsFrameNew)
                 {
+                    Thread.Sleep(PollingIntervalMs);
                     continue;
                 }
 
@@ -198,6 +206,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     senderName,
                     receiver.SenderFps,
                     DateTimeOffset.UtcNow));
+
+                Thread.Sleep(PollingIntervalMs);
             }
         }
         catch (OperationCanceledException)
