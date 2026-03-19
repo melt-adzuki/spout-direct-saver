@@ -1,9 +1,7 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -28,6 +26,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private byte[]? _lastUniqueFrame;
     private uint _recordedWidth;
     private uint _recordedHeight;
+    private double _nominalSourceFps;
     private int _frameCounter;
     private bool _isCompleted;
     private bool _disposed;
@@ -64,6 +63,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             {
                 _recordedWidth = frame.Width;
                 _recordedHeight = frame.Height;
+                _nominalSourceFps = frame.SenderFps;
                 RegisterFrame(frame);
                 return;
             }
@@ -107,8 +107,15 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             await _writerTask.ConfigureAwait(false);
 
-            var manifestPath = await CreateConcatManifestAsync(framesToEncode, cancellationToken).ConfigureAwait(false);
-            await exportService.ExportAsync(_encoderOption, manifestPath, _outputPath, cancellationToken).ConfigureAwait(false);
+            await exportService.ExportAsync(
+                _encoderOption,
+                _spoolPath,
+                framesToEncode,
+                _recordedWidth,
+                _recordedHeight,
+                GetOutputFrameRate(),
+                _outputPath,
+                cancellationToken).ConfigureAwait(false);
             return _outputPath;
         }
         finally
@@ -199,88 +206,24 @@ internal sealed class RecordingSession : IAsyncDisposable
         await fileStream.FlushAsync().ConfigureAwait(false);
     }
 
-    private async Task<string> CreateConcatManifestAsync(IReadOnlyList<RecordedFrame> frames, CancellationToken cancellationToken)
+    private double GetOutputFrameRate()
     {
-        var manifestPath = Path.Combine(_temporaryDirectory, "frames.ffconcat");
-        var frameSize = checked((int)(_recordedWidth * _recordedHeight * 4));
-        var bgraBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
-
-        try
+        if (_nominalSourceFps >= 100.0)
         {
-            await using var spoolStream = new FileStream(
-                _spoolPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                1024 * 1024,
-                FileOptions.SequentialScan);
-            await using var writer = new StreamWriter(manifestPath, false);
-
-            await writer.WriteLineAsync("ffconcat version 1.0").ConfigureAwait(false);
-
-            foreach (var frame in frames)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var imageName = $"frame_{frame.FrameIndex:D6}.tga";
-                var imagePath = Path.Combine(_temporaryDirectory, imageName);
-
-                await ReadExactAsync(spoolStream, bgraBuffer, frameSize, cancellationToken).ConfigureAwait(false);
-                await SaveBgraFrameAsTgaAsync(imagePath, bgraBuffer, frameSize, cancellationToken).ConfigureAwait(false);
-
-                await writer.WriteLineAsync($"file '{imageName}'").ConfigureAwait(false);
-                await writer.WriteLineAsync($"duration {frame.DurationSeconds:0.000000}").ConfigureAwait(false);
-            }
-
-            var lastFrame = frames.Last();
-            await writer.WriteLineAsync($"file 'frame_{lastFrame.FrameIndex:D6}.tga'").ConfigureAwait(false);
-            await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-            return manifestPath;
+            return 120.0;
         }
-        finally
+
+        if (_nominalSourceFps >= 50.0)
         {
-            ArrayPool<byte>.Shared.Return(bgraBuffer);
+            return 60.0;
         }
-    }
 
-    private async Task SaveBgraFrameAsTgaAsync(string absolutePath, byte[] bgraBuffer, int pixelCount, CancellationToken cancellationToken)
-    {
-        await using var fileStream = new FileStream(
-            absolutePath,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.None,
-            131072,
-            FileOptions.SequentialScan);
-        Span<byte> header = stackalloc byte[18];
-        header[2] = 2;
-        header[12] = (byte)(_recordedWidth & 0xFF);
-        header[13] = (byte)((_recordedWidth >> 8) & 0xFF);
-        header[14] = (byte)(_recordedHeight & 0xFF);
-        header[15] = (byte)((_recordedHeight >> 8) & 0xFF);
-        header[16] = 32;
-        header[17] = 0x28;
-
-        await fileStream.WriteAsync(header.ToArray(), cancellationToken).ConfigureAwait(false);
-        await fileStream.WriteAsync(bgraBuffer.AsMemory(0, pixelCount), cancellationToken).ConfigureAwait(false);
-    }
-
-    private static async Task ReadExactAsync(FileStream stream, byte[] buffer, int bytesToRead, CancellationToken cancellationToken)
-    {
-        var totalRead = 0;
-        while (totalRead < bytesToRead)
+        if (_nominalSourceFps >= 25.0)
         {
-            var read = await stream.ReadAsync(
-                buffer.AsMemory(totalRead, bytesToRead - totalRead),
-                cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                throw new EndOfStreamException("一時フレームスプールの読み込みが途中で終了しました。");
-            }
-
-            totalRead += read;
+            return 30.0;
         }
+
+        return 120.0;
     }
 
     private void ThrowIfCompleted()

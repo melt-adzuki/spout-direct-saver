@@ -34,14 +34,14 @@ internal sealed class EncoderOption
 
     public string FileDialogFilter { get; }
 
-    public string BuildArguments(string manifestPath, string outputPath)
+    public string BuildArguments(uint width, uint height, double frameRate, string outputPath)
     {
         return Kind switch
         {
             EncoderProfileKind.PngMov =>
-                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode passthrough -enc_time_base:v 1:120000 -c:v png -pred mixed -pix_fmt rgba -movflags +faststart -video_track_timescale 120000 {Quote(outputPath)}",
+                $"-y -f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} -i - -an -c:v png -pred mixed -pix_fmt rgba -movflags +faststart -video_track_timescale 120000 {Quote(outputPath)}",
             EncoderProfileKind.Ffv1Mkv =>
-                $"-y -f concat -safe 0 -i {Quote(manifestPath)} -an -fps_mode passthrough -enc_time_base:v 1:120000 -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
+                $"-y -f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
             _ => throw new InvalidOperationException($"Unknown encoder kind: {Kind}")
         };
     }
