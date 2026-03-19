@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using System.Buffers.Binary;
 using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
@@ -24,6 +25,7 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private RecordedFrame? _currentFrame;
     private byte[]? _lastUniqueFrame;
+    private ulong _lastUniqueFingerprint;
     private uint _recordedWidth;
     private uint _recordedHeight;
     private double _nominalSourceFps;
@@ -64,7 +66,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 _recordedWidth = frame.Width;
                 _recordedHeight = frame.Height;
                 _nominalSourceFps = frame.SenderFps;
-                RegisterFrame(frame);
+                RegisterFrame(frame, ComputeFingerprint(frame.PixelData));
                 return;
             }
 
@@ -73,14 +75,16 @@ internal sealed class RecordingSession : IAsyncDisposable
                 throw new InvalidOperationException("録画中に解像度が変わりました。現在の録画は固定解像度のみ対応しています。");
             }
 
+            var fingerprint = ComputeFingerprint(frame.PixelData);
             if (_lastUniqueFrame is not null &&
+                fingerprint == _lastUniqueFingerprint &&
                 _lastUniqueFrame.AsSpan().SequenceEqual(frame.PixelData))
             {
                 return;
             }
 
             FinalizeCurrentFrame(frame.StopwatchTicks);
-            RegisterFrame(frame);
+            RegisterFrame(frame, fingerprint);
         }
     }
 
@@ -156,7 +160,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private void RegisterFrame(FramePacket frame)
+    private void RegisterFrame(FramePacket frame, ulong fingerprint)
     {
         _frameCounter++;
         var recordedFrame = new RecordedFrame
@@ -169,6 +173,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
         _lastUniqueFrame = frame.PixelData;
+        _lastUniqueFingerprint = fingerprint;
 
         var request = new FrameWriteRequest(frame.PixelData);
         if (!_writeChannel.Writer.TryWrite(request))
@@ -248,6 +253,47 @@ internal sealed class RecordingSession : IAsyncDisposable
         catch
         {
             // Keep temp files if cleanup fails.
+        }
+    }
+
+    private static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+
+        var hash = offsetBasis;
+        hash = Mix(hash, (ulong)pixelData.Length);
+        if (pixelData.IsEmpty)
+        {
+            return hash;
+        }
+
+        AddWindow(pixelData, 0, Math.Min(128, pixelData.Length), ref hash);
+        AddWindow(pixelData, Math.Max(0, (pixelData.Length / 2) - 64), Math.Min(128, pixelData.Length), ref hash);
+        AddWindow(pixelData, Math.Max(0, pixelData.Length - 128), Math.Min(128, pixelData.Length), ref hash);
+
+        var checkpoints = 8;
+        for (var i = 1; i <= checkpoints; i++)
+        {
+            var offset = (int)(((long)pixelData.Length - 8) * i / (checkpoints + 1));
+            offset = Math.Clamp(offset, 0, Math.Max(0, pixelData.Length - 8));
+            hash = Mix(hash, BinaryPrimitives.ReadUInt64LittleEndian(pixelData.Slice(offset, 8)));
+        }
+
+        return hash;
+
+        static void AddWindow(ReadOnlySpan<byte> data, int offset, int length, ref ulong targetHash)
+        {
+            var end = Math.Min(offset + length, data.Length);
+            for (var index = offset; index < end; index++)
+            {
+                targetHash = Mix(targetHash, data[index]);
+            }
+        }
+
+        static ulong Mix(ulong current, ulong value)
+        {
+            return (current ^ value) * prime;
         }
     }
 

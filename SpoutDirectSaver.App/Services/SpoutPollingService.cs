@@ -13,6 +13,7 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class SpoutPollingService : IAsyncDisposable
 {
     private const uint ReceivePixelFormat = 0x80E1;
+    private const int ReceiveBufferCount = 4;
     private readonly object _startGate = new();
 
     private CancellationTokenSource? _cancellationTokenSource;
@@ -84,12 +85,18 @@ internal sealed class SpoutPollingService : IAsyncDisposable
             return;
         }
 
+        receiver.CPUmode = true;
+        receiver.BufferMode = true;
+        receiver.Buffers = ReceiveBufferCount;
+        receiver.SetFrameCount(true);
+
         IntPtr receiveBuffer = IntPtr.Zero;
         int receiveBufferLength = 0;
         bool wasConnected = false;
         string senderName = string.Empty;
         uint width = 0;
         uint height = 0;
+        var lastAcceptedSenderFrame = -1;
         long nextPollTicks = Stopwatch.GetTimestamp();
 
         try
@@ -98,7 +105,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                var stateReady = receiver.ReceiveTexture();
+                var stateReady = PrepareReceive(receiver);
                 if (!stateReady && !receiver.IsConnected)
                 {
                     if (wasConnected)
@@ -108,6 +115,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         senderName = string.Empty;
                         width = 0;
                         height = 0;
+                        lastAcceptedSenderFrame = -1;
                         ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
                     }
 
@@ -146,6 +154,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                     senderName = connectedSenderName;
                     wasConnected = true;
+                    lastAcceptedSenderFrame = -1;
 
                     RaiseStatus(new CaptureStatus(
                         true,
@@ -155,12 +164,6 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         receiver.SenderFps,
                         message));
 
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                    continue;
-                }
-
-                if (!receiver.IsFrameNew)
-                {
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
                 }
@@ -192,6 +195,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             senderName = string.Empty;
                             width = 0;
                             height = 0;
+                            lastAcceptedSenderFrame = -1;
                             ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
                             WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                             continue;
@@ -201,6 +205,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         {
                             width = receiveWidth;
                             height = receiveHeight;
+                            lastAcceptedSenderFrame = -1;
                             ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
                             WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                             continue;
@@ -211,6 +216,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 if (!string.Equals(senderName, receiver.SenderName, StringComparison.Ordinal))
                 {
                     senderName = receiver.SenderName;
+                    lastAcceptedSenderFrame = -1;
                     RaiseStatus(new CaptureStatus(
                         true,
                         senderName,
@@ -220,8 +226,16 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         $"受信 sender が \"{senderName}\" に切り替わりました。"));
                 }
 
+                var senderFrame = receiver.SenderFrame;
+                if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
+                {
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    continue;
+                }
+
                 var frameCopy = GC.AllocateUninitializedArray<byte>(receiveBufferLength);
                 Marshal.Copy(receiveBuffer, frameCopy, 0, receiveBufferLength);
+                lastAcceptedSenderFrame = senderFrame;
 
                 FrameArrived?.Invoke(this, new FramePacket(
                     frameCopy,
@@ -244,6 +258,11 @@ internal sealed class SpoutPollingService : IAsyncDisposable
             receiver.ReleaseReceiver();
             receiver.CloseOpenGL();
         }
+    }
+
+    private static bool PrepareReceive(SpoutReceiver receiver)
+    {
+        return receiver.IsConnected ? true : receiver.ReceiveTexture();
     }
 
     private void RaiseStatus(CaptureStatus status)
