@@ -1,5 +1,7 @@
 using System;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Spout.Interop;
@@ -82,7 +84,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
             return;
         }
 
-        byte[]? receiveBuffer = null;
+        IntPtr receiveBuffer = IntPtr.Zero;
+        int receiveBufferLength = 0;
         bool wasConnected = false;
         string senderName = string.Empty;
         uint width = 0;
@@ -95,86 +98,62 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                if (!receiver.IsConnected || width == 0 || height == 0)
+                var stateReady = receiver.ReceiveTexture();
+                if (!stateReady && !receiver.IsConnected)
                 {
-                    var connected = receiver.ReceiveTexture();
-                    if (!connected && !receiver.IsConnected)
+                    if (wasConnected)
                     {
-                        if (wasConnected)
-                        {
-                            RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender との接続が切れました。"));
-                            wasConnected = false;
-                            senderName = string.Empty;
-                            width = 0;
-                            height = 0;
-                            receiveBuffer = null;
-                        }
+                        RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender との接続が切れました。"));
+                        wasConnected = false;
+                        senderName = string.Empty;
+                        width = 0;
+                        height = 0;
+                        ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
+                    }
 
-                        WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
-                        continue;
-                    }
-                    else if (connected || receiver.IsConnected)
-                    {
-                        // Immediately sync state to prevent re-entry
-                        width = receiver.SenderWidth;
-                        height = receiver.SenderHeight;
-                        if (width == 0 || height == 0)
-                        {
-                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
-                            continue;
-                        }
-                        receiveBuffer = new byte[checked((int)(width * height * 4))];
-                        senderName = receiver.SenderName;
-                        wasConnected = true;
-                        
-                        RaiseStatus(new CaptureStatus(
-                            true,
-                            senderName,
-                            width,
-                            height,
-                            receiver.SenderFps,
-                            $"Spout sender \"{senderName}\" に接続しました。"));
-                    }
+                    WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                    continue;
                 }
 
-                if (receiveBuffer is null)
+                var senderWidth = receiver.SenderWidth;
+                var senderHeight = receiver.SenderHeight;
+                if (senderWidth == 0 || senderHeight == 0)
                 {
                     WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
                 }
 
-                unsafe
-                {
-                    fixed (byte* pixels = receiveBuffer)
-                    {
-                        var received = receiver.ReceiveImage(pixels, GLFormats.RGBA, true, 0);
-                        if (!received)
-                        {
-                            RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout フレーム受信に失敗しました。sender を再待機します。"));
-                            wasConnected = false;
-                            senderName = string.Empty;
-                            width = 0;
-                            height = 0;
-                            receiveBuffer = null;
-                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
-                            continue;
-                        }
-                    }
-                }
+                var requiredBufferLength = checked((int)(senderWidth * senderHeight * 4));
+                var senderWasUpdated =
+                    receiveBuffer == IntPtr.Zero ||
+                    !wasConnected ||
+                    !stateReady ||
+                    receiver.IsUpdated ||
+                    senderWidth != width ||
+                    senderHeight != height ||
+                    receiveBufferLength != requiredBufferLength;
 
-                if (receiver.IsUpdated || receiver.SenderWidth != width || receiver.SenderHeight != height)
+                if (senderWasUpdated)
                 {
-                    width = receiver.SenderWidth;
-                    height = receiver.SenderHeight;
-                    receiveBuffer = new byte[checked((int)(width * height * 4))];
+                    width = senderWidth;
+                    height = senderHeight;
+                    EnsureReceiveBufferSize(requiredBufferLength, ref receiveBuffer, ref receiveBufferLength);
+
+                    var connectedSenderName = receiver.SenderName;
+                    var message = wasConnected
+                        ? $"sender の状態が更新されました: {width} x {height}"
+                        : $"Spout sender \"{connectedSenderName}\" に接続しました。";
+
+                    senderName = connectedSenderName;
+                    wasConnected = true;
 
                     RaiseStatus(new CaptureStatus(
                         true,
-                        receiver.SenderName,
+                        senderName,
                         width,
                         height,
                         receiver.SenderFps,
-                        $"sender の解像度が更新されました: {width} x {height}"));
+                        message));
 
                     WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
@@ -184,6 +163,49 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 {
                     WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
                     continue;
+                }
+
+                unsafe
+                {
+                    var receiveSenderName = string.IsNullOrWhiteSpace(senderName)
+                        ? receiver.SenderName
+                        : senderName;
+                    var senderNameBytes = Encoding.ASCII.GetBytes($"{receiveSenderName}\0");
+                    var receiveWidth = width;
+                    var receiveHeight = height;
+                    var pixels = (byte*)receiveBuffer;
+
+                    fixed (byte* senderNamePtr = senderNameBytes)
+                    {
+                        var received = receiver.ReceiveImage(
+                            (sbyte*)senderNamePtr,
+                            ref receiveWidth,
+                            ref receiveHeight,
+                            pixels,
+                            GLFormats.RGBA,
+                            true,
+                            0);
+                        if (!received)
+                        {
+                            RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout フレーム受信に失敗しました。sender を再待機します。"));
+                            wasConnected = false;
+                            senderName = string.Empty;
+                            width = 0;
+                            height = 0;
+                            ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
+                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                            continue;
+                        }
+
+                        if (receiveWidth != width || receiveHeight != height)
+                        {
+                            width = receiveWidth;
+                            height = receiveHeight;
+                            ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
+                            WaitUntilNextPoll(ref nextPollTicks, cancellationToken);
+                            continue;
+                        }
+                    }
                 }
 
                 if (!string.Equals(senderName, receiver.SenderName, StringComparison.Ordinal))
@@ -198,8 +220,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         $"受信 sender が \"{senderName}\" に切り替わりました。"));
                 }
 
-                var frameCopy = GC.AllocateUninitializedArray<byte>(receiveBuffer.Length);
-                Buffer.BlockCopy(receiveBuffer, 0, frameCopy, 0, receiveBuffer.Length);
+                var frameCopy = GC.AllocateUninitializedArray<byte>(receiveBufferLength);
+                Marshal.Copy(receiveBuffer, frameCopy, 0, receiveBufferLength);
 
                 FrameArrived?.Invoke(this, new FramePacket(
                     frameCopy,
@@ -218,6 +240,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
         finally
         {
+            ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
             receiver.ReleaseReceiver();
             receiver.CloseOpenGL();
         }
@@ -226,6 +249,29 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     private void RaiseStatus(CaptureStatus status)
     {
         StatusChanged?.Invoke(this, status);
+    }
+
+    private static void EnsureReceiveBufferSize(int requiredBufferLength, ref IntPtr receiveBuffer, ref int receiveBufferLength)
+    {
+        if (receiveBuffer != IntPtr.Zero && receiveBufferLength == requiredBufferLength)
+        {
+            return;
+        }
+
+        ReleaseReceiveBuffer(ref receiveBuffer, ref receiveBufferLength);
+        receiveBuffer = Marshal.AllocHGlobal(requiredBufferLength);
+        receiveBufferLength = requiredBufferLength;
+    }
+
+    private static void ReleaseReceiveBuffer(ref IntPtr receiveBuffer, ref int receiveBufferLength)
+    {
+        if (receiveBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(receiveBuffer);
+            receiveBuffer = IntPtr.Zero;
+        }
+
+        receiveBufferLength = 0;
     }
 
     private static void WaitUntilNextPoll(ref long nextPollTicks, CancellationToken cancellationToken)
