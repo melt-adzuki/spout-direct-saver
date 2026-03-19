@@ -303,7 +303,10 @@ public partial class MainWindow : Window
         try
         {
             _latestFrame = frame;
-            _recordingSession?.AppendFrame(frame);
+            if (!_isStopping)
+            {
+                _recordingSession?.AppendFrame(frame);
+            }
             ScheduleLivePreviewRefresh();
         }
         catch (Exception ex)
