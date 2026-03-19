@@ -12,6 +12,7 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class SpoutPollingService : IAsyncDisposable
 {
+    private const uint ReceivePixelFormat = 0x80E1;
     private readonly object _startGate = new();
 
     private CancellationTokenSource? _cancellationTokenSource;
@@ -181,7 +182,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             ref receiveWidth,
                             ref receiveHeight,
                             pixels,
-                            GLFormats.RGBA,
+                            ReceivePixelFormat,
                             true,
                             0);
                         if (!received)

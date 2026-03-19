@@ -203,7 +203,6 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         var manifestPath = Path.Combine(_temporaryDirectory, "frames.ffconcat");
         var frameSize = checked((int)(_recordedWidth * _recordedHeight * 4));
-        var rgbaBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
         var bgraBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
 
         try
@@ -226,10 +225,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 var imageName = $"frame_{frame.FrameIndex:D6}.tga";
                 var imagePath = Path.Combine(_temporaryDirectory, imageName);
 
-                await ReadExactAsync(spoolStream, rgbaBuffer, frameSize, cancellationToken).ConfigureAwait(false);
-                PixelConversion.ConvertRgbaToBgra(
-                    rgbaBuffer.AsSpan(0, frameSize),
-                    bgraBuffer.AsSpan(0, frameSize));
+                await ReadExactAsync(spoolStream, bgraBuffer, frameSize, cancellationToken).ConfigureAwait(false);
                 await SaveBgraFrameAsTgaAsync(imagePath, bgraBuffer, frameSize, cancellationToken).ConfigureAwait(false);
 
                 await writer.WriteLineAsync($"file '{imageName}'").ConfigureAwait(false);
@@ -244,7 +240,6 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rgbaBuffer);
             ArrayPool<byte>.Shared.Return(bgraBuffer);
         }
     }

@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using LibVLCSharp.Shared;
@@ -21,10 +22,9 @@ public partial class MainWindow : Window
     private readonly EncoderOption[] _encoderOptions = EncoderOption.CreateDefaults();
 
     private LibVLC? _libVlc;
-    private MediaPlayer? _mediaPlayer;
+    private LibVLCSharp.Shared.MediaPlayer? _mediaPlayer;
     private Media? _previewMedia;
     private WriteableBitmap? _liveBitmap;
-    private byte[]? _livePreviewBuffer;
 
     private RecordingSession? _recordingSession;
     private FramePacket? _latestFrame;
@@ -34,7 +34,7 @@ public partial class MainWindow : Window
     private DateTimeOffset? _recordingStartedAt;
     private bool _isStopping;
     private bool _isSeekingPreview;
-    private int _livePreviewUpdateScheduled;
+    private long _lastRenderedPreviewTicks;
 
     public MainWindow()
     {
@@ -43,7 +43,7 @@ public partial class MainWindow : Window
         Core.Initialize();
 
         _libVlc = new LibVLC("--no-video-title-show");
-        _mediaPlayer = new MediaPlayer(_libVlc);
+        _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVlc);
         _mediaPlayer.TimeChanged += MediaPlayer_OnTimeChanged;
         _mediaPlayer.LengthChanged += MediaPlayer_OnLengthChanged;
         _mediaPlayer.EndReached += MediaPlayer_OnEndReached;
@@ -63,6 +63,7 @@ public partial class MainWindow : Window
 
         _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
         _spoutPollingService.StatusChanged += SpoutPollingService_OnStatusChanged;
+        CompositionTarget.Rendering += CompositionTarget_OnRendering;
 
         Loaded += MainWindow_OnLoaded;
         UpdateUiState();
@@ -85,6 +86,7 @@ public partial class MainWindow : Window
             await _recordingSession.DisposeAsync();
         }
 
+        CompositionTarget.Rendering -= CompositionTarget_OnRendering;
         await _spoutPollingService.DisposeAsync();
 
         if (_mediaPlayer is not null)
@@ -307,7 +309,6 @@ public partial class MainWindow : Window
             {
                 _recordingSession?.AppendFrame(frame);
             }
-            ScheduleLivePreviewRefresh();
         }
         catch (Exception ex)
         {
@@ -319,28 +320,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ScheduleLivePreviewRefresh()
+    private void CompositionTarget_OnRendering(object? sender, EventArgs e)
     {
-        if (Interlocked.Exchange(ref _livePreviewUpdateScheduled, 1) != 0)
+        var frame = _latestFrame;
+        if (frame is null || frame.StopwatchTicks == _lastRenderedPreviewTicks)
         {
             return;
         }
 
-        _ = Dispatcher.BeginInvoke(() =>
-        {
-            try
-            {
-                var frame = _latestFrame;
-                if (frame is not null)
-                {
-                    RenderLivePreview(frame);
-                }
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _livePreviewUpdateScheduled, 0);
-            }
-        }, DispatcherPriority.Render);
+        RenderLivePreview(frame);
+        _lastRenderedPreviewTicks = frame.StopwatchTicks;
     }
 
     private void RenderLivePreview(FramePacket frame)
@@ -352,17 +341,10 @@ public partial class MainWindow : Window
         if (_liveBitmap is null || _liveBitmap.PixelWidth != width || _liveBitmap.PixelHeight != height)
         {
             _liveBitmap = new WriteableBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
-            _livePreviewBuffer = new byte[frame.PixelData.Length];
             LivePreviewImage.Source = _liveBitmap;
         }
 
-        if (_livePreviewBuffer is null || _livePreviewBuffer.Length != frame.PixelData.Length)
-        {
-            _livePreviewBuffer = new byte[frame.PixelData.Length];
-        }
-
-        PixelConversion.ConvertRgbaToBgra(frame.PixelData, _livePreviewBuffer);
-        _liveBitmap.WritePixels(new Int32Rect(0, 0, width, height), _livePreviewBuffer, stride, 0);
+        _liveBitmap.WritePixels(new Int32Rect(0, 0, width, height), frame.PixelData, stride, 0);
 
         LivePreviewPlaceholderBorder.Visibility = Visibility.Collapsed;
         SenderNameTextBlock.Text = string.IsNullOrWhiteSpace(frame.SenderName) ? "-" : frame.SenderName;
