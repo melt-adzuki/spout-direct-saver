@@ -1,19 +1,34 @@
 # Realtime Encoding Benchmarks
 
-This note summarizes local experiments around replacing the current heavy temporary spool with realtime FFmpeg encoding for 4K / 60fps RGBA capture.
+このファイルは、alpha 付き Spout 録画を 4K / 60fps で成立させるために行った codec / packaging 調査の記録です。  
+現在の既定構成を選ぶ理由の背景資料として残しています。
 
-## Why the current spool path is fragile
+## 結論
 
-RGBA 8-bit at 3840x2160 is about 33 MB per frame.
+最終的に一番バランスが良かったのは次の系統でした。
 
-- 3840 x 2160 x 4 bytes = 33,177,600 bytes/frame
-- 60 fps = about 1.99 GB/s of raw write traffic
+- RGB 本体: `HEVC NVENC`
+- alpha: grayscale `FFV1`
+- packaging: `RGB main file + alpha sidecar`
 
-That is too close to or beyond what many SSDs can sustain once compression, file metadata, and other app work are included. Even when the cache drive is fast enough, it is still an unnecessarily tight design.
+理由:
 
-## Candidate families
+- single-file alpha codec は realtime 性が足りなかった
+- dual-video-stream MKV は再生互換性と preview が不安定だった
+- raw spool 中心設計は 4K / 60fps では temp 帯域が重すぎた
 
-### Single-file alpha codecs
+## なぜ raw spool は厳しいか
+
+RGBA 8-bit / 3840x2160 は約 `33 MB/frame` です。
+
+- `3840 x 2160 x 4 = 33,177,600 bytes`
+- `60 fps` で約 `1.99 GB/s`
+
+ここに圧縮、メモリコピー、メタデータ更新、preview、sender/receiver 処理が加わるため、SATA SSD 前提ではかなり苦しい設計になります。
+
+## 比較した候補
+
+### 単一ファイルで alpha を持つ候補
 
 - `PNG / MOV`
 - `FFV1 / MKV`
@@ -22,138 +37,88 @@ That is too close to or beyond what many SSDs can sustain once compression, file
 - `CineForm / MOV`
 - `VP9 alpha / WebM`
 
-### Split RGB + alpha
+### 分離型
 
-- RGB main stream: `hevc_nvenc` or `h264_nvenc`
-- Alpha stream: grayscale `ffv1`
-- Packaging:
-  - one `mkv` with two video streams
-  - or one preview-friendly RGB file plus one alpha sidecar file
+- RGB main: `hevc_nvenc` または `h264_nvenc`
+- alpha: grayscale `ffv1`
+- packaging:
+  - 1 本の `mkv` に 2 video stream
+  - `RGB main + alpha sidecar`
 
-The split design is attractive because the alpha plane is only 1 channel, and because the expensive color stream can move to NVENC.
+## ベンチ条件
 
-## Benchmark method
-
-Tools:
+ツール:
 
 - `tools/BenchmarkEncoders.ps1`
 
-Input sample:
+入力:
 
-- 5.85-second 3840x2160 RGBA capture taken from the live `VRCSender1` game sender
+- `VRCSender1` から取得した 3840x2160 RGBA サンプル
 
-Two measurement modes were used:
+評価方法:
 
-1. Container transcode
-   - Input was the captured `png/mov` sample.
-   - This includes source decode overhead.
-2. Raw BGRA loop
-   - The same sample was decoded once to raw `bgra`.
-   - The raw sample was then looped to 29.25 seconds.
-   - This is much closer to the real app architecture, where raw BGRA frames are already in memory and can be streamed straight into FFmpeg.
+1. 通常のコンテナ変換
+2. raw BGRA ループ
 
-## Results
+raw BGRA ループのほうが、実アプリで「すでにメモリ上にあるフレームを encoder へ流す」条件に近いです。
 
-### Container transcode, 5.85 seconds
+## 主な結果
 
-| Codec path | Alpha preserved | Realtime factor | Output size |
-| --- | --- | ---: | ---: |
-| `PNG / MOV` | yes | `0.150x` | `2560.03 MB` |
-| `FFV1 / MKV` | yes | `0.239x` | `1674.20 MB` |
-| `ProRes 4444 / MOV` | yes | `0.139x` | `2867.97 MB` |
-| `Hap Alpha / MOV` | yes | `0.526x` | `1244.29 MB` |
-| `CineForm / MOV` | yes | `0.396x` | `1023.51 MB` |
-| `HEVC NVENC + FFV1 alpha / MKV` | yes | `0.815x` | `51.74 MB` |
-| `H264 NVENC + FFV1 alpha / MKV` | yes | `0.817x` | `112.53 MB` |
+### 単一ファイル alpha codec
 
-Takeaway:
+- `PNG / MOV`
+  - alpha は保持できる
+  - realtime には遠い
+- `FFV1 / MKV`
+  - alpha は保持できる
+  - lossless だが 4K/60 live capture の主軸には重い
+- `ProRes 4444 / MOV`
+  - 品質は魅力的
+  - realtime 性は不足
+- `Hap Alpha / MOV`
+  - single-file alpha 系の中では比較的速い
+  - それでも 4K/60 live capture の主軸には足りない
+- `CineForm / MOV`
+  - alpha を扱える
+  - realtime 性は不十分
+- `VP9 alpha / WebM`
+  - compact で魅力はある
+  - realtime capture 向けではなかった
 
-- The split RGB/alpha design was already much better even before removing input decode cost.
-- The traditional single-file alpha codecs were all far from 4K/60 realtime on this machine.
+### 分離型
 
-### Raw BGRA loop, 29.25 seconds
+- `HEVC NVENC + FFV1 alpha`
+  - 一番有望だった
+- `H264 NVENC + FFV1 alpha`
+  - 安全寄りの代替候補
 
-| Codec path | Alpha preserved | Realtime factor | Output size |
-| --- | --- | ---: | ---: |
-| `Hap Alpha / MOV` | yes | `0.579x` | `6221.46 MB` |
-| `CineForm / MOV` | yes | `0.418x` | `5117.53 MB` |
-| `HEVC 4:4:4 NVENC + FFV1 alpha / MKV` | yes | `0.935x` | `255.10 MB` |
-| `HEVC 4:2:0 NVENC + FFV1 alpha / MKV` | yes | `0.966x` | `254.61 MB` |
-| `H264 4:4:4 NVENC + FFV1 alpha / MKV` | yes | `0.935x` | `555.98 MB` |
-| `H264 4:2:0 NVENC + FFV1 alpha / MKV` | yes | `0.966x` | `550.03 MB` |
+## 実装して分かったこと
 
-Notes:
+ベンチだけでは見えなかった実装上の問題もありました。
 
-- FFmpeg progress logs for the 29.25-second raw run reached about `0.96x` for `HEVC 4:4:4`, about `0.999x` for `HEVC 4:2:0`, and about `1.0x` for `H264 4:2:0`.
-- The small gap between the FFmpeg `speed=` value and the summary `realtime_factor` comes mostly from process startup/shutdown overhead.
-- A long-lived FFmpeg process that stays open for the whole recording session should behave closer to the in-process `speed=` value than the short-run summary value.
+- `main + alpha` を 1 本の MKV に multi-stream で入れると、汎用プレイヤーでの見た目が不安定になりやすい
+- ffmpeg pipe に raw をそのまま流す realtime 経路は、encoder 以前に搬送コストが重かった
+- RGB を GPU encode に逃がし、alpha を sidecar にしたほうが preview と再生互換性が安定した
 
-### VP9 alpha
+そのため、現在は benchmark 上の「一番速そうな見た目」ではなく、実際の app / preview / player 互換性まで含めて sidecar 構成を選んでいます。
 
-`VP9 alpha / WebM` was also tested from raw BGRA on the 5.85-second sample.
+## 現在の実務上の推奨
 
-- Realtime factor: `0.413x`
-- Output size: `54.49 MB`
-- FFmpeg muxed the file as `yuva420p`
-- `ffprobe` reported `pix_fmt=yuv420p` with `alpha_mode=1`
+### 既定
 
-Takeaway:
+- `HEVC NVENC / MKV + FFV1 alpha sidecar`
 
-- VP9 alpha is attractive as a compact single-file distribution format.
-- It is not a realistic 4K/60 live capture target in this environment.
+### lossless 単一ファイルが必要な場合
 
-## Recommendation
+- `PNG / MOV`
+- `FFV1 / MKV`
 
-The most promising architecture is:
+どちらも品質面では優秀ですが、4K / 60fps の継続録画では temp 帯域と encode 負荷に注意が必要です。
 
-1. Keep a single long-lived FFmpeg process open during recording.
-2. Stream raw `bgra` frames directly into FFmpeg over stdin.
-3. Split the input inside FFmpeg:
-   - color stream -> `hevc_nvenc` or `h264_nvenc`
-   - alpha stream -> grayscale `ffv1`
-4. Stop writing raw or lightly compressed intermediate frame spools during capture.
+## 位置づけ
 
-Recommended presets:
+このドキュメントは「今も試すべき候補一覧」ではなく、「なぜ現在の既定構成に至ったか」を残すための履歴です。  
+日常の実装・運用判断は、先に次を参照してください。
 
-- Quality-first:
-  - `hevc_nvenc` main RGB stream in `yuv444p`
-  - grayscale `ffv1` alpha stream
-- Safety-first realtime:
-  - `hevc_nvenc` or `h264_nvenc` main RGB stream in `yuv420p`
-  - grayscale `ffv1` alpha stream
-
-## Packaging tradeoffs
-
-### One MKV with two video streams
-
-Pros:
-
-- single artifact
-- simplest FFmpeg pipeline
-- preserves alpha cleanly
-
-Cons:
-
-- playback support in generic players and WPF preview paths is less predictable
-
-### RGB file + alpha sidecar
-
-Pros:
-
-- the RGB file can be preview-friendly
-- alpha can stay lossless and separate
-- easier to keep app preview simple
-
-Cons:
-
-- two files instead of one
-- requires a small metadata convention for reconstruction
-
-## Likely next implementation step
-
-If realtime capture performance is the priority, the next practical change is to add an export mode based on:
-
-- RGB main: `HEVC NVENC`
-- Alpha sidecar: grayscale `FFV1`
-
-That path removes the storage-bandwidth bottleneck almost entirely while still preserving alpha.
+- [ArchitectureAndPerformance.md](./ArchitectureAndPerformance.md)
+- [OperationalNotes.md](./OperationalNotes.md)
