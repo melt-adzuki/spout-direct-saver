@@ -32,6 +32,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly FileStream? _syncSpoolStream;
     private readonly int _compressionWorkerCount;
     private readonly bool _useRealtimeEncoding;
+    private readonly LZ4Level _spoolCompressionLevel;
 
     private RecordedFrame? _currentFrame;
     private PixelBufferLease? _lastUniqueFrame;
@@ -64,6 +65,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _compressSpoolFrames = compressSpoolFrames;
         _writeSynchronously = writeSynchronously;
         _useRealtimeEncoding = encoderOption.RequiresRealtimeEncoding;
+        _spoolCompressionLevel = ResolveSpoolCompressionLevel(encoderOption);
         _spoolFileOptions = writeThroughSpool
             ? FileOptions.Asynchronous | FileOptions.WriteThrough
             : FileOptions.Asynchronous;
@@ -368,7 +370,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 byte[] payload;
                 if (request.Frame.IsCompressed)
                 {
-                    payload = LZ4Pickler.Pickle(request.PixelData.Span, LZ4Level.L00_FAST);
+                    payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
                 }
                 else
                 {
@@ -431,7 +433,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         var frameOffset = _syncSpoolStream.Position;
         if (request.Frame.IsCompressed)
         {
-            var compressedFrame = LZ4Pickler.Pickle(request.PixelData.Span, LZ4Level.L00_FAST);
+            var compressedFrame = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
             _syncSpoolStream.Write(compressedFrame);
         }
         else
@@ -619,6 +621,18 @@ internal sealed class RecordingSession : IAsyncDisposable
     private static int DetermineCompressionWorkerCount()
     {
         return Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+    }
+
+    private static LZ4Level ResolveSpoolCompressionLevel(EncoderOption encoderOption)
+    {
+        var overrideValue = Environment.GetEnvironmentVariable("SPOUT_DIRECT_SAVER_SPOOL_COMPRESSION");
+        if (!string.IsNullOrWhiteSpace(overrideValue) &&
+            Enum.TryParse<LZ4Level>(overrideValue, ignoreCase: true, out var parsed))
+        {
+            return parsed;
+        }
+
+        return LZ4Level.L00_FAST;
     }
 
     private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, PixelBufferLease PixelData);
