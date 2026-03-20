@@ -141,7 +141,7 @@ public partial class MainWindow : Window
         _recordingTimer.Start();
 
         RecorderStatusTextBlock.Text = "録画を開始しました。変化フレームのみを一時保存しています。";
-        PreviewStatusTextBlock.Text = "録画中です。停止後にプレビューが有効になります。";
+        PreviewStatusTextBlock.Text = "録画中はライブ入力プレビューを停止して録画を優先します。";
         HeaderStatusTextBlock.Text = "録画中";
 
         UpdateUiState();
@@ -328,6 +328,11 @@ public partial class MainWindow : Window
 
     private void CompositionTarget_OnRendering(object? sender, EventArgs e)
     {
+        if (_recordingSession is not null || _isStopping)
+        {
+            return;
+        }
+
         var rendered = _spoutPollingService.TryReadLatestPreviewFrame(frame =>
         {
             if (frame.StopwatchTicks == _lastRenderedPreviewTicks)
