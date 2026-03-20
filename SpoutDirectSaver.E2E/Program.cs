@@ -14,6 +14,8 @@ var outputPath = Path.Combine(outputDirectory, $"capture_{DateTime.Now:yyyyMMdd_
 
 Console.WriteLine($"sender={options.SenderName}");
 Console.WriteLine($"captureSeconds={options.CaptureSeconds}");
+Console.WriteLine($"testSenderScene={options.TestSenderScene}");
+Console.WriteLine($"warmupMs={options.WarmupMilliseconds}");
 Console.WriteLine($"output={outputPath}");
 
 Process? senderProcess = null;
@@ -21,6 +23,10 @@ Process? senderProcess = null;
 try
 {
     senderProcess = LaunchTestSenderIfRequested(options);
+    if (options.LaunchTestSender && options.WarmupMilliseconds > 0)
+    {
+        Thread.Sleep(options.WarmupMilliseconds);
+    }
 
 var receiveOnly = MeasureReceiveOnly(options);
 Console.WriteLine($"receive_only_frames={receiveOnly.FrameCount}");
@@ -139,6 +145,12 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
             }
 
             if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
+            {
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                continue;
+            }
+
+            if (options.LaunchTestSender && IsLikelyAllZeroFrame(buffer, bufferLength))
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -295,6 +307,12 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             }
 
             if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
+            {
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                continue;
+            }
+
+            if (options.LaunchTestSender && IsLikelyAllZeroFrame(buffer, bufferLength))
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -506,6 +524,27 @@ static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader s
     }
 }
 
+static unsafe bool IsLikelyAllZeroFrame(IntPtr buffer, int length)
+{
+    if (buffer == IntPtr.Zero || length <= 0)
+    {
+        return true;
+    }
+
+    var samples = Math.Min(64, Math.Max(1, length / 4096));
+    var ptr = (byte*)buffer;
+    for (var sampleIndex = 0; sampleIndex < samples; sampleIndex++)
+    {
+        var offset = (int)(((long)(length - 1) * sampleIndex) / Math.Max(samples - 1, 1));
+        if (ptr[offset] != 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
 {
     const ulong offsetBasis = 14695981039346656037UL;
@@ -604,7 +643,7 @@ static Process? LaunchTestSenderIfRequested(E2eOptions options)
     {
         FileName = "dotnet",
         Arguments =
-            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {(options.CaptureSeconds * 2) + 3} --send-texture",
+            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {(options.CaptureSeconds * 2) + 3} --send-texture --scene {options.TestSenderScene}",
         RedirectStandardOutput = true,
         RedirectStandardError = true,
         UseShellExecute = false,
@@ -669,6 +708,8 @@ internal sealed record E2eOptions(
     string SenderName,
     int CaptureSeconds,
     bool LaunchTestSender,
+    string TestSenderScene,
+    int WarmupMilliseconds,
     bool IgnoreIsFrameNew,
     uint Width,
     uint Height,
@@ -686,6 +727,8 @@ internal sealed record E2eOptions(
         var senderName = "VRCSender1";
         var captureSeconds = 5;
         var launchTestSender = false;
+        var testSenderScene = "simple";
+        var warmupMilliseconds = 750;
         var ignoreIsFrameNew = false;
         var width = 3840u;
         var height = 2160u;
@@ -711,6 +754,12 @@ internal sealed record E2eOptions(
                 case "--launch-test-sender":
                     launchTestSender = true;
                     ignoreIsFrameNew = true;
+                    break;
+                case "--test-sender-scene":
+                    testSenderScene = args[++index];
+                    break;
+                case "--warmup-ms":
+                    warmupMilliseconds = int.Parse(args[++index]);
                     break;
                 case "--ignore-is-frame-new":
                     ignoreIsFrameNew = true;
@@ -766,7 +815,7 @@ internal sealed record E2eOptions(
             }
         }
 
-        return new E2eOptions(senderName, captureSeconds, launchTestSender, ignoreIsFrameNew, width, height, frameRate, receiveMode, cpuMode, bufferMode, useFrameCount, bufferCount, frameSync, invert);
+        return new E2eOptions(senderName, captureSeconds, launchTestSender, testSenderScene, warmupMilliseconds, ignoreIsFrameNew, width, height, frameRate, receiveMode, cpuMode, bufferMode, useFrameCount, bufferCount, frameSync, invert);
     }
 }
 
