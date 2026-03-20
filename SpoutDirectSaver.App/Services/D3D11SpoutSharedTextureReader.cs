@@ -10,7 +10,7 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 {
-    private const int KeyedMutexTimeoutMilliseconds = 5;
+    private const int KeyedMutexTimeoutMilliseconds = 67;
     private const int AccessMutexTimeoutMilliseconds = 67;
     private readonly IDXGIFactory1 _dxgiFactory;
 

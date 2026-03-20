@@ -135,6 +135,7 @@ public partial class MainWindow : Window
         ResetPreviewArea();
 
         _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _spoutPollingService.SetRecordingMode(true);
         _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
         BeginRecordingLatencyScope();
         _recordingStartedAt = DateTimeOffset.UtcNow;
@@ -167,6 +168,7 @@ public partial class MainWindow : Window
             _lastRecordedFilePath = outputPath;
             _recordingSession = null;
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
+            _spoutPollingService.SetRecordingMode(false);
 
             LoadPreview(outputPath);
             RecorderStatusTextBlock.Text = $"保存完了: {outputPath}";
@@ -186,12 +188,17 @@ public partial class MainWindow : Window
             }
 
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
+            _spoutPollingService.SetRecordingMode(false);
         }
         finally
         {
             EndRecordingLatencyScope();
             _recordingStartedAt = null;
             _isStopping = false;
+            if (_recordingSession is null)
+            {
+                _spoutPollingService.SetRecordingMode(false);
+            }
             UpdateRecordingElapsed();
             UpdateUiState();
         }

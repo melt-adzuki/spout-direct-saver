@@ -64,6 +64,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
+    using var frameCounter = new SpoutFrameCount();
 
     if (!receiver.CreateOpenGL())
     {
@@ -74,6 +75,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     receiver.BufferMode = options.BufferMode;
     receiver.Buffers = options.BufferCount;
     receiver.SetFrameCount(options.UseFrameCount);
+    frameCounter.SetFrameCount(options.UseFrameCount);
     if (options.FrameSync)
     {
         receiver.SetFrameSync(options.SenderName);
@@ -101,6 +103,9 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     var uniqueAcceptedFrameTicks = new List<long>();
     long? firstAcceptedFrameTick = null;
     byte[]? lastFallbackFrame = null;
+    var frameCountSenderName = string.Empty;
+    var frameCountSupportProbed = false;
+    var frameCountSupported = false;
 
     try
     {
@@ -138,7 +143,17 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 bufferLength = requiredLength;
             }
 
-            if (!options.IgnoreIsFrameNew && !receiver.IsFrameNew)
+            var useSharedFrameCounter = options.ReceiveMode == ReceiveMode.D3D11SharedTexture &&
+                TryPrepareSharedTextureReadback(receiver, sharedTextureReader, frameCounter, options.SenderName, ref frameCountSenderName, out _);
+
+            if (useSharedFrameCounter)
+            {
+                if (!TryAwaitSharedFrame(frameCounter, options.SenderName, ref frameCountSupportProbed, ref frameCountSupported, receiver.SenderFps))
+                {
+                    continue;
+                }
+            }
+            else if (!options.IgnoreIsFrameNew && !receiver.IsFrameNew)
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -156,11 +171,14 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 continue;
             }
 
-            var senderFrame = receiver.SenderFrame;
+            var senderFrame = useSharedFrameCounter ? frameCounter.SenderFrame : receiver.SenderFrame;
             var acceptedFrameTick = Stopwatch.GetTimestamp();
             if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
             {
-                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                if (!useSharedFrameCounter)
+                {
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                }
                 continue;
             }
 
@@ -196,7 +214,10 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 }
             }
             firstFrameSeen = true;
-            WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+            if (!useSharedFrameCounter)
+            {
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+            }
         }
     }
     finally
@@ -231,6 +252,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
+    using var frameCounter = new SpoutFrameCount();
 
     if (!receiver.CreateOpenGL())
     {
@@ -241,6 +263,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     receiver.BufferMode = options.BufferMode;
     receiver.Buffers = options.BufferCount;
     receiver.SetFrameCount(options.UseFrameCount);
+    frameCounter.SetFrameCount(options.UseFrameCount);
     if (options.FrameSync)
     {
         receiver.SetFrameSync(options.SenderName);
@@ -263,6 +286,9 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     long? firstAcceptedFrameTick = null;
     byte[]? lastFallbackFrame = null;
     var diagnosticsPrinted = false;
+    var frameCountSenderName = string.Empty;
+    var frameCountSupportProbed = false;
+    var frameCountSupported = false;
 
     try
     {
@@ -300,7 +326,17 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 bufferLength = requiredLength;
             }
 
-            if (!options.IgnoreIsFrameNew && !receiver.IsFrameNew)
+            var useSharedFrameCounter = options.ReceiveMode == ReceiveMode.D3D11SharedTexture &&
+                TryPrepareSharedTextureReadback(receiver, sharedTextureReader, frameCounter, options.SenderName, ref frameCountSenderName, out _);
+
+            if (useSharedFrameCounter)
+            {
+                if (!TryAwaitSharedFrame(frameCounter, options.SenderName, ref frameCountSupportProbed, ref frameCountSupported, receiver.SenderFps))
+                {
+                    continue;
+                }
+            }
+            else if (!options.IgnoreIsFrameNew && !receiver.IsFrameNew)
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -318,18 +354,21 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 continue;
             }
 
-            var senderFrame = receiver.SenderFrame;
+            var senderFrame = useSharedFrameCounter ? frameCounter.SenderFrame : receiver.SenderFrame;
             if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
             {
-                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                if (!useSharedFrameCounter)
+                {
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                }
                 continue;
             }
 
             session ??= new RecordingSession(
                 EncoderOption.CreateDefaults()[0],
                 outputPath,
-                channelCapacity: 8,
-                blockOnBackpressure: false);
+                channelCapacity: 32,
+                blockOnBackpressure: true);
             var acceptedFrameTick = Stopwatch.GetTimestamp();
             frameCount++;
             if (senderFrame > 0)
@@ -378,7 +417,10 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                     lastFallbackFrame = managedCopy;
                 }
             }
-            WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+            if (!useSharedFrameCounter)
+            {
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+            }
         }
 
         if (session is null)
@@ -414,6 +456,40 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
         receiver.ReleaseReceiver();
         receiver.CloseOpenGL();
     }
+}
+
+static bool TryPrepareSharedTextureReadback(
+    SpoutReceiver receiver,
+    D3D11SpoutSharedTextureReader sharedTextureReader,
+    SpoutFrameCount frameCounter,
+    string senderName,
+    ref string frameCountSenderName,
+    out double effectiveSenderFps)
+{
+    effectiveSenderFps = receiver.SenderFps;
+    if (!receiver.SenderGLDX || receiver.SenderCPU || receiver.SenderHandle == IntPtr.Zero)
+    {
+        return false;
+    }
+
+    if (!sharedTextureReader.TrySynchronizeSender(receiver, senderName, out _))
+    {
+        return false;
+    }
+
+    if (!string.Equals(frameCountSenderName, senderName, StringComparison.Ordinal))
+    {
+        frameCounter.CleanupFrameCount();
+        frameCounter.EnableFrameCount(senderName);
+        frameCountSenderName = senderName;
+    }
+
+    if (frameCounter.SenderFps > 1.0)
+    {
+        effectiveSenderFps = frameCounter.SenderFps;
+    }
+
+    return true;
 }
 
 static async Task ProbeVideoAsync(string outputPath)
@@ -452,6 +528,39 @@ static void WaitUntilNextPoll(ref long nextPollTicks, double senderFps)
     {
         Thread.SpinWait(64);
     }
+}
+
+static bool WaitForNextFrame(SpoutFrameCount frameCounter, double senderFps)
+{
+    var timeoutMilliseconds = senderFps > 1.0
+        ? (uint)Math.Clamp((int)Math.Ceiling((1000.0 / Math.Min(senderFps, 120.0)) * 2.0), 4, 67)
+        : 20u;
+    return frameCounter.WaitNewFrame(timeoutMilliseconds);
+}
+
+static bool TryAwaitSharedFrame(
+    SpoutFrameCount frameCounter,
+    string senderName,
+    ref bool frameCountSupportProbed,
+    ref bool frameCountSupported,
+    double senderFps)
+{
+    if (!frameCountSupportProbed)
+    {
+        frameCountSupportProbed = true;
+        frameCountSupported =
+            !string.IsNullOrWhiteSpace(senderName) &&
+            frameCounter.WaitNewFrame(0) &&
+            frameCounter.SenderFrame > 0;
+        return true;
+    }
+
+    if (!frameCountSupported)
+    {
+        return true;
+    }
+
+    return WaitForNextFrame(frameCounter, senderFps);
 }
 
 static bool PrepareReceive(SpoutReceiver receiver, E2eOptions options)

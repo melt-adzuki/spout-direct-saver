@@ -35,10 +35,16 @@ var diffScores = samples
     .ToArray();
 
 var otsuThreshold = diffScores.Length == 0 ? 0.0 : OtsuThreshold.Compute(diffScores);
+var motionThreshold = diffScores.Length == 0 ? 0.0 : Quantiles.Compute(diffScores.Where(value => value > 0.0).ToArray(), 0.25);
 var exactStats = VisualUpdateStats.Build(
     samples,
     static sample => sample.IsExactSignatureRepeat,
     "exact_signature");
+var motionStutterStats = VisualUpdateStats.BuildMotionStutter(
+    samples,
+    probe.AverageFrameRate,
+    motionThreshold,
+    "motion_stutter");
 var perceptualStats = VisualUpdateStats.Build(
     samples,
     sample => sample.SignatureMeanAbsoluteDifference <= otsuThreshold,
@@ -49,12 +55,19 @@ Console.WriteLine($"exact_signature_min_1s_fps={exactStats.MinimumOneSecondFps:0
 Console.WriteLine($"exact_signature_repeat_ratio={exactStats.RepeatFrameRatio:0.000}");
 Console.WriteLine($"exact_signature_update_count={exactStats.UpdateCount}");
 Console.WriteLine($"exact_signature_longest_repeat_run={exactStats.LongestRepeatRunFrames}");
+Console.WriteLine($"motion_threshold={motionThreshold:0.###}");
+Console.WriteLine($"motion_stutter_avg_fps={motionStutterStats.AverageFps:0.00}");
+Console.WriteLine($"motion_stutter_min_1s_fps={motionStutterStats.MinimumOneSecondFps:0.00}");
+Console.WriteLine($"motion_stutter_repeat_ratio={motionStutterStats.RepeatFrameRatio:0.000}");
+Console.WriteLine($"motion_stutter_update_count={motionStutterStats.UpdateCount}");
+Console.WriteLine($"motion_stutter_longest_repeat_run={motionStutterStats.LongestRepeatRunFrames}");
 Console.WriteLine($"experimental_perceptual_threshold={otsuThreshold:0.###}");
 Console.WriteLine($"experimental_perceptual_avg_fps={perceptualStats.AverageFps:0.00}");
 Console.WriteLine($"experimental_perceptual_min_1s_fps={perceptualStats.MinimumOneSecondFps:0.00}");
 Console.WriteLine($"experimental_perceptual_longest_repeat_run={perceptualStats.LongestRepeatRunFrames}");
 
 PrintWorstWindows("exact_signature", exactStats.WorstWindows);
+PrintWorstWindows("motion_stutter", motionStutterStats.WorstWindows);
 PrintWorstWindows("perceptual", perceptualStats.WorstWindows);
 
 if (options.CsvPath is not null)
@@ -124,7 +137,7 @@ static async Task<List<FrameSample>> DecodeAndAnalyzeAsync(
             {
                 currentSignature.CopyTo(previousSignature);
                 currentFrame.AsSpan(0, frameSize).CopyTo(previousFrame);
-                samples.Add(new FrameSample(frameIndex, ptsSeconds, false, 255.0));
+                samples.Add(new FrameSample(frameIndex, ptsSeconds, false, 0.0));
                 hasPrevious = true;
                 frameIndex++;
                 continue;
@@ -430,6 +443,74 @@ internal sealed record VisualUpdateStats(
                 .ToArray());
     }
 
+    public static VisualUpdateStats BuildMotionStutter(
+        IReadOnlyList<FrameSample> samples,
+        double nominalFrameRate,
+        double motionThreshold,
+        string label)
+    {
+        if (samples.Count == 0 || nominalFrameRate <= 0.0)
+        {
+            return new VisualUpdateStats(label, 0.0, 0.0, 0.0, 0, 0, []);
+        }
+
+        var dropFrames = new bool[samples.Count];
+        var longestRepeatRun = 0;
+
+        for (var index = 1; index < samples.Count; index++)
+        {
+            if (!samples[index].IsExactSignatureRepeat)
+            {
+                continue;
+            }
+
+            var runStart = index;
+            while (index < samples.Count && samples[index].IsExactSignatureRepeat)
+            {
+                index++;
+            }
+
+            var runEndExclusive = index;
+            var previousDiff = samples[runStart - 1].SignatureMeanAbsoluteDifference;
+            var nextDiff = runEndExclusive < samples.Count
+                ? samples[runEndExclusive].SignatureMeanAbsoluteDifference
+                : 0.0;
+
+            if (previousDiff >= motionThreshold && nextDiff >= motionThreshold)
+            {
+                for (var runIndex = runStart; runIndex < runEndExclusive; runIndex++)
+                {
+                    dropFrames[runIndex] = true;
+                }
+
+                longestRepeatRun = Math.Max(longestRepeatRun, runEndExclusive - runStart);
+            }
+        }
+
+        var firstPts = samples[0].PtsSeconds;
+        var lastPts = samples[^1].PtsSeconds;
+        var duration = Math.Max(lastPts - firstPts, 1.0 / Math.Max(nominalFrameRate, 1.0));
+        var totalDrops = dropFrames.Count(static dropped => dropped);
+        var averageFps = Math.Max(0.0, nominalFrameRate - (totalDrops / duration));
+        var windows = ComputeDropWindowMetrics(dropFrames, samples, nominalFrameRate);
+        var minimum = windows.Count == 0
+            ? averageFps
+            : windows.Min(window => window.FramesPerSecond);
+
+        return new VisualUpdateStats(
+            label,
+            averageFps,
+            minimum,
+            totalDrops / (double)Math.Max(1, samples.Count - 1),
+            Math.Max(0, samples.Count - totalDrops),
+            longestRepeatRun,
+            windows
+                .OrderBy(window => window.FramesPerSecond)
+                .ThenBy(window => window.StartSeconds)
+                .Take(5)
+                .ToArray());
+    }
+
     private static List<WindowMetric> ComputeWindowMetrics(IReadOnlyList<double> updateTimes, IReadOnlyList<FrameSample> samples)
     {
         var windows = new List<WindowMetric>();
@@ -469,6 +550,65 @@ internal sealed record VisualUpdateStats(
             }
 
             windows.Add(new WindowMetric(windowStart, windowEnd, (updateEnd - updateStart) / windowDurationSeconds));
+        }
+
+        return windows;
+    }
+
+    private static List<WindowMetric> ComputeDropWindowMetrics(bool[] dropFrames, IReadOnlyList<FrameSample> samples, double nominalFrameRate)
+    {
+        var windows = new List<WindowMetric>();
+        if (samples.Count == 0 || nominalFrameRate <= 0.0)
+        {
+            return windows;
+        }
+
+        const double windowDurationSeconds = 1.0;
+        const double windowStepSeconds = 0.1;
+        var firstPts = samples[0].PtsSeconds;
+        var lastPts = samples[^1].PtsSeconds;
+        if (lastPts - firstPts < windowDurationSeconds)
+        {
+            return windows;
+        }
+
+        var startIndex = 0;
+        var endIndex = 0;
+        var dropCount = 0;
+
+        for (var windowStart = firstPts; windowStart + windowDurationSeconds <= lastPts; windowStart += windowStepSeconds)
+        {
+            var windowEnd = windowStart + windowDurationSeconds;
+
+            while (startIndex < samples.Count && samples[startIndex].PtsSeconds < windowStart)
+            {
+                if (dropFrames[startIndex])
+                {
+                    dropCount--;
+                }
+
+                startIndex++;
+            }
+
+            if (endIndex < startIndex)
+            {
+                endIndex = startIndex;
+            }
+
+            while (endIndex < samples.Count && samples[endIndex].PtsSeconds < windowEnd)
+            {
+                if (dropFrames[endIndex])
+                {
+                    dropCount++;
+                }
+
+                endIndex++;
+            }
+
+            windows.Add(new WindowMetric(
+                windowStart,
+                windowEnd,
+                Math.Max(0.0, nominalFrameRate - (dropCount / windowDurationSeconds))));
         }
 
         return windows;
@@ -538,5 +678,20 @@ internal static class OtsuThreshold
         }
 
         return maxValue * (bestThreshold / (double)(bins - 1));
+    }
+}
+
+internal static class Quantiles
+{
+    public static double Compute(IReadOnlyList<double> sortedValues, double fraction)
+    {
+        if (sortedValues.Count == 0)
+        {
+            return 0.0;
+        }
+
+        var ordered = sortedValues.OrderBy(static value => value).ToArray();
+        var index = (int)Math.Round((ordered.Length - 1) * Math.Clamp(fraction, 0.0, 1.0));
+        return ordered[Math.Clamp(index, 0, ordered.Length - 1)];
     }
 }

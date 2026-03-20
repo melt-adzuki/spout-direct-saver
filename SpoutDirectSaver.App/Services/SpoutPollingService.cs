@@ -23,10 +23,16 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     private int _previewBufferLength;
     private LivePreviewFrame _latestPreviewFrame;
     private bool _hasPreviewFrame;
+    private int _recordingModeEnabled;
 
     public event EventHandler<FramePacket>? FrameArrived;
 
     public event EventHandler<CaptureStatus>? StatusChanged;
+
+    public void SetRecordingMode(bool enabled)
+    {
+        Interlocked.Exchange(ref _recordingModeEnabled, enabled ? 1 : 0);
+    }
 
     public bool TryReadLatestPreviewFrame(Action<LivePreviewFrame> reader)
     {
@@ -100,6 +106,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     {
         using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
         using var receiver = new SpoutReceiver();
+        using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
+        using var frameCounter = new SpoutFrameCount();
 
         if (!receiver.CreateOpenGL())
         {
@@ -113,13 +121,17 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         uint height = 0;
         var lastAcceptedSenderFrame = -1;
         long nextPollTicks = Stopwatch.GetTimestamp();
+        var frameCountSenderName = string.Empty;
+        var frameCountSupportProbed = false;
+        var frameCountSupported = false;
 
         try
         {
-            receiver.SetCPUmode(false);
-            receiver.BufferMode = true;
+            receiver.SetCPUmode(true);
+            receiver.BufferMode = false;
             receiver.Buffers = ReceiveBufferCount;
             receiver.SetFrameCount(true);
+            frameCounter.SetFrameCount(true);
 
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender を待っています。"));
 
@@ -140,6 +152,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         width = 0;
                         height = 0;
                         lastAcceptedSenderFrame = -1;
+                        frameCountSenderName = string.Empty;
+                        frameCountSupportProbed = false;
+                        frameCountSupported = false;
                     }
 
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
@@ -160,11 +175,45 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     senderWasUpdated = true;
                 }
 
-                if (!TryReceivePreviewImage(
-                        receiver,
-                        connectedSenderName,
-                        connectedWidth,
-                        connectedHeight))
+                var preferSharedTextureReadback = TryPrepareSharedTextureReadback(
+                    receiver,
+                    sharedTextureReader,
+                    frameCounter,
+                    connectedSenderName,
+                    ref frameCountSenderName,
+                    out var effectiveSenderFps);
+                if (preferSharedTextureReadback && !frameCountSupportProbed)
+                {
+                    frameCountSupportProbed = true;
+                    frameCountSupported =
+                        !string.IsNullOrWhiteSpace(connectedSenderName) &&
+                        frameCounter.WaitNewFrame(0) &&
+                        frameCounter.SenderFrame > 0;
+                }
+
+                preferSharedTextureReadback &= frameCountSupported;
+
+                if (preferSharedTextureReadback)
+                {
+                    if (!TryReceiveSharedTextureFrame(
+                            sharedTextureReader,
+                            frameCounter,
+                            connectedSenderName,
+                            ref frameCountSupportProbed,
+                            ref frameCountSupported,
+                            _previewBackBuffer,
+                            _previewBufferLength,
+                            effectiveSenderFps,
+                            cancellationToken))
+                    {
+                        continue;
+                    }
+                }
+                else if (!TryReceivePreviewImage(
+                             receiver,
+                             connectedSenderName,
+                             connectedWidth,
+                             connectedHeight))
                 {
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
@@ -182,36 +231,59 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                     wasConnected = true;
                     lastAcceptedSenderFrame = -1;
+                    frameCountSupportProbed = false;
+                    frameCountSupported = false;
 
                     RaiseStatus(new CaptureStatus(
                         true,
                         senderName,
                         width,
                         height,
-                        receiver.SenderFps,
+                        effectiveSenderFps,
                         message));
 
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    if (!preferSharedTextureReadback)
+                    {
+                        WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    }
                     continue;
                 }
 
-                var senderFrame = receiver.SenderFrame;
+                var senderFrame = preferSharedTextureReadback
+                    ? frameCounter.SenderFrame
+                    : receiver.SenderFrame;
                 if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
                 {
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    if (!preferSharedTextureReadback)
+                    {
+                        WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    }
                     continue;
                 }
 
                 lastAcceptedSenderFrame = senderFrame;
-                PublishPreviewFrame(width, height, senderName, receiver.SenderFps, Stopwatch.GetTimestamp());
+                var acceptedFrameTicks = Stopwatch.GetTimestamp();
+                var recordingMode = Volatile.Read(ref _recordingModeEnabled) != 0;
+                if (!recordingMode)
+                {
+                    PublishPreviewFrame(width, height, senderName, effectiveSenderFps, acceptedFrameTicks);
+                }
 
                 var frameHandler = FrameArrived;
                 if (frameHandler is not null)
                 {
                     var frameCopy = GC.AllocateUninitializedArray<byte>(_previewBufferLength);
-                    lock (_previewGate)
+                    var sourceBuffer = recordingMode ? _previewBackBuffer : _previewFrontBuffer;
+                    if (!recordingMode)
                     {
-                        Marshal.Copy(_previewFrontBuffer, frameCopy, 0, _previewBufferLength);
+                        lock (_previewGate)
+                        {
+                            Marshal.Copy(sourceBuffer, frameCopy, 0, _previewBufferLength);
+                        }
+                    }
+                    else
+                    {
+                        Marshal.Copy(sourceBuffer, frameCopy, 0, _previewBufferLength);
                     }
 
                     frameHandler.Invoke(this, new FramePacket(
@@ -219,12 +291,15 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         width,
                         height,
                         senderName,
-                        receiver.SenderFps,
-                        _latestPreviewFrame.StopwatchTicks,
+                        effectiveSenderFps,
+                        acceptedFrameTicks,
                         DateTimeOffset.UtcNow));
                 }
 
-                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                if (!preferSharedTextureReadback)
+                {
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                }
             }
         }
         catch (OperationCanceledException)
@@ -303,6 +378,66 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 false,
                 0);
         }
+    }
+
+    private static bool TryPrepareSharedTextureReadback(
+        SpoutReceiver receiver,
+        D3D11SpoutSharedTextureReader sharedTextureReader,
+        SpoutFrameCount frameCounter,
+        string senderName,
+        ref string frameCountSenderName,
+        out double effectiveSenderFps)
+    {
+        effectiveSenderFps = receiver.SenderFps;
+        if (!receiver.SenderGLDX || receiver.SenderCPU || receiver.SenderHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        if (!sharedTextureReader.TrySynchronizeSender(receiver, senderName, out _))
+        {
+            return false;
+        }
+
+        if (!string.Equals(frameCountSenderName, senderName, StringComparison.Ordinal))
+        {
+            frameCounter.CleanupFrameCount();
+            frameCounter.EnableFrameCount(senderName);
+            frameCountSenderName = senderName;
+        }
+
+        if (frameCounter.SenderFps > 1.0)
+        {
+            effectiveSenderFps = frameCounter.SenderFps;
+        }
+
+        return true;
+    }
+
+    private static bool TryReceiveSharedTextureFrame(
+        D3D11SpoutSharedTextureReader sharedTextureReader,
+        SpoutFrameCount frameCounter,
+        string senderName,
+        ref bool frameCountSupportProbed,
+        ref bool frameCountSupported,
+        IntPtr destinationBuffer,
+        int destinationLength,
+        double senderFps,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!TryAwaitSharedFrame(
+                frameCounter,
+                senderName,
+                ref frameCountSupportProbed,
+                ref frameCountSupported,
+                senderFps))
+        {
+            return false;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return sharedTextureReader.TryReadFrame(destinationBuffer, destinationLength, out _);
     }
 
     private static string ReadNullTerminatedAscii(byte[] buffer)
@@ -412,5 +547,38 @@ internal sealed class SpoutPollingService : IAsyncDisposable
             ? Math.Min(senderFps, 120.0)
             : 120.0;
         return (long)Math.Round(Stopwatch.Frequency / targetFps);
+    }
+
+    private static bool WaitForNextFrame(SpoutFrameCount frameCounter, double senderFps)
+    {
+        var timeoutMilliseconds = senderFps > 1.0
+            ? (uint)Math.Clamp((int)Math.Ceiling((1000.0 / Math.Min(senderFps, 120.0)) * 2.0), 4, 67)
+            : 20u;
+        return frameCounter.WaitNewFrame(timeoutMilliseconds);
+    }
+
+    private static bool TryAwaitSharedFrame(
+        SpoutFrameCount frameCounter,
+        string senderName,
+        ref bool frameCountSupportProbed,
+        ref bool frameCountSupported,
+        double senderFps)
+    {
+        if (!frameCountSupportProbed)
+        {
+            frameCountSupportProbed = true;
+            frameCountSupported =
+                !string.IsNullOrWhiteSpace(senderName) &&
+                frameCounter.WaitNewFrame(0) &&
+                frameCounter.SenderFrame > 0;
+            return true;
+        }
+
+        if (!frameCountSupported)
+        {
+            return true;
+        }
+
+        return WaitForNextFrame(frameCounter, senderFps);
     }
 }

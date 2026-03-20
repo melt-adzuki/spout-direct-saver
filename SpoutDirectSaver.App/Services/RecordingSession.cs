@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -20,12 +21,16 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly string _temporaryDirectory;
     private readonly string _spoolPath;
     private readonly List<RecordedFrame> _frames = [];
-    private readonly Channel<FrameWriteRequest> _writeChannel;
+    private readonly Channel<FrameWriteRequest> _compressionChannel;
+    private readonly ConcurrentDictionary<int, PreparedFrameWriteRequest> _preparedFrames = new();
+    private readonly SemaphoreSlim _preparedFrameSignal = new(0);
+    private readonly Task[] _compressionTasks;
     private readonly Task _writerTask;
     private readonly bool _blockOnBackpressure;
     private readonly FileOptions _spoolFileOptions;
     private readonly bool _writeSynchronously;
     private readonly FileStream? _syncSpoolStream;
+    private readonly int _compressionWorkerCount;
 
     private RecordedFrame? _currentFrame;
     private byte[]? _lastUniqueFrame;
@@ -37,12 +42,13 @@ internal sealed class RecordingSession : IAsyncDisposable
     private bool _isCompleted;
     private bool _disposed;
     private bool? _compressSpoolFrames;
+    private int _remainingCompressionWorkers;
 
     public RecordingSession(
         EncoderOption encoderOption,
         string outputPath,
-        int channelCapacity = 8,
-        bool blockOnBackpressure = false,
+        int channelCapacity = 32,
+        bool blockOnBackpressure = true,
         bool? compressSpoolFrames = null,
         bool writeThroughSpool = false,
         bool writeSynchronously = false)
@@ -62,26 +68,48 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         Directory.CreateDirectory(_temporaryDirectory);
 
-        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
+        _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
         {
-            SingleReader = true,
+            SingleReader = false,
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait
         });
 
         if (_writeSynchronously)
         {
+            _compressionWorkerCount = 0;
+            _remainingCompressionWorkers = 0;
+            _compressionTasks = Array.Empty<Task>();
             _syncSpoolStream = CreateSpoolStream();
             _writerTask = Task.CompletedTask;
         }
         else
         {
+            _compressionWorkerCount = DetermineCompressionWorkerCount();
+            _remainingCompressionWorkers = _compressionWorkerCount;
+            _compressionTasks = new Task[_compressionWorkerCount];
+
+            for (var index = 0; index < _compressionWorkerCount; index++)
+            {
+                _compressionTasks[index] = Task.Factory.StartNew(
+                    static state =>
+                    {
+                        var session = (RecordingSession)state!;
+                        using var schedulingScope = WindowsScheduling.EnterWriterProfile();
+                        session.CompressFramesAsync().GetAwaiter().GetResult();
+                    },
+                    this,
+                    CancellationToken.None,
+                    TaskCreationOptions.LongRunning,
+                    TaskScheduler.Default);
+            }
+
             _writerTask = Task.Factory.StartNew(
                 static state =>
                 {
                     var session = (RecordingSession)state!;
                     using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                    session.WriteFramesAsync().GetAwaiter().GetResult();
+                    session.WritePreparedFramesAsync().GetAwaiter().GetResult();
                 },
                 this,
                 CancellationToken.None,
@@ -137,12 +165,16 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
 
             FinalizeCurrentFrame(Stopwatch.GetTimestamp());
-            _writeChannel.Writer.TryComplete();
+            _compressionChannel.Writer.TryComplete();
             framesToEncode = _frames.ToArray();
         }
 
         try
         {
+            if (_compressionTasks.Length > 0)
+            {
+                await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+            }
             await _writerTask.ConfigureAwait(false);
             _syncSpoolStream?.Dispose();
 
@@ -178,12 +210,16 @@ internal sealed class RecordingSession : IAsyncDisposable
             if (!_isCompleted)
             {
                 _isCompleted = true;
-                _writeChannel.Writer.TryComplete();
+                _compressionChannel.Writer.TryComplete();
             }
         }
 
         try
         {
+            if (_compressionTasks.Length > 0)
+            {
+                await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+            }
             await _writerTask.ConfigureAwait(false);
         }
         catch
@@ -209,7 +245,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _compressSpoolFrames ??= true;
         recordedFrame.IsCompressed = _compressSpoolFrames.Value;
 
-        var request = new FrameWriteRequest(recordedFrame, frame.PixelData);
+        var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, frame.PixelData);
         if (_writeSynchronously)
         {
             WriteFrameSynchronously(request);
@@ -242,13 +278,64 @@ internal sealed class RecordingSession : IAsyncDisposable
         _currentFrame.DurationSeconds = Math.Max(duration, MinimumFrameDurationSeconds);
     }
 
-    private async Task WriteFramesAsync()
+    private async Task CompressFramesAsync()
+    {
+        try
+        {
+            await foreach (var request in _compressionChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+            {
+                byte[] payload;
+                if (request.Frame.IsCompressed)
+                {
+                    payload = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
+                }
+                else
+                {
+                    payload = request.PixelData;
+                }
+
+                _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
+                    request.Sequence,
+                    request.Frame,
+                    payload,
+                    request.Frame.IsCompressed ? payload.Length : request.PixelData.Length);
+                _preparedFrameSignal.Release();
+            }
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref _remainingCompressionWorkers) == 0)
+            {
+                _preparedFrameSignal.Release();
+            }
+        }
+    }
+
+    private async Task WritePreparedFramesAsync()
     {
         await using var fileStream = CreateSpoolStream();
+        var nextSequence = 1;
 
-        await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+        while (true)
         {
-            await WriteFrameAsync(fileStream, request).ConfigureAwait(false);
+            if (_preparedFrames.TryRemove(nextSequence, out var prepared))
+            {
+                await WritePreparedFrameAsync(fileStream, prepared).ConfigureAwait(false);
+                nextSequence++;
+                continue;
+            }
+
+            if (Volatile.Read(ref _remainingCompressionWorkers) == 0)
+            {
+                if (_preparedFrames.IsEmpty)
+                {
+                    break;
+                }
+
+                throw new InvalidOperationException("一時フレームスプールの順序が壊れています。");
+            }
+
+            await _preparedFrameSignal.WaitAsync().ConfigureAwait(false);
         }
 
         await fileStream.FlushAsync().ConfigureAwait(false);
@@ -274,21 +361,12 @@ internal sealed class RecordingSession : IAsyncDisposable
         _syncSpoolStream.Flush();
     }
 
-    private async Task WriteFrameAsync(FileStream fileStream, FrameWriteRequest request)
+    private async Task WritePreparedFrameAsync(FileStream fileStream, PreparedFrameWriteRequest preparedFrame)
     {
         var frameOffset = fileStream.Position;
-        if (request.Frame.IsCompressed)
-        {
-            var compressedFrame = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
-            await fileStream.WriteAsync(compressedFrame).ConfigureAwait(false);
-        }
-        else
-        {
-            await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
-        }
-
-        request.Frame.SpoolOffset = frameOffset;
-        request.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
+        await fileStream.WriteAsync(preparedFrame.Payload.AsMemory(0, preparedFrame.Length)).ConfigureAwait(false);
+        preparedFrame.Frame.SpoolOffset = frameOffset;
+        preparedFrame.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
     }
 
     private FileStream CreateSpoolStream()
@@ -306,11 +384,11 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         if (_blockOnBackpressure)
         {
-            _writeChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
+            _compressionChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
             return true;
         }
 
-        return _writeChannel.Writer.TryWrite(request);
+        return _compressionChannel.Writer.TryWrite(request);
     }
 
     private double GetOutputFrameRate()
@@ -360,10 +438,22 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private static string ResolveCacheRoot(string outputPath)
     {
-        var outputDirectory = Path.GetDirectoryName(outputPath);
-        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        var overrideRoot = Environment.GetEnvironmentVariable("SPOUT_DIRECT_SAVER_CACHE_ROOT");
+        if (!string.IsNullOrWhiteSpace(overrideRoot))
         {
-            return Path.Combine(outputDirectory, ".spout-cache");
+            return Path.Combine(overrideRoot, "SpoutDirectSaverCache");
+        }
+
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(localAppData))
+        {
+            return Path.Combine(localAppData, "SpoutDirectSaver", "Cache");
+        }
+
+        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        if (!string.IsNullOrWhiteSpace(desktop))
+        {
+            return Path.Combine(desktop, "SpoutDirectSaverCache");
         }
 
         return Path.Combine(Path.GetTempPath(), "SpoutDirectSaver");
@@ -410,5 +500,12 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private sealed record FrameWriteRequest(RecordedFrame Frame, byte[] PixelData);
+    private static int DetermineCompressionWorkerCount()
+    {
+        return Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+    }
+
+    private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, byte[] PixelData);
+
+    private sealed record PreparedFrameWriteRequest(int Sequence, RecordedFrame Frame, byte[] Payload, int Length);
 }
