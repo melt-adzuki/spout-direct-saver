@@ -10,12 +10,15 @@
 
   <ItemGroup>
     <PackageReference Include="Spout.NETCore" Version="2.7.17" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Include="..\SpoutDirectSaver.App\Models\EncoderOption.cs" Link="Models\EncoderOption.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\FramePacket.cs" Link="Models\FramePacket.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\RecordedFrame.cs" Link="Models\RecordedFrame.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\D3D11SpoutSharedTextureReader.cs" Link="Services\D3D11SpoutSharedTextureReader.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\PixelConversion.cs" Link="Services\PixelConversion.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RecordingSession.cs" Link="Services\RecordingSession.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\VideoExportService.cs" Link="Services\VideoExportService.cs" />

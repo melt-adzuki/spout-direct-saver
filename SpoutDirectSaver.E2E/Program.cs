@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text;
 using Spout.Interop;
 using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
@@ -55,6 +54,7 @@ finally
 static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Elapsed, uint Width, uint Height, FrameRateStats FrameRateStats) MeasureReceiveOnly(E2eOptions options)
 {
     using var receiver = new SpoutReceiver();
+    using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
     receiver.CPUmode = options.CpuMode;
     receiver.BufferMode = options.BufferMode;
     receiver.SetFrameCount(options.UseFrameCount);
@@ -87,8 +87,9 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     var nextPollTicks = Stopwatch.GetTimestamp();
     var bufferLength = 0;
     var buffer = IntPtr.Zero;
-    var acceptedFrameTicks = new List<long>();
+    var uniqueAcceptedFrameTicks = new List<long>();
     long? firstAcceptedFrameTick = null;
+    byte[]? lastFallbackFrame = null;
 
     try
     {
@@ -126,31 +127,14 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 continue;
             }
 
-            unsafe
+            if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
             {
-                var receiveWidth = width;
-                var receiveHeight = height;
-                var senderNameBytes = Encoding.ASCII.GetBytes($"{options.SenderName}\0");
-                fixed (byte* senderNamePtr = senderNameBytes)
-                {
-                    var received = receiver.ReceiveImage(
-                        (sbyte*)senderNamePtr,
-                        ref receiveWidth,
-                        ref receiveHeight,
-                        (byte*)buffer,
-                        0x80E1u,
-                        true,
-                        0);
-
-                    if (!received)
-                    {
-                        WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
-                        continue;
-                    }
-                }
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                continue;
             }
 
             var senderFrame = receiver.SenderFrame;
+            var acceptedFrameTick = Stopwatch.GetTimestamp();
             if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
@@ -160,14 +144,13 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
             frameCount++;
             senderFrameStart = senderFrameStart < 0 ? senderFrame : senderFrameStart;
             senderFrameEnd = senderFrame;
-            var acceptedFrameTick = Stopwatch.GetTimestamp();
-            acceptedFrameTicks.Add(acceptedFrameTick);
-            firstAcceptedFrameTick ??= acceptedFrameTick;
             if (senderFrame > 0)
             {
                 if (senderFrame != lastObservedSenderFrame)
                 {
                     uniqueFrameCount++;
+                    uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
+                    firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastObservedSenderFrame = senderFrame;
                 }
 
@@ -178,10 +161,15 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
                 Marshal.Copy(buffer, managedCopy, 0, bufferLength);
                 var fingerprint = ComputeFingerprint(managedCopy);
-                if (lastFallbackFingerprint != fingerprint)
+                if (lastFallbackFingerprint != fingerprint ||
+                    lastFallbackFrame is null ||
+                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy))
                 {
                     uniqueFrameCount++;
+                    uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
+                    firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastFallbackFingerprint = fingerprint;
+                    lastFallbackFrame = managedCopy;
                 }
             }
             firstFrameSeen = true;
@@ -213,12 +201,13 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
         started.Elapsed,
         width,
         height,
-        BuildFrameRateStats(acceptedFrameTicks, captureStartedTicks, captureEndedTicks));
+        BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
 }
 
 static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, string outputPath)
 {
     using var receiver = new SpoutReceiver();
+    using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
     receiver.CPUmode = options.CpuMode;
     receiver.BufferMode = options.BufferMode;
     receiver.SetFrameCount(options.UseFrameCount);
@@ -246,8 +235,9 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     var endTicks = Stopwatch.GetTimestamp() + (long)(TimeSpan.FromSeconds(options.CaptureSeconds).TotalSeconds * Stopwatch.Frequency);
     var nextPollTicks = Stopwatch.GetTimestamp();
     var lastAcceptedSenderFrame = -1;
-    var acceptedFrameTicks = new List<long>();
+    var uniqueAcceptedFrameTicks = new List<long>();
     long? firstAcceptedFrameTick = null;
+    byte[]? lastFallbackFrame = null;
 
     try
     {
@@ -285,28 +275,10 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 continue;
             }
 
-            unsafe
+            if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
             {
-                var receiveWidth = width;
-                var receiveHeight = height;
-                var senderNameBytes = Encoding.ASCII.GetBytes($"{options.SenderName}\0");
-                fixed (byte* senderNamePtr = senderNameBytes)
-                {
-                    var received = receiver.ReceiveImage(
-                        (sbyte*)senderNamePtr,
-                        ref receiveWidth,
-                        ref receiveHeight,
-                        (byte*)buffer,
-                        0x80E1u,
-                        true,
-                        0);
-
-                    if (!received)
-                    {
-                        WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
-                        continue;
-                    }
-                }
+                WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
+                continue;
             }
 
             var senderFrame = receiver.SenderFrame;
@@ -332,13 +304,13 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 acceptedFrameTick,
                 DateTimeOffset.UtcNow));
             frameCount++;
-            acceptedFrameTicks.Add(acceptedFrameTick);
-            firstAcceptedFrameTick ??= acceptedFrameTick;
             if (senderFrame > 0)
             {
                 if (senderFrame != lastObservedSenderFrame)
                 {
                     uniqueFrameCount++;
+                    uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
+                    firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastObservedSenderFrame = senderFrame;
                 }
 
@@ -347,10 +319,15 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             else
             {
                 var fingerprint = ComputeFingerprint(managedCopy);
-                if (lastFallbackFingerprint != fingerprint)
+                if (lastFallbackFingerprint != fingerprint ||
+                    lastFallbackFrame is null ||
+                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy))
                 {
                     uniqueFrameCount++;
+                    uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
+                    firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastFallbackFingerprint = fingerprint;
+                    lastFallbackFrame = managedCopy;
                 }
             }
             WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
@@ -372,7 +349,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             uniqueFrameCount,
             captureElapsed,
             savedPath,
-            BuildFrameRateStats(acceptedFrameTicks, captureStartedTicks, captureEndedTicks));
+            BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
     }
     finally
     {
@@ -434,8 +411,50 @@ static bool PrepareReceive(SpoutReceiver receiver, ReceiveMode receiveMode)
     return receiveMode switch
     {
         ReceiveMode.ImageOnly => receiver.IsConnected ? true : receiver.ReceiveTexture(),
+        ReceiveMode.D3D11SharedTexture => receiver.ReceiveTexture(),
         _ => receiver.ReceiveTexture()
     };
+}
+
+static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader sharedTextureReader, E2eOptions options, IntPtr buffer, ref uint width, ref uint height)
+{
+    switch (options.ReceiveMode)
+    {
+        case ReceiveMode.D3D11SharedTexture:
+            if (!sharedTextureReader.TrySynchronizeSender(receiver, receiver.SenderName, out _))
+            {
+                return false;
+            }
+
+            return sharedTextureReader.TryReadFrame(buffer, checked((int)(width * height * 4)), out _);
+
+        default:
+            unsafe
+            {
+                var receiveWidth = width;
+                var receiveHeight = height;
+                var senderNameBytes = System.Text.Encoding.ASCII.GetBytes($"{options.SenderName}\0");
+                fixed (byte* senderNamePtr = senderNameBytes)
+                {
+                    var received = receiver.ReceiveImage(
+                        (sbyte*)senderNamePtr,
+                        ref receiveWidth,
+                        ref receiveHeight,
+                        (byte*)buffer,
+                        0x80E1u,
+                        true,
+                        0);
+                    if (!received)
+                    {
+                        return false;
+                    }
+                }
+
+                width = receiveWidth;
+                height = receiveHeight;
+                return true;
+            }
+    }
 }
 
 static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
@@ -443,21 +462,40 @@ static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
     const ulong offsetBasis = 14695981039346656037UL;
     const ulong prime = 1099511628211UL;
 
-    var hash = offsetBasis ^ (ulong)pixelData.Length;
+    var hash = offsetBasis;
+    hash = Mix(hash, (ulong)pixelData.Length);
     if (pixelData.IsEmpty)
     {
         return hash;
     }
 
+    AddWindow(pixelData, 0, Math.Min(128, pixelData.Length), ref hash);
+    AddWindow(pixelData, Math.Max(0, (pixelData.Length / 2) - 64), Math.Min(128, pixelData.Length), ref hash);
+    AddWindow(pixelData, Math.Max(0, pixelData.Length - 128), Math.Min(128, pixelData.Length), ref hash);
+
     var checkpoints = 8;
-    for (var i = 0; i < checkpoints; i++)
+    for (var i = 1; i <= checkpoints; i++)
     {
-        var offset = (int)(((long)pixelData.Length - 1) * i / Math.Max(checkpoints - 1, 1));
-        hash ^= pixelData[offset];
-        hash *= prime;
+        var offset = (int)(((long)pixelData.Length - 8) * i / (checkpoints + 1));
+        offset = Math.Clamp(offset, 0, Math.Max(0, pixelData.Length - 8));
+        hash = Mix(hash, System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(pixelData.Slice(offset, 8)));
     }
 
     return hash;
+
+    static void AddWindow(ReadOnlySpan<byte> data, int offset, int length, ref ulong targetHash)
+    {
+        var end = Math.Min(offset + length, data.Length);
+        for (var index = offset; index < end; index++)
+        {
+            targetHash = Mix(targetHash, data[index]);
+        }
+    }
+
+    static ulong Mix(ulong current, ulong value)
+    {
+        return (current ^ value) * prime;
+    }
 }
 
 static FrameRateStats BuildFrameRateStats(IReadOnlyList<long> acceptedFrameTicks, long captureStartedTicks, long captureEndedTicks)
@@ -475,9 +513,14 @@ static FrameRateStats BuildFrameRateStats(IReadOnlyList<long> acceptedFrameTicks
     var startIndex = 0;
     var endIndex = 0;
 
-    while (windowStart < captureEndedTicks)
+    if (captureEndedTicks - captureStartedTicks < windowTicks)
     {
-        var windowEnd = Math.Min(windowStart + windowTicks, captureEndedTicks);
+        return new FrameRateStats(averageFps, averageFps);
+    }
+
+    while (windowStart + windowTicks <= captureEndedTicks)
+    {
+        var windowEnd = windowStart + windowTicks;
         while (startIndex < acceptedFrameTicks.Count && acceptedFrameTicks[startIndex] < windowStart)
         {
             startIndex++;
@@ -512,7 +555,7 @@ static Process? LaunchTestSenderIfRequested(E2eOptions options)
     {
         FileName = "dotnet",
         Arguments =
-            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {options.CaptureSeconds + 3}",
+            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {options.CaptureSeconds + 3} --send-texture",
         RedirectStandardOutput = true,
         RedirectStandardError = true,
         UseShellExecute = false,
@@ -569,7 +612,7 @@ internal sealed record E2eOptions(
         var width = 3840u;
         var height = 2160u;
         var frameRate = 60.0;
-        var receiveMode = ReceiveMode.TextureThenImage;
+        var receiveMode = ReceiveMode.D3D11SharedTexture;
         var cpuMode = true;
         var bufferMode = true;
         var useFrameCount = true;
@@ -605,6 +648,9 @@ internal sealed record E2eOptions(
                 case "--image-only":
                     receiveMode = ReceiveMode.ImageOnly;
                     break;
+                case "--shared-texture-readback":
+                    receiveMode = ReceiveMode.D3D11SharedTexture;
+                    break;
                 case "--no-cpu-mode":
                     cpuMode = false;
                     break;
@@ -635,8 +681,8 @@ internal sealed record E2eOptions(
 
 internal enum ReceiveMode
 {
-    TextureThenImage,
-    ImageOnly
+    D3D11SharedTexture,
+    ImageOnly,
 }
 
 internal sealed record FrameRateStats(double AverageFps, double MinimumOneSecondFps);

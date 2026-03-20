@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -41,7 +42,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             Path.GetTempPath(),
             "SpoutDirectSaver",
             Guid.NewGuid().ToString("N"));
-        _spoolPath = Path.Combine(_temporaryDirectory, "frames.rgba");
+        _spoolPath = Path.Combine(_temporaryDirectory, "frames.bin");
 
         Directory.CreateDirectory(_temporaryDirectory);
 
@@ -66,7 +67,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 _recordedWidth = frame.Width;
                 _recordedHeight = frame.Height;
                 _nominalSourceFps = frame.SenderFps;
-                RegisterFrame(frame, ComputeFingerprint(frame.PixelData));
+                TryRegisterFrame(frame, ComputeFingerprint(frame.PixelData));
                 return;
             }
 
@@ -83,8 +84,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 return;
             }
 
-            FinalizeCurrentFrame(frame.StopwatchTicks);
-            RegisterFrame(frame, fingerprint);
+            TryRegisterFrame(frame, fingerprint);
         }
     }
 
@@ -160,26 +160,31 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private void RegisterFrame(FramePacket frame, ulong fingerprint)
+    private void TryRegisterFrame(FramePacket frame, ulong fingerprint)
     {
-        _frameCounter++;
         var recordedFrame = new RecordedFrame
         {
-            FrameIndex = _frameCounter,
+            FrameIndex = _frameCounter + 1,
             StopwatchTicks = frame.StopwatchTicks,
             TimestampUtc = frame.TimestampUtc
         };
 
+        var request = new FrameWriteRequest(recordedFrame, frame.PixelData);
+        if (!_writeChannel.Writer.TryWrite(request))
+        {
+            return;
+        }
+
+        if (_currentFrame is not null)
+        {
+            FinalizeCurrentFrame(frame.StopwatchTicks);
+        }
+
+        _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
         _lastUniqueFrame = frame.PixelData;
         _lastUniqueFingerprint = fingerprint;
-
-        var request = new FrameWriteRequest(frame.PixelData);
-        if (!_writeChannel.Writer.TryWrite(request))
-        {
-            _writeChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
-        }
     }
 
     private void FinalizeCurrentFrame(long completedStopwatchTicks)
@@ -205,7 +210,14 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
+            var frameOffset = fileStream.Position;
+            await using (var compressionStream = new ZLibStream(fileStream, CompressionLevel.Fastest, leaveOpen: true))
+            {
+                await compressionStream.WriteAsync(request.PixelData).ConfigureAwait(false);
+            }
+
+            request.Frame.SpoolOffset = frameOffset;
+            request.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
         }
 
         await fileStream.FlushAsync().ConfigureAwait(false);
@@ -297,5 +309,5 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private sealed record FrameWriteRequest(byte[] PixelData);
+    private sealed record FrameWriteRequest(RecordedFrame Frame, byte[] PixelData);
 }

@@ -11,4 +11,8 @@ internal sealed class RecordedFrame
     public required DateTimeOffset TimestampUtc { get; init; }
 
     public double DurationSeconds { get; set; }
+
+    public long SpoolOffset { get; set; }
+
+    public int SpoolLength { get; set; }
 }

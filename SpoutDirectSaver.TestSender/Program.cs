@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Spout.Interop;
 
 var options = SenderOptions.Parse(args);
@@ -6,6 +7,7 @@ Console.WriteLine($"sender={options.Name}");
 Console.WriteLine($"size={options.Width}x{options.Height}");
 Console.WriteLine($"fps={options.FrameRate:0.###}");
 Console.WriteLine($"duration={(options.Duration is null ? "infinite" : $"{options.Duration.Value.TotalSeconds:0.###}s")}");
+Console.WriteLine($"mode={(options.SendTexture ? "send-texture" : "send-image")}");
 
 using var sender = new SpoutSender();
 sender.SetFrameCount(true);
@@ -23,6 +25,12 @@ if (!sender.CreateSender(options.Name, options.Width, options.Height, 0))
 var pattern = new MovingPattern(options.Width, options.Height);
 var frameBuffer = GC.AllocateUninitializedArray<byte>(checked((int)(options.Width * options.Height * 4)));
 pattern.Initialize(frameBuffer);
+var textureId = 0u;
+
+if (options.SendTexture)
+{
+    textureId = GlTexture.Create(options.Width, options.Height, frameBuffer);
+}
 
 var nextFrameTicks = Stopwatch.GetTimestamp();
 var endTicks = options.Duration is null
@@ -49,9 +57,14 @@ try
         {
             fixed (byte* pixels = frameBuffer)
             {
-                if (!sender.SendImage(pixels, options.Width, options.Height, 0x80E1u, false, 0))
+                var success = options.SendTexture
+                    ? GlTexture.Upload(textureId, options.Width, options.Height, pixels) &&
+                      sender.SendTexture(textureId, GlTexture.Texture2D, options.Width, options.Height, false, 0)
+                    : sender.SendImage(pixels, options.Width, options.Height, GlTexture.Bgra, false, 0);
+
+                if (!success)
                 {
-                    throw new InvalidOperationException("SendImage failed.");
+                    throw new InvalidOperationException(options.SendTexture ? "SendTexture failed." : "SendImage failed.");
                 }
             }
         }
@@ -72,6 +85,11 @@ try
 }
 finally
 {
+    if (textureId != 0)
+    {
+        GlTexture.Delete(textureId);
+    }
+
     sender.ReleaseSender();
     sender.CloseOpenGL();
 }
@@ -99,7 +117,7 @@ static void WaitUntilNextFrame(ref long nextFrameTicks, double frameRate)
     }
 }
 
-internal sealed record SenderOptions(string Name, uint Width, uint Height, double FrameRate, TimeSpan? Duration)
+internal sealed record SenderOptions(string Name, uint Width, uint Height, double FrameRate, TimeSpan? Duration, bool SendTexture)
 {
     public static SenderOptions Parse(string[] args)
     {
@@ -108,6 +126,7 @@ internal sealed record SenderOptions(string Name, uint Width, uint Height, doubl
         var height = 2160u;
         var frameRate = 60.0;
         TimeSpan? duration = TimeSpan.FromSeconds(10);
+        var sendTexture = true;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -131,11 +150,93 @@ internal sealed record SenderOptions(string Name, uint Width, uint Height, doubl
                 case "--infinite":
                     duration = null;
                     break;
+                case "--send-image":
+                    sendTexture = false;
+                    break;
+                case "--send-texture":
+                    sendTexture = true;
+                    break;
             }
         }
 
-        return new SenderOptions(name, width, height, frameRate, duration);
+        return new SenderOptions(name, width, height, frameRate, duration, sendTexture);
     }
+}
+
+internal static class GlTexture
+{
+    public const uint Texture2D = 0x0DE1u;
+    public const uint Bgra = 0x80E1u;
+    private const uint UnsignedByte = 0x1401u;
+    private const int TextureMinFilter = 0x2801;
+    private const int TextureMagFilter = 0x2800;
+    private const int TextureWrapS = 0x2802;
+    private const int TextureWrapT = 0x2803;
+    private const int Nearest = 0x2600;
+    private const int ClampToEdge = 0x812F;
+    private const int Rgba8 = 0x8058;
+
+    public static uint Create(uint width, uint height, byte[] initialData)
+    {
+        unsafe
+        {
+            fixed (byte* pixels = initialData)
+            {
+                return Create(width, height, pixels);
+            }
+        }
+    }
+
+    public static unsafe uint Create(uint width, uint height, byte* pixels)
+    {
+        uint textureId = 0;
+        glGenTextures(1, &textureId);
+        glBindTexture(Texture2D, textureId);
+        glTexParameteri(Texture2D, TextureMinFilter, Nearest);
+        glTexParameteri(Texture2D, TextureMagFilter, Nearest);
+        glTexParameteri(Texture2D, TextureWrapS, ClampToEdge);
+        glTexParameteri(Texture2D, TextureWrapT, ClampToEdge);
+        glTexImage2D(Texture2D, 0, Rgba8, (int)width, (int)height, 0, Bgra, UnsignedByte, pixels);
+        return textureId;
+    }
+
+    public static unsafe bool Upload(uint textureId, uint width, uint height, byte* pixels)
+    {
+        if (textureId == 0)
+        {
+            return false;
+        }
+
+        glBindTexture(Texture2D, textureId);
+        glTexSubImage2D(Texture2D, 0, 0, 0, (int)width, (int)height, Bgra, UnsignedByte, pixels);
+        return true;
+    }
+
+    public static void Delete(uint textureId)
+    {
+        unsafe
+        {
+            glDeleteTextures(1, &textureId);
+        }
+    }
+
+    [DllImport("opengl32.dll")]
+    private static extern unsafe void glGenTextures(int n, uint* textures);
+
+    [DllImport("opengl32.dll")]
+    private static extern void glBindTexture(uint target, uint texture);
+
+    [DllImport("opengl32.dll")]
+    private static extern void glTexParameteri(uint target, int pname, int param);
+
+    [DllImport("opengl32.dll")]
+    private static extern unsafe void glTexImage2D(uint target, int level, int internalformat, int width, int height, int border, uint format, uint type, void* pixels);
+
+    [DllImport("opengl32.dll")]
+    private static extern unsafe void glTexSubImage2D(uint target, int level, int xoffset, int yoffset, int width, int height, uint format, uint type, void* pixels);
+
+    [DllImport("opengl32.dll")]
+    private static extern unsafe void glDeleteTextures(int n, uint* textures);
 }
 
 internal sealed class MovingPattern

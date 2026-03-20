@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Buffers;
 using System.Collections.Generic;
+using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using SpoutDirectSaver.App.Models;
@@ -87,7 +89,8 @@ internal sealed class VideoExportService
         CancellationToken cancellationToken)
     {
         var frameSize = checked((int)(width * height * 4));
-        var buffer = ArrayPool<byte>.Shared.Rent(frameSize);
+        var rawBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+        byte[] compressedBuffer = Array.Empty<byte>();
         var emittedFrames = 0;
         var accumulatedTimelineFrames = 0.0;
 
@@ -105,7 +108,37 @@ internal sealed class VideoExportService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                await ReadExactAsync(spoolStream, buffer, frameSize, cancellationToken).ConfigureAwait(false);
+                if (frame.SpoolLength <= 0)
+                {
+                    throw new InvalidOperationException("一時フレームスプールのメタデータが壊れています。");
+                }
+
+                if (compressedBuffer.Length < frame.SpoolLength)
+                {
+                    if (compressedBuffer.Length > 0)
+                    {
+                        ArrayPool<byte>.Shared.Return(compressedBuffer);
+                    }
+
+                    compressedBuffer = ArrayPool<byte>.Shared.Rent(frame.SpoolLength);
+                }
+
+                if (spoolStream.Position != frame.SpoolOffset)
+                {
+                    spoolStream.Seek(frame.SpoolOffset, SeekOrigin.Begin);
+                }
+
+                await ReadExactAsync(
+                    spoolStream,
+                    compressedBuffer,
+                    frame.SpoolLength,
+                    cancellationToken).ConfigureAwait(false);
+
+                await InflateFrameAsync(
+                    compressedBuffer.AsMemory(0, frame.SpoolLength),
+                    rawBuffer,
+                    frameSize,
+                    cancellationToken).ConfigureAwait(false);
 
                 accumulatedTimelineFrames += frame.DurationSeconds * outputFrameRate;
                 var targetTotalFrames = Math.Max(emittedFrames + 1, (int)Math.Round(accumulatedTimelineFrames));
@@ -113,7 +146,7 @@ internal sealed class VideoExportService
 
                 for (var i = 0; i < repeatCount; i++)
                 {
-                    await destination.WriteAsync(buffer.AsMemory(0, frameSize), cancellationToken).ConfigureAwait(false);
+                    await destination.WriteAsync(rawBuffer.AsMemory(0, frameSize), cancellationToken).ConfigureAwait(false);
                 }
 
                 emittedFrames = targetTotalFrames;
@@ -123,12 +156,16 @@ internal sealed class VideoExportService
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            ArrayPool<byte>.Shared.Return(rawBuffer);
+            if (compressedBuffer.Length > 0)
+            {
+                ArrayPool<byte>.Shared.Return(compressedBuffer);
+            }
         }
     }
 
     private static async Task ReadExactAsync(
-        FileStream stream,
+        Stream stream,
         byte[] buffer,
         int bytesToRead,
         CancellationToken cancellationToken)
@@ -146,5 +183,21 @@ internal sealed class VideoExportService
 
             totalRead += read;
         }
+    }
+
+    private static async Task InflateFrameAsync(
+        ReadOnlyMemory<byte> compressedFrame,
+        byte[] destinationBuffer,
+        int expectedBytes,
+        CancellationToken cancellationToken)
+    {
+        if (!MemoryMarshal.TryGetArray(compressedFrame, out ArraySegment<byte> segment) || segment.Array is null)
+        {
+            throw new InvalidOperationException("圧縮フレームの読み出しに失敗しました。");
+        }
+
+        using var memoryStream = new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false, publiclyVisible: false);
+        await using var compressionStream = new ZLibStream(memoryStream, CompressionMode.Decompress, leaveOpen: false);
+        await ReadExactAsync(compressionStream, destinationBuffer, expectedBytes, cancellationToken).ConfigureAwait(false);
     }
 }
