@@ -113,32 +113,48 @@ internal sealed class VideoExportService
                     throw new InvalidOperationException("一時フレームスプールのメタデータが壊れています。");
                 }
 
-                if (compressedBuffer.Length < frame.SpoolLength)
-                {
-                    if (compressedBuffer.Length > 0)
-                    {
-                        ArrayPool<byte>.Shared.Return(compressedBuffer);
-                    }
-
-                    compressedBuffer = ArrayPool<byte>.Shared.Rent(frame.SpoolLength);
-                }
-
                 if (spoolStream.Position != frame.SpoolOffset)
                 {
                     spoolStream.Seek(frame.SpoolOffset, SeekOrigin.Begin);
                 }
 
-                await ReadExactAsync(
-                    spoolStream,
-                    compressedBuffer,
-                    frame.SpoolLength,
-                    cancellationToken).ConfigureAwait(false);
+                if (frame.IsCompressed)
+                {
+                    if (compressedBuffer.Length < frame.SpoolLength)
+                    {
+                        if (compressedBuffer.Length > 0)
+                        {
+                            ArrayPool<byte>.Shared.Return(compressedBuffer);
+                        }
 
-                await InflateFrameAsync(
-                    compressedBuffer.AsMemory(0, frame.SpoolLength),
-                    rawBuffer,
-                    frameSize,
-                    cancellationToken).ConfigureAwait(false);
+                        compressedBuffer = ArrayPool<byte>.Shared.Rent(frame.SpoolLength);
+                    }
+
+                    await ReadExactAsync(
+                        spoolStream,
+                        compressedBuffer,
+                        frame.SpoolLength,
+                        cancellationToken).ConfigureAwait(false);
+
+                    await InflateFrameAsync(
+                        compressedBuffer.AsMemory(0, frame.SpoolLength),
+                        rawBuffer,
+                        frameSize,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    if (frame.SpoolLength != frameSize)
+                    {
+                        throw new InvalidOperationException("raw スプールフレームのサイズが想定と一致しません。");
+                    }
+
+                    await ReadExactAsync(
+                        spoolStream,
+                        rawBuffer,
+                        frameSize,
+                        cancellationToken).ConfigureAwait(false);
+                }
 
                 accumulatedTimelineFrames += frame.DurationSeconds * outputFrameRate;
                 var targetTotalFrames = Math.Max(emittedFrames + 1, (int)Math.Round(accumulatedTimelineFrames));

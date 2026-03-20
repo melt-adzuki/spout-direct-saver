@@ -1,5 +1,7 @@
 using System;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Spout.Interop;
@@ -12,13 +14,33 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 {
     private const int ReceiveBufferCount = 4;
     private readonly object _startGate = new();
+    private readonly object _previewGate = new();
 
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
+    private IntPtr _previewFrontBuffer = IntPtr.Zero;
+    private IntPtr _previewBackBuffer = IntPtr.Zero;
+    private int _previewBufferLength;
+    private LivePreviewFrame _latestPreviewFrame;
+    private bool _hasPreviewFrame;
 
     public event EventHandler<FramePacket>? FrameArrived;
 
     public event EventHandler<CaptureStatus>? StatusChanged;
+
+    public bool TryReadLatestPreviewFrame(Action<LivePreviewFrame> reader)
+    {
+        lock (_previewGate)
+        {
+            if (!_hasPreviewFrame || _previewFrontBuffer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            reader(_latestPreviewFrame);
+            return true;
+        }
+    }
 
     public Task StartAsync()
     {
@@ -70,23 +92,20 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 // Normal shutdown path.
             }
         }
+
+        ReleasePreviewBuffers();
     }
 
     private void RunPollingLoop(CancellationToken cancellationToken)
     {
+        using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
         using var receiver = new SpoutReceiver();
-        using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
 
         if (!receiver.CreateOpenGL())
         {
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout OpenGL コンテキストの初期化に失敗しました。"));
             return;
         }
-
-        receiver.CPUmode = true;
-        receiver.BufferMode = true;
-        receiver.Buffers = ReceiveBufferCount;
-        receiver.SetFrameCount(true);
 
         bool wasConnected = false;
         string senderName = string.Empty;
@@ -97,12 +116,24 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
         try
         {
+            receiver.SetCPUmode(false);
+            receiver.BufferMode = true;
+            receiver.Buffers = ReceiveBufferCount;
+            receiver.SetFrameCount(true);
+
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender を待っています。"));
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                var stateReady = PrepareReceive(receiver);
-                if (!stateReady && !receiver.IsConnected)
+                if (!TryReceivePreviewImage(
+                        receiver,
+                        senderName,
+                        width,
+                        height,
+                        out var receivedSenderName,
+                        out var receivedWidth,
+                        out var receivedHeight,
+                        out var receiveMessage))
                 {
                     if (wasConnected)
                     {
@@ -118,44 +149,23 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     continue;
                 }
 
-                var senderWidth = receiver.SenderWidth;
-                var senderHeight = receiver.SenderHeight;
-                if (senderWidth == 0 || senderHeight == 0)
-                {
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                    continue;
-                }
-
                 var senderWasUpdated =
                     !wasConnected ||
-                    !stateReady ||
                     receiver.IsUpdated ||
-                    senderWidth != width ||
-                    senderHeight != height;
+                    receivedWidth != width ||
+                    receivedHeight != height ||
+                    !string.Equals(receivedSenderName, senderName, StringComparison.Ordinal);
 
                 if (senderWasUpdated)
                 {
-                    width = senderWidth;
-                    height = senderHeight;
-
-                    var connectedSenderName = receiver.SenderName;
-                    if (!sharedTextureReader.TrySynchronizeSender(receiver, connectedSenderName, out var syncError))
-                    {
-                        RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, syncError ?? "共有テクスチャの初期化に失敗しました。"));
-                        wasConnected = false;
-                        senderName = string.Empty;
-                        width = 0;
-                        height = 0;
-                        lastAcceptedSenderFrame = -1;
-                        WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                        continue;
-                    }
+                    width = receivedWidth;
+                    height = receivedHeight;
+                    senderName = receivedSenderName;
 
                     var message = wasConnected
                         ? $"sender の状態が更新されました: {width} x {height}"
-                        : $"Spout sender \"{connectedSenderName}\" に接続しました。";
+                        : $"Spout sender \"{senderName}\" に接続しました。";
 
-                    senderName = connectedSenderName;
                     wasConnected = true;
                     lastAcceptedSenderFrame = -1;
 
@@ -165,35 +175,10 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         width,
                         height,
                         receiver.SenderFps,
-                        message));
+                        receiveMessage ?? message));
 
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
-                }
-
-                if (!sharedTextureReader.TrySynchronizeSender(receiver, senderName, out var resyncError))
-                {
-                    RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, resyncError ?? "共有テクスチャへの再接続に失敗しました。"));
-                    wasConnected = false;
-                    senderName = string.Empty;
-                    width = 0;
-                    height = 0;
-                    lastAcceptedSenderFrame = -1;
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                    continue;
-                }
-
-                if (!string.Equals(senderName, receiver.SenderName, StringComparison.Ordinal))
-                {
-                    senderName = receiver.SenderName;
-                    lastAcceptedSenderFrame = -1;
-                    RaiseStatus(new CaptureStatus(
-                        true,
-                        senderName,
-                        width,
-                        height,
-                        receiver.SenderFps,
-                        $"受信 sender が \"{senderName}\" に切り替わりました。"));
                 }
 
                 var senderFrame = receiver.SenderFrame;
@@ -203,29 +188,28 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     continue;
                 }
 
-                var frameLength = checked((int)(width * height * 4));
-                var frameCopy = GC.AllocateUninitializedArray<byte>(frameLength);
-                if (!sharedTextureReader.TryReadFrame(frameCopy, out var readError))
+                lastAcceptedSenderFrame = senderFrame;
+                PublishPreviewFrame(width, height, senderName, receiver.SenderFps, Stopwatch.GetTimestamp());
+
+                var frameHandler = FrameArrived;
+                if (frameHandler is not null)
                 {
-                    if (!string.IsNullOrWhiteSpace(readError))
+                    var frameCopy = GC.AllocateUninitializedArray<byte>(_previewBufferLength);
+                    lock (_previewGate)
                     {
-                        RaiseStatus(new CaptureStatus(true, senderName, width, height, receiver.SenderFps, readError));
+                        Marshal.Copy(_previewFrontBuffer, frameCopy, 0, _previewBufferLength);
                     }
 
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                    continue;
+                    frameHandler.Invoke(this, new FramePacket(
+                        frameCopy,
+                        width,
+                        height,
+                        senderName,
+                        receiver.SenderFps,
+                        _latestPreviewFrame.StopwatchTicks,
+                        DateTimeOffset.UtcNow));
                 }
 
-                lastAcceptedSenderFrame = senderFrame;
-
-                FrameArrived?.Invoke(this, new FramePacket(
-                    frameCopy,
-                    width,
-                    height,
-                    senderName,
-                    receiver.SenderFps,
-                    Stopwatch.GetTimestamp(),
-                    DateTimeOffset.UtcNow));
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
             }
         }
@@ -242,12 +226,144 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
     private static bool PrepareReceive(SpoutReceiver receiver)
     {
-        return receiver.IsConnected ? true : receiver.ReceiveTexture();
+        return receiver.ReceiveTexture();
+    }
+
+    private bool TryReceivePreviewImage(
+        SpoutReceiver receiver,
+        string senderName,
+        uint width,
+        uint height,
+        out string receivedSenderName,
+        out uint receivedWidth,
+        out uint receivedHeight,
+        out string? message)
+    {
+        unsafe
+        {
+            var senderNameBytes = new byte[256];
+            if (!string.IsNullOrWhiteSpace(senderName))
+            {
+                var encodedName = Encoding.ASCII.GetBytes(senderName);
+                Array.Copy(encodedName, senderNameBytes, Math.Min(encodedName.Length, senderNameBytes.Length - 1));
+            }
+
+            receivedWidth = width;
+            receivedHeight = height;
+
+            fixed (byte* senderNamePtr = senderNameBytes)
+            {
+                var pixelBuffer = _previewBackBuffer == IntPtr.Zero ? null : (byte*)_previewBackBuffer;
+                var received = receiver.ReceiveImage(
+                    (sbyte*)senderNamePtr,
+                    ref receivedWidth,
+                    ref receivedHeight,
+                    pixelBuffer,
+                    0x80E1u,
+                    false,
+                    0);
+
+                receivedSenderName = ReadNullTerminatedAscii(senderNameBytes);
+                if (!received)
+                {
+                    message = null;
+                    return false;
+                }
+            }
+        }
+
+        if (receivedWidth == 0 || receivedHeight == 0)
+        {
+            message = null;
+            return false;
+        }
+
+        var requiredLength = checked((int)(receivedWidth * receivedHeight * 4));
+        if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
+        {
+            EnsurePreviewBufferSize(requiredLength);
+            message = $"受信サイズ {receivedWidth} x {receivedHeight} に合わせてバッファを再初期化しました。";
+            return false;
+        }
+
+        message = null;
+        return true;
+    }
+
+    private static string ReadNullTerminatedAscii(byte[] buffer)
+    {
+        var length = Array.IndexOf(buffer, (byte)0);
+        if (length < 0)
+        {
+            length = buffer.Length;
+        }
+
+        return Encoding.ASCII.GetString(buffer, 0, length);
     }
 
     private void RaiseStatus(CaptureStatus status)
     {
         StatusChanged?.Invoke(this, status);
+    }
+
+    private void EnsurePreviewBufferSize(int requiredBufferLength)
+    {
+        lock (_previewGate)
+        {
+            if (_previewFrontBuffer != IntPtr.Zero && _previewBufferLength == requiredBufferLength)
+            {
+                return;
+            }
+
+            ReleasePreviewBuffersUnsafe();
+            _previewFrontBuffer = Marshal.AllocHGlobal(requiredBufferLength);
+            _previewBackBuffer = Marshal.AllocHGlobal(requiredBufferLength);
+            _previewBufferLength = requiredBufferLength;
+            _hasPreviewFrame = false;
+        }
+    }
+
+    private void PublishPreviewFrame(uint width, uint height, string senderName, double senderFps, long stopwatchTicks)
+    {
+        lock (_previewGate)
+        {
+            (_previewFrontBuffer, _previewBackBuffer) = (_previewBackBuffer, _previewFrontBuffer);
+            _latestPreviewFrame = new LivePreviewFrame(
+                _previewFrontBuffer,
+                width,
+                height,
+                senderName,
+                senderFps,
+                stopwatchTicks);
+            _hasPreviewFrame = true;
+        }
+    }
+
+    private void ReleasePreviewBuffers()
+    {
+        lock (_previewGate)
+        {
+            ReleasePreviewBuffersUnsafe();
+        }
+    }
+
+    private void ReleasePreviewBuffersUnsafe()
+    {
+        if (_previewFrontBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_previewFrontBuffer);
+            _previewFrontBuffer = IntPtr.Zero;
+        }
+
+        if (_previewBackBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_previewBackBuffer);
+            _previewBackBuffer = IntPtr.Zero;
+        }
+
+        _previewBufferLength = 0;
+        _hasPreviewFrame = false;
+        _latestPreviewFrame = default;
     }
 
     private static void WaitUntilNextPoll(ref long nextPollTicks, double senderFps, CancellationToken cancellationToken)

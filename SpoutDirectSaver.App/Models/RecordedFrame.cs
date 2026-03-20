@@ -15,4 +15,6 @@ internal sealed class RecordedFrame
     public long SpoolOffset { get; set; }
 
     public int SpoolLength { get; set; }
+
+    public bool IsCompressed { get; set; }
 }

@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Spout.Interop;
+using SpoutDirectSaver.App.Services;
 
 var options = SenderOptions.Parse(args);
+WindowsScheduling.TryPromoteCurrentProcess(ProcessPriorityClass.High);
+using var schedulingScope = WindowsScheduling.EnterGameProfile();
 Console.WriteLine($"sender={options.Name}");
 Console.WriteLine($"size={options.Width}x{options.Height}");
 Console.WriteLine($"fps={options.FrameRate:0.###}");

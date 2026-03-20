@@ -5,9 +5,11 @@ using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
 
 var options = E2eOptions.Parse(args);
+WindowsScheduling.TryPromoteCurrentProcess(ProcessPriorityClass.High);
+using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
 var outputDirectory = Path.Combine(Environment.CurrentDirectory, ".tmp-e2e-output");
 Directory.CreateDirectory(outputDirectory);
-var outputPath = Path.Combine(outputDirectory, $"capture_{DateTime.Now:yyyyMMdd_HHmmss}.mov");
+var outputPath = Path.Combine(outputDirectory, $"capture_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.mov");
 
 Console.WriteLine($"sender={options.SenderName}");
 Console.WriteLine($"captureSeconds={options.CaptureSeconds}");
@@ -55,18 +57,19 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
-    receiver.CPUmode = options.CpuMode;
-    receiver.BufferMode = options.BufferMode;
-    receiver.SetFrameCount(options.UseFrameCount);
-    receiver.Buffers = options.BufferCount;
-    if (options.FrameSync)
-    {
-        receiver.SetFrameSync(options.SenderName);
-    }
 
     if (!receiver.CreateOpenGL())
     {
         throw new InvalidOperationException("CreateOpenGL failed.");
+    }
+
+    receiver.SetCPUmode(options.CpuMode);
+    receiver.BufferMode = options.BufferMode;
+    receiver.Buffers = options.BufferCount;
+    receiver.SetFrameCount(options.UseFrameCount);
+    if (options.FrameSync)
+    {
+        receiver.SetFrameSync(options.SenderName);
     }
 
     receiver.SetReceiverName(options.SenderName);
@@ -80,6 +83,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     var senderFrameEnd = -1;
     var lastObservedSenderFrame = -1;
     var lastAcceptedSenderFrame = -1;
+    var diagnosticsPrinted = false;
     ulong? lastFallbackFingerprint = null;
     var duration = TimeSpan.FromSeconds(options.CaptureSeconds);
     var started = Stopwatch.StartNew();
@@ -95,7 +99,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     {
         while (Stopwatch.GetTimestamp() < endTicks)
         {
-            if (!PrepareReceive(receiver, options.ReceiveMode) && !receiver.IsConnected)
+            if (!PrepareReceive(receiver, options) && !receiver.IsConnected)
             {
                 Thread.Sleep(1);
                 continue;
@@ -107,6 +111,12 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
             {
                 Thread.Sleep(1);
                 continue;
+            }
+
+            if (!diagnosticsPrinted)
+            {
+                PrintReceiverDiagnostics(receiver);
+                diagnosticsPrinted = true;
             }
 
             var requiredLength = checked((int)(width * height * 4));
@@ -208,18 +218,19 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
-    receiver.CPUmode = options.CpuMode;
-    receiver.BufferMode = options.BufferMode;
-    receiver.SetFrameCount(options.UseFrameCount);
-    receiver.Buffers = options.BufferCount;
-    if (options.FrameSync)
-    {
-        receiver.SetFrameSync(options.SenderName);
-    }
 
     if (!receiver.CreateOpenGL())
     {
         throw new InvalidOperationException("CreateOpenGL failed.");
+    }
+
+    receiver.SetCPUmode(options.CpuMode);
+    receiver.BufferMode = options.BufferMode;
+    receiver.Buffers = options.BufferCount;
+    receiver.SetFrameCount(options.UseFrameCount);
+    if (options.FrameSync)
+    {
+        receiver.SetFrameSync(options.SenderName);
     }
 
     receiver.SetReceiverName(options.SenderName);
@@ -238,12 +249,13 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     var uniqueAcceptedFrameTicks = new List<long>();
     long? firstAcceptedFrameTick = null;
     byte[]? lastFallbackFrame = null;
+    var diagnosticsPrinted = false;
 
     try
     {
         while (Stopwatch.GetTimestamp() < endTicks)
         {
-            if (!PrepareReceive(receiver, options.ReceiveMode) && !receiver.IsConnected)
+            if (!PrepareReceive(receiver, options) && !receiver.IsConnected)
             {
                 Thread.Sleep(1);
                 continue;
@@ -255,6 +267,12 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             {
                 Thread.Sleep(1);
                 continue;
+            }
+
+            if (!diagnosticsPrinted)
+            {
+                PrintReceiverDiagnostics(receiver);
+                diagnosticsPrinted = true;
             }
 
             var requiredLength = checked((int)(width * height * 4));
@@ -406,14 +424,33 @@ static void WaitUntilNextPoll(ref long nextPollTicks, double senderFps)
     }
 }
 
-static bool PrepareReceive(SpoutReceiver receiver, ReceiveMode receiveMode)
+static bool PrepareReceive(SpoutReceiver receiver, E2eOptions options)
 {
-    return receiveMode switch
+    return options.ReceiveMode switch
     {
-        ReceiveMode.ImageOnly => receiver.IsConnected ? true : receiver.ReceiveTexture(),
-        ReceiveMode.D3D11SharedTexture => receiver.ReceiveTexture(),
+        ReceiveMode.D3D11SharedTexture => PrepareDirectSharedTextureReceive(receiver, options.SenderName),
         _ => receiver.ReceiveTexture()
     };
+}
+
+static bool PrepareDirectSharedTextureReceive(SpoutReceiver receiver, string senderName)
+{
+    unsafe
+    {
+        var requestedSenderBytes = System.Text.Encoding.ASCII.GetBytes($"{senderName}\0");
+        fixed (byte* requestedSenderPtr = requestedSenderBytes)
+        {
+            uint width = 0;
+            uint height = 0;
+            if (!receiver.IsConnected)
+            {
+                return receiver.CreateReceiver((sbyte*)requestedSenderPtr, ref width, ref height);
+            }
+
+            var connected = receiver.IsConnected;
+            return receiver.CheckReceiver((sbyte*)requestedSenderPtr, ref width, ref height, ref connected);
+        }
+    }
 }
 
 static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader sharedTextureReader, E2eOptions options, IntPtr buffer, ref uint width, ref uint height)
@@ -442,7 +479,7 @@ static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader s
                         ref receiveHeight,
                         (byte*)buffer,
                         0x80E1u,
-                        true,
+                        options.Invert,
                         0);
                     if (!received)
                     {
@@ -588,6 +625,34 @@ static Process? LaunchTestSenderIfRequested(E2eOptions options)
     return process;
 }
 
+static void PrintReceiverDiagnostics(SpoutReceiver receiver)
+{
+    Console.WriteLine($"receiver_adapter_index={receiver.Adapter}");
+    Console.WriteLine($"receiver_adapter_name={ReadAdapterName(receiver)}");
+    Console.WriteLine($"receiver_is_gldx_ready={receiver.IsGLDXready}");
+    Console.WriteLine($"receiver_auto_share={receiver.AutoShare}");
+    Console.WriteLine($"receiver_cpu_mode={receiver.CPUmode}");
+    Console.WriteLine($"receiver_cpu_share={receiver.CPUshare}");
+    Console.WriteLine($"receiver_buffer_mode={receiver.BufferMode}");
+    Console.WriteLine($"receiver_share_mode={receiver.ShareMode}");
+    Console.WriteLine($"sender_cpu={receiver.SenderCPU}");
+    Console.WriteLine($"sender_gldx={receiver.SenderGLDX}");
+    Console.WriteLine($"sender_format={receiver.SenderFormat}");
+    Console.WriteLine($"sender_handle=0x{receiver.SenderHandle.ToInt64():X}");
+}
+
+static string ReadAdapterName(SpoutReceiver receiver)
+{
+    unsafe
+    {
+        var buffer = stackalloc sbyte[256];
+        buffer[0] = 0;
+        return receiver.GetAdapterName(receiver.Adapter, buffer, 256)
+            ? new string(buffer)
+            : "(unavailable)";
+    }
+}
+
 internal sealed record E2eOptions(
     string SenderName,
     int CaptureSeconds,
@@ -601,7 +666,8 @@ internal sealed record E2eOptions(
     bool BufferMode,
     bool UseFrameCount,
     int BufferCount,
-    bool FrameSync)
+    bool FrameSync,
+    bool Invert)
 {
     public static E2eOptions Parse(string[] args)
     {
@@ -612,12 +678,13 @@ internal sealed record E2eOptions(
         var width = 3840u;
         var height = 2160u;
         var frameRate = 60.0;
-        var receiveMode = ReceiveMode.D3D11SharedTexture;
-        var cpuMode = true;
+        var receiveMode = ReceiveMode.ImageOnly;
+        var cpuMode = false;
         var bufferMode = true;
         var useFrameCount = true;
         var bufferCount = 2;
         var frameSync = false;
+        var invert = false;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -654,6 +721,12 @@ internal sealed record E2eOptions(
                 case "--no-cpu-mode":
                     cpuMode = false;
                     break;
+                case "--cpu-mode":
+                    cpuMode = true;
+                    break;
+                case "--buffer-mode":
+                    bufferMode = true;
+                    break;
                 case "--no-buffer-mode":
                     bufferMode = false;
                     break;
@@ -666,6 +739,12 @@ internal sealed record E2eOptions(
                 case "--frame-sync":
                     frameSync = true;
                     break;
+                case "--invert":
+                    invert = true;
+                    break;
+                case "--no-invert":
+                    invert = false;
+                    break;
                 default:
                     if (!args[index].StartsWith("--", StringComparison.Ordinal))
                     {
@@ -675,7 +754,7 @@ internal sealed record E2eOptions(
             }
         }
 
-        return new E2eOptions(senderName, captureSeconds, launchTestSender, ignoreIsFrameNew, width, height, frameRate, receiveMode, cpuMode, bufferMode, useFrameCount, bufferCount, frameSync);
+        return new E2eOptions(senderName, captureSeconds, launchTestSender, ignoreIsFrameNew, width, height, frameRate, receiveMode, cpuMode, bufferMode, useFrameCount, bufferCount, frameSync, invert);
     }
 }
 

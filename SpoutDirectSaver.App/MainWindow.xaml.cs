@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.IO;
+using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -27,7 +28,6 @@ public partial class MainWindow : Window
     private WriteableBitmap? _liveBitmap;
 
     private RecordingSession? _recordingSession;
-    private FramePacket? _latestFrame;
     private CaptureStatus? _latestStatus;
     private string? _outputPath;
     private string? _lastRecordedFilePath;
@@ -35,6 +35,7 @@ public partial class MainWindow : Window
     private bool _isStopping;
     private bool _isSeekingPreview;
     private long _lastRenderedPreviewTicks;
+    private GCLatencyMode? _recordingLatencyModeRestore;
 
     public MainWindow()
     {
@@ -61,7 +62,6 @@ public partial class MainWindow : Window
             IsEnabled = false
         };
 
-        _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
         _spoutPollingService.StatusChanged += SpoutPollingService_OnStatusChanged;
         CompositionTarget.Rendering += CompositionTarget_OnRendering;
 
@@ -84,6 +84,7 @@ public partial class MainWindow : Window
         if (_recordingSession is not null)
         {
             await _recordingSession.DisposeAsync();
+            EndRecordingLatencyScope();
         }
 
         CompositionTarget.Rendering -= CompositionTarget_OnRendering;
@@ -134,6 +135,8 @@ public partial class MainWindow : Window
         ResetPreviewArea();
 
         _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
+        BeginRecordingLatencyScope();
         _recordingStartedAt = DateTimeOffset.UtcNow;
         _recordingTimer.Start();
 
@@ -163,6 +166,7 @@ public partial class MainWindow : Window
             var outputPath = await _recordingSession.FinalizeAsync(_videoExportService, CancellationToken.None);
             _lastRecordedFilePath = outputPath;
             _recordingSession = null;
+            _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
 
             LoadPreview(outputPath);
             RecorderStatusTextBlock.Text = $"保存完了: {outputPath}";
@@ -180,9 +184,12 @@ public partial class MainWindow : Window
                 await _recordingSession.DisposeAsync();
                 _recordingSession = null;
             }
+
+            _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
         }
         finally
         {
+            EndRecordingLatencyScope();
             _recordingStartedAt = null;
             _isStopping = false;
             UpdateRecordingElapsed();
@@ -304,7 +311,6 @@ public partial class MainWindow : Window
     {
         try
         {
-            _latestFrame = frame;
             if (!_isStopping)
             {
                 _recordingSession?.AppendFrame(frame);
@@ -322,17 +328,24 @@ public partial class MainWindow : Window
 
     private void CompositionTarget_OnRendering(object? sender, EventArgs e)
     {
-        var frame = _latestFrame;
-        if (frame is null || frame.StopwatchTicks == _lastRenderedPreviewTicks)
+        var rendered = _spoutPollingService.TryReadLatestPreviewFrame(frame =>
+        {
+            if (frame.StopwatchTicks == _lastRenderedPreviewTicks)
+            {
+                return;
+            }
+
+            RenderLivePreview(frame);
+            _lastRenderedPreviewTicks = frame.StopwatchTicks;
+        });
+
+        if (!rendered)
         {
             return;
         }
-
-        RenderLivePreview(frame);
-        _lastRenderedPreviewTicks = frame.StopwatchTicks;
     }
 
-    private void RenderLivePreview(FramePacket frame)
+    private void RenderLivePreview(LivePreviewFrame frame)
     {
         var width = (int)frame.Width;
         var height = (int)frame.Height;
@@ -344,7 +357,7 @@ public partial class MainWindow : Window
             LivePreviewImage.Source = _liveBitmap;
         }
 
-        _liveBitmap.WritePixels(new Int32Rect(0, 0, width, height), frame.PixelData, stride, 0);
+        _liveBitmap.WritePixels(new Int32Rect(0, 0, width, height), frame.PixelData, stride * height, stride);
 
         LivePreviewPlaceholderBorder.Visibility = Visibility.Collapsed;
         SenderNameTextBlock.Text = string.IsNullOrWhiteSpace(frame.SenderName) ? "-" : frame.SenderName;
@@ -455,6 +468,28 @@ public partial class MainWindow : Window
     }
 
     private EncoderOption SelectedEncoderOption => (EncoderOption)(FormatComboBox.SelectedItem ?? _encoderOptions[0]);
+
+    private void BeginRecordingLatencyScope()
+    {
+        if (_recordingLatencyModeRestore is not null)
+        {
+            return;
+        }
+
+        _recordingLatencyModeRestore = GCSettings.LatencyMode;
+        GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+    }
+
+    private void EndRecordingLatencyScope()
+    {
+        if (_recordingLatencyModeRestore is null)
+        {
+            return;
+        }
+
+        GCSettings.LatencyMode = _recordingLatencyModeRestore.Value;
+        _recordingLatencyModeRestore = null;
+    }
 
     private static string BuildSuggestedOutputName(EncoderOption option)
     {

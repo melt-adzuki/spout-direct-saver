@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using SharpGen.Runtime;
 using Spout.Interop;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -11,14 +12,15 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 {
     private const int KeyedMutexTimeoutMilliseconds = 5;
     private const int AccessMutexTimeoutMilliseconds = 67;
-
-    private readonly ID3D11Device _device;
-    private readonly ID3D11DeviceContext _deviceContext;
+    private readonly IDXGIFactory1 _dxgiFactory;
 
     private Mutex? _accessMutex;
+    private ID3D11Device? _device;
+    private ID3D11DeviceContext? _deviceContext;
     private ID3D11Texture2D? _sharedTexture;
     private ID3D11Texture2D? _stagingTexture;
     private IDXGIKeyedMutex? _keyedMutex;
+    private int _deviceAdapterIndex = int.MinValue;
     private IntPtr _sharedHandle;
     private string _senderName = string.Empty;
     private uint _width;
@@ -27,11 +29,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
     public D3D11SpoutSharedTextureReader()
     {
-        _device = D3D11.D3D11CreateDevice(
-            DriverType.Hardware,
-            DeviceCreationFlags.BgraSupport,
-            Array.Empty<FeatureLevel>());
-        _deviceContext = _device.ImmediateContext;
+        _dxgiFactory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
     }
 
     public uint Width => _width;
@@ -51,6 +49,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
         unsafe
         {
+            EnsureDevice(receiver.Adapter);
+
             uint width = 0;
             uint height = 0;
             uint dxgiFormat = 0;
@@ -139,7 +139,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             }
 
             sharedAccessAcquired = true;
-            _deviceContext.CopyResource(_stagingTexture, _sharedTexture);
+            _deviceContext!.CopyResource(_stagingTexture, _sharedTexture);
             _deviceContext.Flush();
             var mapped = _deviceContext.Map(_stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
 
@@ -175,15 +175,16 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     public void Dispose()
     {
         ResetResources();
-        _deviceContext.Dispose();
-        _device.Dispose();
+        _deviceContext?.Dispose();
+        _device?.Dispose();
+        _dxgiFactory.Dispose();
     }
 
     private void RecreateResources(string senderName, IntPtr sharedHandle, uint width, uint height, Format format)
     {
         ResetResources();
 
-        var sharedTexture = _device.OpenSharedResource<ID3D11Texture2D>(sharedHandle);
+        var sharedTexture = _device!.OpenSharedResource<ID3D11Texture2D>(sharedHandle);
         var sharedDescription = sharedTexture.Description;
         var stagingDescription = new Texture2DDescription(
             sharedDescription.Format,
@@ -209,6 +210,57 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _width = width;
         _height = height;
         _format = format;
+    }
+
+    private void EnsureDevice(int adapterIndex)
+    {
+        if (_device is not null && _deviceContext is not null && _deviceAdapterIndex == adapterIndex)
+        {
+            return;
+        }
+
+        ResetResources();
+        _deviceContext?.Dispose();
+        _device?.Dispose();
+        _deviceContext = null;
+        _device = null;
+
+        IDXGIAdapter1? adapter = null;
+        try
+        {
+            if (adapterIndex >= 0)
+            {
+                var adapterResult = _dxgiFactory.EnumAdapters1((uint)adapterIndex, out adapter);
+                if (adapterResult.Success && adapter is not null)
+                {
+                    ID3D11Device? device;
+                    ID3D11DeviceContext? context;
+                    var result = D3D11.D3D11CreateDevice(
+                        adapter,
+                        DriverType.Unknown,
+                        DeviceCreationFlags.BgraSupport,
+                        Array.Empty<FeatureLevel>(),
+                        out device,
+                        out context);
+                    result.CheckError();
+                    _device = device;
+                    _deviceContext = context;
+                    _deviceAdapterIndex = adapterIndex;
+                    return;
+                }
+            }
+
+            _device = D3D11.D3D11CreateDevice(
+                DriverType.Hardware,
+                DeviceCreationFlags.BgraSupport,
+                Array.Empty<FeatureLevel>());
+            _deviceContext = _device.ImmediateContext;
+            _deviceAdapterIndex = -1;
+        }
+        finally
+        {
+            adapter?.Dispose();
+        }
     }
 
     private void ResetResources()
@@ -342,4 +394,5 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             destinationRow[offset + 3] = sourceRow[offset + 3];
         }
     }
+
 }

@@ -14,6 +14,7 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class RecordingSession : IAsyncDisposable
 {
     private const double MinimumFrameDurationSeconds = 1.0 / 120.0;
+    private const int RawSpoolThresholdBytes = 3840 * 2160 * 4;
 
     private readonly object _gate = new();
     private readonly EncoderOption _encoderOption;
@@ -33,14 +34,14 @@ internal sealed class RecordingSession : IAsyncDisposable
     private int _frameCounter;
     private bool _isCompleted;
     private bool _disposed;
+    private bool? _compressSpoolFrames;
 
     public RecordingSession(EncoderOption encoderOption, string outputPath)
     {
         _encoderOption = encoderOption;
         _outputPath = outputPath;
         _temporaryDirectory = Path.Combine(
-            Path.GetTempPath(),
-            "SpoutDirectSaver",
+            ResolveCacheRoot(outputPath),
             Guid.NewGuid().ToString("N"));
         _spoolPath = Path.Combine(_temporaryDirectory, "frames.bin");
 
@@ -53,7 +54,17 @@ internal sealed class RecordingSession : IAsyncDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        _writerTask = Task.Run(WriteFramesAsync);
+        _writerTask = Task.Factory.StartNew(
+            static state =>
+            {
+                var session = (RecordingSession)state!;
+                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
+                session.WriteFramesAsync().GetAwaiter().GetResult();
+            },
+            this,
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     public void AppendFrame(FramePacket frame)
@@ -169,6 +180,9 @@ internal sealed class RecordingSession : IAsyncDisposable
             TimestampUtc = frame.TimestampUtc
         };
 
+        _compressSpoolFrames ??= frame.PixelData.Length < RawSpoolThresholdBytes;
+        recordedFrame.IsCompressed = _compressSpoolFrames.Value;
+
         var request = new FrameWriteRequest(recordedFrame, frame.PixelData);
         if (!_writeChannel.Writer.TryWrite(request))
         {
@@ -205,15 +219,20 @@ internal sealed class RecordingSession : IAsyncDisposable
             FileMode.Create,
             FileAccess.Write,
             FileShare.Read,
-            1024 * 1024,
-            FileOptions.SequentialScan);
+            4 * 1024 * 1024,
+            FileOptions.Asynchronous);
 
         await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             var frameOffset = fileStream.Position;
-            await using (var compressionStream = new ZLibStream(fileStream, CompressionLevel.Fastest, leaveOpen: true))
+            if (request.Frame.IsCompressed)
             {
+                await using var compressionStream = new ZLibStream(fileStream, CompressionLevel.Fastest, leaveOpen: true);
                 await compressionStream.WriteAsync(request.PixelData).ConfigureAwait(false);
+            }
+            else
+            {
+                await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
             }
 
             request.Frame.SpoolOffset = frameOffset;
@@ -266,6 +285,17 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             // Keep temp files if cleanup fails.
         }
+    }
+
+    private static string ResolveCacheRoot(string outputPath)
+    {
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            return Path.Combine(outputDirectory, ".spout-cache");
+        }
+
+        return Path.Combine(Path.GetTempPath(), "SpoutDirectSaver");
     }
 
     private static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
