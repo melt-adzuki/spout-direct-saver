@@ -29,7 +29,9 @@ var endTicks = options.Duration is null
     ? long.MaxValue
     : Stopwatch.GetTimestamp() + (long)Math.Round(options.Duration.Value.TotalSeconds * Stopwatch.Frequency);
 var framesSent = 0;
-var reportStopwatch = Stopwatch.StartNew();
+var totalStopwatch = Stopwatch.StartNew();
+var lastReportElapsed = TimeSpan.Zero;
+var lastReportedFrames = 0;
 
 Console.CancelKeyPress += (_, eventArgs) =>
 {
@@ -55,9 +57,14 @@ try
         }
 
         framesSent++;
-        if (reportStopwatch.ElapsedMilliseconds >= 1000)
+        if ((totalStopwatch.Elapsed - lastReportElapsed).TotalSeconds >= 1.0)
         {
-            Console.WriteLine($"frames_sent={framesSent} elapsed={reportStopwatch.Elapsed.TotalSeconds:0.000} fps={framesSent / reportStopwatch.Elapsed.TotalSeconds:0.00}");
+            var reportElapsed = totalStopwatch.Elapsed - lastReportElapsed;
+            var reportFrames = framesSent - lastReportedFrames;
+            Console.WriteLine(
+                $"frames_sent={framesSent} elapsed={totalStopwatch.Elapsed.TotalSeconds:0.000} fps={reportFrames / reportElapsed.TotalSeconds:0.00}");
+            lastReportElapsed = totalStopwatch.Elapsed;
+            lastReportedFrames = framesSent;
         }
 
         WaitUntilNextFrame(ref nextFrameTicks, options.FrameRate);

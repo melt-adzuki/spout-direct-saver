@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.App", "Spo
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.TestSender", "SpoutDirectSaver.TestSender\SpoutDirectSaver.TestSender.csproj", "{C8286B47-17A9-4B68-8D32-2CED0A33D6B4}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.E2E", "SpoutDirectSaver.E2E\SpoutDirectSaver.E2E.csproj", "{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -41,6 +43,18 @@ Global
 		{C8286B47-17A9-4B68-8D32-2CED0A33D6B4}.Release|x64.Build.0 = Release|Any CPU
 		{C8286B47-17A9-4B68-8D32-2CED0A33D6B4}.Release|x86.ActiveCfg = Release|Any CPU
 		{C8286B47-17A9-4B68-8D32-2CED0A33D6B4}.Release|x86.Build.0 = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|x64.Build.0 = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Debug|x86.Build.0 = Debug|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x64.ActiveCfg = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x64.Build.0 = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x86.ActiveCfg = Release|Any CPU
+		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
