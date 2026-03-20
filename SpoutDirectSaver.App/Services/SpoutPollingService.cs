@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Spout.Interop;
 using Spout.NETCore;
 using SpoutDirectSaver.App.Models;
+using Vortice.DXGI;
 
 namespace SpoutDirectSaver.App.Services;
 
@@ -404,7 +405,23 @@ internal sealed class SpoutPollingService : IAsyncDisposable
             return false;
         }
 
-        if (!sharedTextureReader.TrySynchronizeSender(receiver, senderName, out _))
+        var senderFormat = (Format)receiver.SenderFormat;
+        var synchronized =
+            sharedTextureReader.Matches(
+                senderName,
+                receiver.SenderHandle,
+                receiver.SenderWidth,
+                receiver.SenderHeight,
+                senderFormat) ||
+            sharedTextureReader.TrySynchronizeSender(
+                senderName,
+                receiver.SenderHandle,
+                receiver.SenderWidth,
+                receiver.SenderHeight,
+                senderFormat,
+                receiver.Adapter,
+                out _);
+        if (!synchronized)
         {
             return false;
         }

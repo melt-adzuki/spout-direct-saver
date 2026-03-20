@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using Spout.Interop;
 using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
+using Vortice.DXGI;
 
 var options = E2eOptions.Parse(args);
 var encoderOption = EncoderOption.CreateDefaults()[0];
@@ -476,7 +477,23 @@ static bool TryPrepareSharedTextureReadback(
         return false;
     }
 
-    if (!sharedTextureReader.TrySynchronizeSender(receiver, senderName, out _))
+    var senderFormat = (Format)receiver.SenderFormat;
+    var synchronized =
+        sharedTextureReader.Matches(
+            senderName,
+            receiver.SenderHandle,
+            receiver.SenderWidth,
+            receiver.SenderHeight,
+            senderFormat) ||
+        sharedTextureReader.TrySynchronizeSender(
+            senderName,
+            receiver.SenderHandle,
+            receiver.SenderWidth,
+            receiver.SenderHeight,
+            senderFormat,
+            receiver.Adapter,
+            out _);
+    if (!synchronized)
     {
         return false;
     }

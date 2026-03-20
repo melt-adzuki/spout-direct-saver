@@ -12,13 +12,14 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 {
     private const int KeyedMutexTimeoutMilliseconds = 67;
     private const int AccessMutexTimeoutMilliseconds = 67;
+    private const int StagingTextureCount = 3;
     private readonly IDXGIFactory1 _dxgiFactory;
 
     private Mutex? _accessMutex;
     private ID3D11Device? _device;
     private ID3D11DeviceContext? _deviceContext;
     private ID3D11Texture2D? _sharedTexture;
-    private readonly ID3D11Texture2D?[] _stagingTextures = new ID3D11Texture2D?[2];
+    private readonly ID3D11Texture2D?[] _stagingTextures = new ID3D11Texture2D?[StagingTextureCount];
     private IDXGIKeyedMutex? _keyedMutex;
     private int _deviceAdapterIndex = int.MinValue;
     private IntPtr _sharedHandle;
@@ -27,8 +28,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private uint _height;
     private Format _format = Format.Unknown;
     private int _copyIndex;
-    private int _readIndex;
-    private bool _hasPrimedReadback;
+    private int _copiedFrameCount;
 
     public D3D11SpoutSharedTextureReader()
     {
@@ -41,6 +41,67 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
     public Format Format => _format;
 
+    public bool Matches(string senderName, IntPtr sharedHandle, uint width, uint height, Format format)
+    {
+        return _sharedTexture is not null &&
+               sharedHandle == _sharedHandle &&
+               width == _width &&
+               height == _height &&
+               format == _format &&
+               string.Equals(senderName, _senderName, StringComparison.Ordinal);
+    }
+
+    public bool TrySynchronizeSender(
+        string senderName,
+        IntPtr sharedHandle,
+        uint width,
+        uint height,
+        Format format,
+        int adapterIndex,
+        out string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(senderName))
+        {
+            ResetResources();
+            errorMessage = "Spout sender 名が取得できませんでした。";
+            return false;
+        }
+
+        if (sharedHandle == IntPtr.Zero || width == 0 || height == 0)
+        {
+            ResetResources();
+            errorMessage = $"sender \"{senderName}\" の共有テクスチャ情報が不正です。";
+            return false;
+        }
+
+        if (!IsSupportedFormat(format))
+        {
+            ResetResources();
+            errorMessage = $"未対応の DXGI format です: {format}.";
+            return false;
+        }
+
+        if (Matches(senderName, sharedHandle, width, height, format) && _deviceAdapterIndex == adapterIndex)
+        {
+            errorMessage = null;
+            return true;
+        }
+
+        try
+        {
+            EnsureDevice(adapterIndex);
+            RecreateResources(senderName, sharedHandle, width, height, format);
+            errorMessage = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ResetResources();
+            errorMessage = $"共有テクスチャを開けませんでした: {ex.Message}";
+            return false;
+        }
+    }
+
     public bool TrySynchronizeSender(SpoutReceiver receiver, string senderName, out string? errorMessage)
     {
         if (string.IsNullOrWhiteSpace(senderName))
@@ -52,8 +113,6 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
         unsafe
         {
-            EnsureDevice(receiver.Adapter);
-
             uint width = 0;
             uint height = 0;
             uint dxgiFormat = 0;
@@ -72,37 +131,14 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                 return false;
             }
 
-            var format = (Format)dxgiFormat;
-            if (!IsSupportedFormat(format))
-            {
-                ResetResources();
-                errorMessage = $"未対応の DXGI format です: {format}.";
-                return false;
-            }
-
-            if (_sharedTexture is not null &&
-                sharedHandle == _sharedHandle &&
-                width == _width &&
-                height == _height &&
-                format == _format &&
-                string.Equals(senderName, _senderName, StringComparison.Ordinal))
-            {
-                errorMessage = null;
-                return true;
-            }
-
-            try
-            {
-                RecreateResources(senderName, sharedHandle, width, height, format);
-                errorMessage = null;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                ResetResources();
-                errorMessage = $"共有テクスチャを開けませんでした: {ex.Message}";
-                return false;
-            }
+            return TrySynchronizeSender(
+                senderName,
+                sharedHandle,
+                width,
+                height,
+                (Format)dxgiFormat,
+                receiver.Adapter,
+                out errorMessage);
         }
     }
 
@@ -120,7 +156,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     public bool TryReadFrame(IntPtr destination, int destinationLength, out string? errorMessage)
     {
         var requiredBytes = checked((int)(_width * _height * 4));
-        if (_sharedTexture is null || _stagingTextures[0] is null || _stagingTextures[1] is null)
+        if (_sharedTexture is null || Array.Exists(_stagingTextures, static texture => texture is null))
         {
             errorMessage = "共有テクスチャが初期化されていません。";
             return false;
@@ -143,13 +179,18 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
             sharedAccessAcquired = true;
             var copyTexture = _stagingTextures[_copyIndex]!;
-            var readTexture = _stagingTextures[_readIndex]!;
             _deviceContext!.CopyResource(copyTexture, _sharedTexture);
+            _copiedFrameCount++;
 
-            if (!_hasPrimedReadback)
+            ID3D11Texture2D readTexture;
+            if (_copiedFrameCount < StagingTextureCount)
             {
                 readTexture = copyTexture;
-                _hasPrimedReadback = true;
+            }
+            else
+            {
+                var readIndex = (_copyIndex + 1) % StagingTextureCount;
+                readTexture = _stagingTextures[readIndex]!;
             }
 
             var mapped = _deviceContext.Map(readTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
@@ -166,7 +207,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                 _deviceContext.Unmap(readTexture, 0);
             }
 
-            (_copyIndex, _readIndex) = (_readIndex, _copyIndex);
+            _copyIndex = (_copyIndex + 1) % StagingTextureCount;
 
             errorMessage = null;
             return true;
@@ -213,8 +254,10 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             ResourceOptionFlags.None);
 
         _sharedTexture = sharedTexture;
-        _stagingTextures[0] = _device.CreateTexture2D(stagingDescription);
-        _stagingTextures[1] = _device.CreateTexture2D(stagingDescription);
+        for (var index = 0; index < StagingTextureCount; index++)
+        {
+            _stagingTextures[index] = _device.CreateTexture2D(stagingDescription);
+        }
         _keyedMutex = sharedTexture.QueryInterfaceOrNull<IDXGIKeyedMutex>();
         _accessMutex = _keyedMutex is null
             ? new Mutex(false, $"{senderName}_SpoutAccessMutex")
@@ -225,8 +268,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _height = height;
         _format = format;
         _copyIndex = 0;
-        _readIndex = 1;
-        _hasPrimedReadback = false;
+        _copiedFrameCount = 0;
     }
 
     private void EnsureDevice(int adapterIndex)
@@ -286,10 +328,11 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _accessMutex = null;
         _keyedMutex?.Dispose();
         _keyedMutex = null;
-        _stagingTextures[0]?.Dispose();
-        _stagingTextures[0] = null;
-        _stagingTextures[1]?.Dispose();
-        _stagingTextures[1] = null;
+        for (var index = 0; index < _stagingTextures.Length; index++)
+        {
+            _stagingTextures[index]?.Dispose();
+            _stagingTextures[index] = null;
+        }
         _sharedTexture?.Dispose();
         _sharedTexture = null;
         _sharedHandle = IntPtr.Zero;
@@ -298,8 +341,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _height = 0;
         _format = Format.Unknown;
         _copyIndex = 0;
-        _readIndex = 1;
-        _hasPrimedReadback = false;
+        _copiedFrameCount = 0;
     }
 
     private bool TryAcquireTextureAccess()
