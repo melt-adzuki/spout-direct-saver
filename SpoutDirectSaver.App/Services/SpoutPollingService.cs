@@ -125,15 +125,12 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                if (!TryReceivePreviewImage(
+                if (!TryEnsureReceiverConnected(
                         receiver,
                         senderName,
-                        width,
-                        height,
-                        out var receivedSenderName,
-                        out var receivedWidth,
-                        out var receivedHeight,
-                        out var receiveMessage))
+                        out var connectedSenderName,
+                        out var connectedWidth,
+                        out var connectedHeight))
                 {
                     if (wasConnected)
                     {
@@ -152,15 +149,32 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 var senderWasUpdated =
                     !wasConnected ||
                     receiver.IsUpdated ||
-                    receivedWidth != width ||
-                    receivedHeight != height ||
-                    !string.Equals(receivedSenderName, senderName, StringComparison.Ordinal);
+                    connectedWidth != width ||
+                    connectedHeight != height ||
+                    !string.Equals(connectedSenderName, senderName, StringComparison.Ordinal);
+
+                var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
+                if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
+                {
+                    EnsurePreviewBufferSize(requiredLength);
+                    senderWasUpdated = true;
+                }
+
+                if (!TryReceivePreviewImage(
+                        receiver,
+                        connectedSenderName,
+                        connectedWidth,
+                        connectedHeight))
+                {
+                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    continue;
+                }
 
                 if (senderWasUpdated)
                 {
-                    width = receivedWidth;
-                    height = receivedHeight;
-                    senderName = receivedSenderName;
+                    width = connectedWidth;
+                    height = connectedHeight;
+                    senderName = connectedSenderName;
 
                     var message = wasConnected
                         ? $"sender の状態が更新されました: {width} x {height}"
@@ -175,7 +189,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         width,
                         height,
                         receiver.SenderFps,
-                        receiveMessage ?? message));
+                        message));
 
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
@@ -224,70 +238,71 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
     }
 
-    private static bool PrepareReceive(SpoutReceiver receiver)
-    {
-        return receiver.ReceiveTexture();
-    }
-
-    private bool TryReceivePreviewImage(
+    private static bool TryEnsureReceiverConnected(
         SpoutReceiver receiver,
-        string senderName,
-        uint width,
-        uint height,
-        out string receivedSenderName,
-        out uint receivedWidth,
-        out uint receivedHeight,
-        out string? message)
+        string requestedSenderName,
+        out string connectedSenderName,
+        out uint width,
+        out uint height)
     {
         unsafe
         {
             var senderNameBytes = new byte[256];
-            if (!string.IsNullOrWhiteSpace(senderName))
+            if (!string.IsNullOrWhiteSpace(requestedSenderName))
             {
-                var encodedName = Encoding.ASCII.GetBytes(senderName);
+                var encodedName = Encoding.ASCII.GetBytes(requestedSenderName);
                 Array.Copy(encodedName, senderNameBytes, Math.Min(encodedName.Length, senderNameBytes.Length - 1));
             }
 
-            receivedWidth = width;
-            receivedHeight = height;
+            width = 0;
+            height = 0;
 
             fixed (byte* senderNamePtr = senderNameBytes)
             {
-                var pixelBuffer = _previewBackBuffer == IntPtr.Zero ? null : (byte*)_previewBackBuffer;
-                var received = receiver.ReceiveImage(
-                    (sbyte*)senderNamePtr,
-                    ref receivedWidth,
-                    ref receivedHeight,
-                    pixelBuffer,
-                    0x80E1u,
-                    false,
-                    0);
-
-                receivedSenderName = ReadNullTerminatedAscii(senderNameBytes);
-                if (!received)
+                bool ready;
+                if (!receiver.IsConnected)
                 {
-                    message = null;
-                    return false;
+                    ready = receiver.CreateReceiver((sbyte*)senderNamePtr, ref width, ref height);
                 }
+                else
+                {
+                    var connected = receiver.IsConnected;
+                    ready = receiver.CheckReceiver((sbyte*)senderNamePtr, ref width, ref height, ref connected) && connected;
+                }
+
+                connectedSenderName = ReadNullTerminatedAscii(senderNameBytes);
+                return ready && width > 0 && height > 0;
             }
         }
+    }
 
-        if (receivedWidth == 0 || receivedHeight == 0)
+    private unsafe bool TryReceivePreviewImage(
+        SpoutReceiver receiver,
+        string senderName,
+        uint width,
+        uint height)
+    {
+        var senderNameBytes = new byte[256];
+        if (!string.IsNullOrWhiteSpace(senderName))
         {
-            message = null;
-            return false;
+            var encodedName = Encoding.ASCII.GetBytes(senderName);
+            Array.Copy(encodedName, senderNameBytes, Math.Min(encodedName.Length, senderNameBytes.Length - 1));
         }
 
-        var requiredLength = checked((int)(receivedWidth * receivedHeight * 4));
-        if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
-        {
-            EnsurePreviewBufferSize(requiredLength);
-            message = $"受信サイズ {receivedWidth} x {receivedHeight} に合わせてバッファを再初期化しました。";
-            return false;
-        }
+        var receivedWidth = width;
+        var receivedHeight = height;
 
-        message = null;
-        return true;
+        fixed (byte* senderNamePtr = senderNameBytes)
+        {
+            return receiver.ReceiveImage(
+                (sbyte*)senderNamePtr,
+                ref receivedWidth,
+                ref receivedHeight,
+                (byte*)_previewBackBuffer,
+                0x80E1u,
+                false,
+                0);
+        }
     }
 
     private static string ReadNullTerminatedAscii(byte[] buffer)
