@@ -6,11 +6,12 @@ using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
 
 var options = E2eOptions.Parse(args);
+var encoderOption = EncoderOption.CreateDefaults()[0];
 WindowsScheduling.TryPromoteCurrentProcess(ProcessPriorityClass.High);
 using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
 var outputDirectory = Path.Combine(Environment.CurrentDirectory, ".tmp-e2e-output");
 Directory.CreateDirectory(outputDirectory);
-var outputPath = Path.Combine(outputDirectory, $"capture_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.mov");
+var outputPath = Path.Combine(outputDirectory, $"capture_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}{encoderOption.Extension}");
 
 Console.WriteLine($"sender={options.SenderName}");
 Console.WriteLine($"captureSeconds={options.CaptureSeconds}");
@@ -39,7 +40,7 @@ Console.WriteLine($"receive_only_unique_min_1s_fps={receiveOnly.FrameRateStats.M
 Console.WriteLine($"receive_only_size={receiveOnly.Width}x{receiveOnly.Height}");
 Console.WriteLine($"receive_only_sender_frame_delta={receiveOnly.SenderFrameDelta}");
 
-    var recordResult = await RecordAndExportAsync(options, outputPath);
+    var recordResult = await RecordAndExportAsync(options, encoderOption, outputPath);
 Console.WriteLine($"record_frames_seen={recordResult.TotalFramesSeen}");
 Console.WriteLine($"record_unique_frames={recordResult.UniqueFramesSeen}");
 Console.WriteLine($"record_elapsed={recordResult.CaptureElapsed.TotalSeconds:0.000}");
@@ -248,7 +249,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
         BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
 }
 
-static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, string outputPath)
+static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, EncoderOption encoderOption, string outputPath)
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
@@ -365,7 +366,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             }
 
             session ??= new RecordingSession(
-                EncoderOption.CreateDefaults()[0],
+                encoderOption,
                 outputPath,
                 channelCapacity: 32,
                 blockOnBackpressure: true);
@@ -373,8 +374,8 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             frameCount++;
             if (senderFrame > 0)
             {
-                var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
-                Marshal.Copy(buffer, managedCopy, 0, bufferLength);
+                var managedCopy = PixelBufferLease.Rent(bufferLength);
+                Marshal.Copy(buffer, managedCopy.Buffer, 0, bufferLength);
                 session.AppendFrame(new FramePacket(
                     managedCopy,
                     width,
@@ -395,8 +396,13 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             }
             else
             {
-                var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
-                Marshal.Copy(buffer, managedCopy, 0, bufferLength);
+                var managedCopy = PixelBufferLease.Rent(bufferLength);
+                Marshal.Copy(buffer, managedCopy.Buffer, 0, bufferLength);
+                var fingerprint = ComputeFingerprint(managedCopy.Span);
+                var shouldCountAsUnique =
+                    lastFallbackFingerprint != fingerprint ||
+                    lastFallbackFrame is null ||
+                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy.Span);
                 session.AppendFrame(new FramePacket(
                     managedCopy,
                     width,
@@ -405,16 +411,14 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                     receiver.SenderFps,
                     acceptedFrameTick,
                     DateTimeOffset.UtcNow));
-                var fingerprint = ComputeFingerprint(managedCopy);
-                if (lastFallbackFingerprint != fingerprint ||
-                    lastFallbackFrame is null ||
-                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy))
+                if (shouldCountAsUnique)
                 {
                     uniqueFrameCount++;
                     uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
                     firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastFallbackFingerprint = fingerprint;
-                    lastFallbackFrame = managedCopy;
+                    lastFallbackFrame = GC.AllocateUninitializedArray<byte>(managedCopy.Length);
+                    managedCopy.Span.CopyTo(lastFallbackFrame);
                 }
             }
             if (!useSharedFrameCounter)

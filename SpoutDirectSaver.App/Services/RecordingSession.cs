@@ -31,18 +31,23 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly bool _writeSynchronously;
     private readonly FileStream? _syncSpoolStream;
     private readonly int _compressionWorkerCount;
+    private readonly bool _useRealtimeEncoding;
 
     private RecordedFrame? _currentFrame;
-    private byte[]? _lastUniqueFrame;
+    private PixelBufferLease? _lastUniqueFrame;
     private ulong _lastUniqueFingerprint;
     private uint _recordedWidth;
     private uint _recordedHeight;
     private double _nominalSourceFps;
+    private double _outputFrameRate;
+    private double _accumulatedTimelineFrames;
+    private int _emittedTimelineFrames;
     private int _frameCounter;
     private bool _isCompleted;
     private bool _disposed;
     private bool? _compressSpoolFrames;
     private int _remainingCompressionWorkers;
+    private RealtimeHybridWriter? _realtimeWriter;
 
     public RecordingSession(
         EncoderOption encoderOption,
@@ -58,9 +63,24 @@ internal sealed class RecordingSession : IAsyncDisposable
         _blockOnBackpressure = blockOnBackpressure;
         _compressSpoolFrames = compressSpoolFrames;
         _writeSynchronously = writeSynchronously;
+        _useRealtimeEncoding = encoderOption.RequiresRealtimeEncoding;
         _spoolFileOptions = writeThroughSpool
             ? FileOptions.Asynchronous | FileOptions.WriteThrough
             : FileOptions.Asynchronous;
+
+        if (_useRealtimeEncoding)
+        {
+            _temporaryDirectory = string.Empty;
+            _spoolPath = string.Empty;
+            _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(1);
+            _compressionWorkerCount = 0;
+            _remainingCompressionWorkers = 0;
+            _compressionTasks = Array.Empty<Task>();
+            _syncSpoolStream = null;
+            _writerTask = Task.CompletedTask;
+            return;
+        }
+
         _temporaryDirectory = Path.Combine(
             ResolveCacheRoot(outputPath),
             Guid.NewGuid().ToString("N"));
@@ -120,39 +140,47 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     public void AppendFrame(FramePacket frame)
     {
-        lock (_gate)
+        try
         {
-            ThrowIfCompleted();
-
-            if (_currentFrame is null)
+            lock (_gate)
             {
-                _recordedWidth = frame.Width;
-                _recordedHeight = frame.Height;
-                _nominalSourceFps = frame.SenderFps;
-                TryRegisterFrame(frame, ComputeFingerprint(frame.PixelData));
-                return;
-            }
+                ThrowIfCompleted();
 
-            if (frame.Width != _recordedWidth || frame.Height != _recordedHeight)
-            {
-                throw new InvalidOperationException("録画中に解像度が変わりました。現在の録画は固定解像度のみ対応しています。");
-            }
+                if (_currentFrame is null)
+                {
+                    _recordedWidth = frame.Width;
+                    _recordedHeight = frame.Height;
+                    _nominalSourceFps = frame.SenderFps;
+                    TryRegisterFrame(frame, ComputeFingerprint(frame.PixelBuffer.Span));
+                    return;
+                }
 
-            var fingerprint = ComputeFingerprint(frame.PixelData);
-            if (_lastUniqueFrame is not null &&
-                fingerprint == _lastUniqueFingerprint &&
-                _lastUniqueFrame.AsSpan().SequenceEqual(frame.PixelData))
-            {
-                return;
-            }
+                if (frame.Width != _recordedWidth || frame.Height != _recordedHeight)
+                {
+                    throw new InvalidOperationException("録画中に解像度が変わりました。現在の録画は固定解像度のみ対応しています。");
+                }
 
-            TryRegisterFrame(frame, fingerprint);
+                var fingerprint = ComputeFingerprint(frame.PixelBuffer.Span);
+                if (fingerprint == _lastUniqueFingerprint)
+                {
+                    frame.PixelBuffer.Dispose();
+                    return;
+                }
+
+                TryRegisterFrame(frame, fingerprint);
+            }
+        }
+        catch
+        {
+            frame.PixelBuffer.Dispose();
+            throw;
         }
     }
 
     public async Task<string> FinalizeAsync(VideoExportService exportService, CancellationToken cancellationToken)
     {
-        RecordedFrame[] framesToEncode;
+        RecordedFrame[] framesToEncode = [];
+        RealtimeHybridWriter? realtimeWriter = null;
 
         lock (_gate)
         {
@@ -165,12 +193,34 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
 
             FinalizeCurrentFrame(Stopwatch.GetTimestamp());
-            _compressionChannel.Writer.TryComplete();
-            framesToEncode = _frames.ToArray();
+            if (_useRealtimeEncoding)
+            {
+                if (_currentFrame is not null && _lastUniqueFrame is not null)
+                {
+                    QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
+                }
+
+                realtimeWriter = _realtimeWriter;
+            }
+            else
+            {
+                _compressionChannel.Writer.TryComplete();
+                framesToEncode = _frames.ToArray();
+            }
         }
 
         try
         {
+            if (_useRealtimeEncoding)
+            {
+                if (realtimeWriter is null)
+                {
+                    throw new InvalidOperationException("realtime エンコーダーが初期化されていません。");
+                }
+
+                return await realtimeWriter.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             if (_compressionTasks.Length > 0)
             {
                 await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
@@ -210,17 +260,30 @@ internal sealed class RecordingSession : IAsyncDisposable
             if (!_isCompleted)
             {
                 _isCompleted = true;
-                _compressionChannel.Writer.TryComplete();
+                if (!_useRealtimeEncoding)
+                {
+                    _compressionChannel.Writer.TryComplete();
+                }
             }
         }
 
         try
         {
-            if (_compressionTasks.Length > 0)
+            if (_useRealtimeEncoding)
             {
-                await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+                if (_realtimeWriter is not null)
+                {
+                    await _realtimeWriter.DisposeAsync().ConfigureAwait(false);
+                }
             }
-            await _writerTask.ConfigureAwait(false);
+            else
+            {
+                if (_compressionTasks.Length > 0)
+                {
+                    await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+                }
+                await _writerTask.ConfigureAwait(false);
+            }
         }
         catch
         {
@@ -235,35 +298,53 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private void TryRegisterFrame(FramePacket frame, ulong fingerprint)
     {
+        if (_currentFrame is not null)
+        {
+            FinalizeCurrentFrame(frame.StopwatchTicks);
+            if (_useRealtimeEncoding)
+            {
+                if (_lastUniqueFrame is null)
+                {
+                    throw new InvalidOperationException("realtime エンコード用の前フレームが見つかりません。");
+                }
+
+                QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
+            }
+        }
+
         var recordedFrame = new RecordedFrame
         {
             FrameIndex = _frameCounter + 1,
             StopwatchTicks = frame.StopwatchTicks,
-            TimestampUtc = frame.TimestampUtc
+            TimestampUtc = frame.TimestampUtc,
+            IsCompressed = false
         };
 
-        _compressSpoolFrames ??= true;
-        recordedFrame.IsCompressed = _compressSpoolFrames.Value;
-
-        var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, frame.PixelData);
-        if (_writeSynchronously)
+        if (_useRealtimeEncoding)
         {
-            WriteFrameSynchronously(request);
+            EnsureRealtimeWriterStarted();
         }
-        else if (!TryQueueFrameWrite(request))
+        else
         {
-            return;
-        }
+            _compressSpoolFrames ??= true;
+            recordedFrame.IsCompressed = _compressSpoolFrames.Value;
 
-        if (_currentFrame is not null)
-        {
-            FinalizeCurrentFrame(frame.StopwatchTicks);
+            var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, frame.PixelBuffer);
+            if (_writeSynchronously)
+            {
+                WriteFrameSynchronously(request);
+            }
+            else if (!TryQueueFrameWrite(request))
+            {
+                frame.PixelBuffer.Dispose();
+                return;
+            }
         }
 
         _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
-        _lastUniqueFrame = frame.PixelData;
+        _lastUniqueFrame = _useRealtimeEncoding ? frame.PixelBuffer : null;
         _lastUniqueFingerprint = fingerprint;
     }
 
@@ -287,11 +368,12 @@ internal sealed class RecordingSession : IAsyncDisposable
                 byte[] payload;
                 if (request.Frame.IsCompressed)
                 {
-                    payload = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
+                    payload = LZ4Pickler.Pickle(request.PixelData.Span, LZ4Level.L00_FAST);
                 }
                 else
                 {
-                    payload = request.PixelData;
+                    payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
+                    request.PixelData.Span.CopyTo(payload);
                 }
 
                 _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
@@ -299,6 +381,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                     request.Frame,
                     payload,
                     request.Frame.IsCompressed ? payload.Length : request.PixelData.Length);
+                request.PixelData.Dispose();
                 _preparedFrameSignal.Release();
             }
         }
@@ -348,17 +431,18 @@ internal sealed class RecordingSession : IAsyncDisposable
         var frameOffset = _syncSpoolStream.Position;
         if (request.Frame.IsCompressed)
         {
-            var compressedFrame = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
+            var compressedFrame = LZ4Pickler.Pickle(request.PixelData.Span, LZ4Level.L00_FAST);
             _syncSpoolStream.Write(compressedFrame);
         }
         else
         {
-            _syncSpoolStream.Write(request.PixelData);
+            _syncSpoolStream.Write(request.PixelData.Buffer, 0, request.PixelData.Length);
         }
 
         request.Frame.SpoolOffset = frameOffset;
         request.Frame.SpoolLength = checked((int)(_syncSpoolStream.Position - frameOffset));
         _syncSpoolStream.Flush();
+        request.PixelData.Dispose();
     }
 
     private async Task WritePreparedFrameAsync(FileStream fileStream, PreparedFrameWriteRequest preparedFrame)
@@ -419,9 +503,41 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
+    private void EnsureRealtimeWriterStarted()
+    {
+        if (!_useRealtimeEncoding || _realtimeWriter is not null)
+        {
+            return;
+        }
+
+        _outputFrameRate = GetOutputFrameRate();
+        _realtimeWriter = new RealtimeHybridWriter(
+            _recordedWidth,
+            _recordedHeight,
+            _outputFrameRate,
+            _outputPath,
+            ResolveCacheRoot(_outputPath));
+    }
+
+    private void QueueFrameForRealtimeEncode(RecordedFrame frame, PixelBufferLease pixelData)
+    {
+        EnsureRealtimeWriterStarted();
+        if (_realtimeWriter is null)
+        {
+            throw new InvalidOperationException("realtime エンコーダーが初期化されていません。");
+        }
+
+        _accumulatedTimelineFrames += frame.DurationSeconds * _outputFrameRate;
+        var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
+        var repeatCount = targetTotalFrames - _emittedTimelineFrames;
+
+        _realtimeWriter.QueueFrame(pixelData, repeatCount);
+        _emittedTimelineFrames = targetTotalFrames;
+    }
+
     private void TryDeleteTemporaryDirectory()
     {
-        if (!Directory.Exists(_temporaryDirectory))
+        if (string.IsNullOrWhiteSpace(_temporaryDirectory) || !Directory.Exists(_temporaryDirectory))
         {
             return;
         }
@@ -505,7 +621,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         return Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
     }
 
-    private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, byte[] PixelData);
+    private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, PixelBufferLease PixelData);
 
     private sealed record PreparedFrameWriteRequest(int Sequence, RecordedFrame Frame, byte[] Payload, int Length);
 }

@@ -1,0 +1,170 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using SharpGen.Runtime;
+using Vortice.MediaFoundation;
+
+namespace SpoutDirectSaver.App.Services;
+
+internal sealed class MediaFoundationHevcWriter : IDisposable
+{
+    private const long HundredNanosecondsPerSecond = 10_000_000;
+    private static readonly object StartupGate = new();
+    private static int _startupRefCount;
+
+    private readonly IMFSinkWriter _sinkWriter;
+    private readonly int _streamIndex;
+    private readonly long _frameDurationHns;
+    private long _submittedFrameCount;
+    private bool _completed;
+    private bool _disposed;
+
+    public MediaFoundationHevcWriter(
+        uint width,
+        uint height,
+        double frameRate,
+        string outputPath,
+        uint averageBitrate = 40_000_000)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+        EnsureMediaFoundationStarted();
+
+        using var sinkWriterAttributes = MediaFactory.MFCreateAttributes(6);
+        sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1u);
+        sinkWriterAttributes.Set(SinkWriterAttributeKeys.DisableThrottling, 1u);
+        sinkWriterAttributes.Set(SinkWriterAttributeKeys.LowLatency, 1u);
+        sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssClass, "Capture");
+        sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssPriority, 2u);
+
+        _sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, sinkWriterAttributes);
+
+        using var outputMediaType = MediaFactory.MFCreateMediaType();
+        outputMediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
+        outputMediaType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.Hevc);
+        outputMediaType.Set(MediaTypeAttributeKeys.AvgBitrate, averageBitrate);
+        outputMediaType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive);
+        MediaFactory.MFSetAttributeSize(outputMediaType, MediaTypeAttributeKeys.FrameSize, width, height).CheckError();
+        SetFrameRate(outputMediaType, frameRate);
+        MediaFactory.MFSetAttributeRatio(outputMediaType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1).CheckError();
+
+        _streamIndex = _sinkWriter.AddStream(outputMediaType);
+
+        using var inputMediaType = MediaFactory.MFCreateMediaType();
+        inputMediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
+        inputMediaType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.Rgb32);
+        inputMediaType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive);
+        inputMediaType.Set(MediaTypeAttributeKeys.DefaultStride, checked((uint)(width * 4)));
+        inputMediaType.Set(MediaTypeAttributeKeys.SampleSize, checked((uint)(width * height * 4)));
+        MediaFactory.MFSetAttributeSize(inputMediaType, MediaTypeAttributeKeys.FrameSize, width, height).CheckError();
+        SetFrameRate(inputMediaType, frameRate);
+        MediaFactory.MFSetAttributeRatio(inputMediaType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1).CheckError();
+
+        _sinkWriter.SetInputMediaType(_streamIndex, inputMediaType, null);
+        _sinkWriter.BeginWriting();
+        _frameDurationHns = Math.Max(1, (long)Math.Round(HundredNanosecondsPerSecond / frameRate));
+    }
+
+    public void WriteFrame(byte[] bgraFrame, int frameLength, int repeatCount)
+    {
+        if (repeatCount <= 0)
+        {
+            return;
+        }
+
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_completed)
+        {
+            throw new InvalidOperationException("Media Foundation writer は既に完了しています。");
+        }
+
+        for (var index = 0; index < repeatCount; index++)
+        {
+            using var mediaBuffer = MediaFactory.MFCreateMemoryBuffer(frameLength);
+            IntPtr destination = IntPtr.Zero;
+
+            try
+            {
+                mediaBuffer.Lock(out destination, out _, out _);
+                Marshal.Copy(bgraFrame, 0, destination, frameLength);
+            }
+            finally
+            {
+                if (destination != IntPtr.Zero)
+                {
+                    mediaBuffer.Unlock();
+                }
+            }
+
+            mediaBuffer.CurrentLength = frameLength;
+
+            using var sample = MediaFactory.MFCreateSample();
+            sample.AddBuffer(mediaBuffer);
+            sample.SampleTime = _submittedFrameCount * _frameDurationHns;
+            sample.SampleDuration = _frameDurationHns;
+            _sinkWriter.WriteSample(_streamIndex, sample);
+            _submittedFrameCount++;
+        }
+    }
+
+    public void Complete()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_completed)
+        {
+            return;
+        }
+
+        _completed = true;
+        _sinkWriter.Finalize();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _sinkWriter.Dispose();
+        ShutdownMediaFoundationIfNeeded();
+    }
+
+    private static void EnsureMediaFoundationStarted()
+    {
+        lock (StartupGate)
+        {
+            if (_startupRefCount == 0)
+            {
+                MediaFactory.MFStartup();
+            }
+
+            _startupRefCount++;
+        }
+    }
+
+    private static void ShutdownMediaFoundationIfNeeded()
+    {
+        lock (StartupGate)
+        {
+            if (_startupRefCount <= 0)
+            {
+                return;
+            }
+
+            _startupRefCount--;
+            if (_startupRefCount == 0)
+            {
+                MediaFactory.MFShutdown();
+            }
+        }
+    }
+
+    private static void SetFrameRate(IMFAttributes attributes, double frameRate)
+    {
+        var fpsNumerator = (uint)Math.Clamp((int)Math.Round(frameRate * 1000.0), 1, int.MaxValue);
+        const uint fpsDenominator = 1000;
+        MediaFactory.MFSetAttributeRatio(attributes, MediaTypeAttributeKeys.FrameRate, fpsNumerator, fpsDenominator).CheckError();
+    }
+}

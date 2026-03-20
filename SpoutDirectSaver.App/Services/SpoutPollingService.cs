@@ -272,18 +272,18 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 var frameHandler = FrameArrived;
                 if (frameHandler is not null)
                 {
-                    var frameCopy = GC.AllocateUninitializedArray<byte>(_previewBufferLength);
+                    var frameCopy = PixelBufferLease.Rent(_previewBufferLength);
                     var sourceBuffer = recordingMode ? _previewBackBuffer : _previewFrontBuffer;
                     if (!recordingMode)
                     {
                         lock (_previewGate)
                         {
-                            Marshal.Copy(sourceBuffer, frameCopy, 0, _previewBufferLength);
+                            Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
                         }
                     }
                     else
                     {
-                        Marshal.Copy(sourceBuffer, frameCopy, 0, _previewBufferLength);
+                        Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
                     }
 
                     frameHandler.Invoke(this, new FramePacket(

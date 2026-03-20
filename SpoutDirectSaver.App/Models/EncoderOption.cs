@@ -4,6 +4,7 @@ namespace SpoutDirectSaver.App.Models;
 
 internal enum EncoderProfileKind
 {
+    HevcNvencFfv1AlphaMkv,
     PngMov,
     Ffv1Mkv
 }
@@ -34,14 +35,27 @@ internal sealed class EncoderOption
 
     public string FileDialogFilter { get; }
 
+    public bool RequiresRealtimeEncoding => false;
+
     public string BuildArguments(uint width, uint height, double frameRate, string outputPath)
+        => BuildArgumentsCore(width, height, frameRate, "-i -", outputPath);
+
+    public string BuildPipeArguments(uint width, uint height, double frameRate, string inputPath, string outputPath)
+        => BuildArgumentsCore(width, height, frameRate, $"-blocksize 33554432 -i {Quote(inputPath)}", outputPath);
+
+    private string BuildArgumentsCore(uint width, uint height, double frameRate, string inputSpecifier, string outputPath)
     {
+        var gop = Math.Max(1, (int)Math.Round(frameRate));
+        var rawInput = $"-f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} {inputSpecifier}";
+
         return Kind switch
         {
+            EncoderProfileKind.HevcNvencFfv1AlphaMkv =>
+                $"-y {rawInput} -an -filter_complex \"[0:v]split=2[rgb][alpha];[alpha]alphaextract,format=gray[aout]\" -map \"[rgb]\" -c:v:0 hevc_nvenc -preset:v:0 p1 -tune:v:0 ll -rc:v:0 vbr -cq:v:0 21 -b:v:0 0 -g:v:0 {gop} -pix_fmt:v:0 yuv420p -profile:v:0 main -map \"[aout]\" -c:v:1 ffv1 -level:v:1 3 -coder:v:1 1 -context:v:1 1 -g:v:1 1 -slicecrc:v:1 1 -pix_fmt:v:1 gray -cues_to_front 1 {Quote(outputPath)}",
             EncoderProfileKind.PngMov =>
-                $"-y -f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} -i - -an -c:v png -pred mixed -pix_fmt rgba -movflags +faststart -video_track_timescale 120000 {Quote(outputPath)}",
+                $"-y {rawInput} -an -c:v png -pred mixed -pix_fmt rgba -movflags +faststart -video_track_timescale 120000 {Quote(outputPath)}",
             EncoderProfileKind.Ffv1Mkv =>
-                $"-y -f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
+                $"-y {rawInput} -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt bgra -cues_to_front 1 {Quote(outputPath)}",
             _ => throw new InvalidOperationException($"Unknown encoder kind: {Kind}")
         };
     }
@@ -52,6 +66,12 @@ internal sealed class EncoderOption
     {
         return
         [
+            new(
+                EncoderProfileKind.HevcNvencFfv1AlphaMkv,
+                "HEVC NVENC / MKV + FFV1 alpha",
+                ".mkv",
+                "録画中は変化フレームを圧縮キャッシュし、停止後に RGB 本体を HEVC NVENC(yuv420p)、alpha を grayscale FFV1 の第2映像ストリームとして MKV に確定します。リアルタイム pipe より安定性を優先した構成です。",
+                "Matroska MKV (*.mkv)|*.mkv"),
             new(
                 EncoderProfileKind.PngMov,
                 "PNG / MOV (lossless RGBA 8bit, alpha保持)",

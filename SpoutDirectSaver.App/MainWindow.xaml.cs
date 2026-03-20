@@ -141,7 +141,9 @@ public partial class MainWindow : Window
         _recordingStartedAt = DateTimeOffset.UtcNow;
         _recordingTimer.Start();
 
-        RecorderStatusTextBlock.Text = "録画を開始しました。変化フレームのみを一時保存しています。";
+        RecorderStatusTextBlock.Text = SelectedEncoderOption.RequiresRealtimeEncoding
+            ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
+            : "録画を開始しました。変化フレームのみを一時保存しています。";
         PreviewStatusTextBlock.Text = "録画中はライブ入力プレビューを停止して録画を優先します。";
         HeaderStatusTextBlock.Text = "録画中";
 
@@ -162,7 +164,9 @@ public partial class MainWindow : Window
         try
         {
             HeaderStatusTextBlock.Text = "エンコード中";
-            RecorderStatusTextBlock.Text = "録画を停止しました。可変fps動画を書き出しています。";
+            RecorderStatusTextBlock.Text = SelectedEncoderOption.RequiresRealtimeEncoding
+                ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"
+                : "録画を停止しました。可変fps動画を書き出しています。";
 
             var outputPath = await _recordingSession.FinalizeAsync(_videoExportService, CancellationToken.None);
             _lastRecordedFilePath = outputPath;
@@ -318,13 +322,17 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (!_isStopping)
+            if (!_isStopping && _recordingSession is not null)
             {
-                _recordingSession?.AppendFrame(frame);
+                _recordingSession.AppendFrame(frame);
+                return;
             }
+
+            frame.PixelBuffer.Dispose();
         }
         catch (Exception ex)
         {
+            frame.PixelBuffer.Dispose();
             _ = Dispatcher.BeginInvoke(() =>
             {
                 RecorderStatusTextBlock.Text = $"録画を継続できませんでした: {ex.Message}";
