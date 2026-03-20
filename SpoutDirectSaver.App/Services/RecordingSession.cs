@@ -32,11 +32,16 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly FileStream? _syncSpoolStream;
     private readonly int _compressionWorkerCount;
     private readonly bool _useRealtimeEncoding;
+    private readonly bool _useRealtimeRgbIntermediate;
+    private readonly bool _disableHybridRgbIntermediate;
+    private readonly bool _disableHybridAlphaSpool;
     private readonly LZ4Level _spoolCompressionLevel;
 
     private RecordedFrame? _currentFrame;
     private PixelBufferLease? _lastUniqueFrame;
     private ulong _lastUniqueFingerprint;
+    private ulong _lastAlphaFingerprint;
+    private bool _hasLastAlphaFingerprint;
     private uint _recordedWidth;
     private uint _recordedHeight;
     private double _nominalSourceFps;
@@ -49,6 +54,9 @@ internal sealed class RecordingSession : IAsyncDisposable
     private bool? _compressSpoolFrames;
     private int _remainingCompressionWorkers;
     private RealtimeHybridWriter? _realtimeWriter;
+    private RealtimeRgbNvencWriter? _rgbIntermediateWriter;
+    private readonly string? _rgbIntermediatePath;
+    private readonly string? _alphaTrackPath;
 
     public RecordingSession(
         EncoderOption encoderOption,
@@ -65,6 +73,11 @@ internal sealed class RecordingSession : IAsyncDisposable
         _compressSpoolFrames = compressSpoolFrames;
         _writeSynchronously = writeSynchronously;
         _useRealtimeEncoding = encoderOption.RequiresRealtimeEncoding;
+        _useRealtimeRgbIntermediate =
+            !_useRealtimeEncoding &&
+            encoderOption.Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
+        _disableHybridRgbIntermediate = IsEnabled("SPOUT_DIRECT_SAVER_DISABLE_HYBRID_RGB");
+        _disableHybridAlphaSpool = IsEnabled("SPOUT_DIRECT_SAVER_DISABLE_HYBRID_ALPHA");
         _spoolCompressionLevel = ResolveSpoolCompressionLevel(encoderOption);
         _spoolFileOptions = writeThroughSpool
             ? FileOptions.Asynchronous | FileOptions.WriteThrough
@@ -87,6 +100,12 @@ internal sealed class RecordingSession : IAsyncDisposable
             ResolveCacheRoot(outputPath),
             Guid.NewGuid().ToString("N"));
         _spoolPath = Path.Combine(_temporaryDirectory, "frames.bin");
+        _rgbIntermediatePath = _useRealtimeRgbIntermediate
+            ? Path.Combine(_temporaryDirectory, "rgb.mp4")
+            : null;
+        _alphaTrackPath = _useRealtimeRgbIntermediate
+            ? Path.Combine(_temporaryDirectory, "alpha.mkv")
+            : null;
 
         Directory.CreateDirectory(_temporaryDirectory);
 
@@ -183,6 +202,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         RecordedFrame[] framesToEncode = [];
         RealtimeHybridWriter? realtimeWriter = null;
+        RealtimeRgbNvencWriter? rgbIntermediateWriter = null;
 
         lock (_gate)
         {
@@ -204,6 +224,20 @@ internal sealed class RecordingSession : IAsyncDisposable
 
                 realtimeWriter = _realtimeWriter;
             }
+            else if (_useRealtimeRgbIntermediate)
+            {
+                if (!_disableHybridRgbIntermediate &&
+                    _currentFrame is not null &&
+                    _lastUniqueFrame is not null)
+                {
+                    QueueFrameForRealtimeRgbIntermediate(_currentFrame, _lastUniqueFrame);
+                    _lastUniqueFrame = null;
+                }
+
+                _compressionChannel.Writer.TryComplete();
+                framesToEncode = _frames.ToArray();
+                rgbIntermediateWriter = _rgbIntermediateWriter;
+            }
             else
             {
                 _compressionChannel.Writer.TryComplete();
@@ -221,6 +255,70 @@ internal sealed class RecordingSession : IAsyncDisposable
                 }
 
                 return await realtimeWriter.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_useRealtimeRgbIntermediate)
+            {
+                if (!_disableHybridRgbIntermediate &&
+                    (rgbIntermediateWriter is null || _rgbIntermediatePath is null))
+                {
+                    throw new InvalidOperationException("RGB intermediate encoder が初期化されていません。");
+                }
+
+                if (!_disableHybridRgbIntermediate)
+                {
+                    await rgbIntermediateWriter!.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                if (_compressionTasks.Length > 0)
+                {
+                    await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+                }
+
+                if (!_disableHybridAlphaSpool)
+                {
+                    await _writerTask.ConfigureAwait(false);
+                    _syncSpoolStream?.Dispose();
+
+                    if (_alphaTrackPath is null)
+                    {
+                        throw new InvalidOperationException("alpha track path が初期化されていません。");
+                    }
+
+                    await exportService.ExportAlphaTrackAsync(
+                        _spoolPath,
+                        framesToEncode,
+                        _recordedWidth,
+                        _recordedHeight,
+                        GetOutputFrameRate(),
+                        _alphaTrackPath,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                if (_disableHybridRgbIntermediate)
+                {
+                    await exportService.RemuxSingleVideoAsync(
+                        _alphaTrackPath!,
+                        _outputPath,
+                        cancellationToken).ConfigureAwait(false);
+                    return _outputPath;
+                }
+
+                if (_disableHybridAlphaSpool)
+                {
+                    await exportService.RemuxSingleVideoAsync(
+                        _rgbIntermediatePath!,
+                        _outputPath,
+                        cancellationToken).ConfigureAwait(false);
+                    return _outputPath;
+                }
+
+                await exportService.MuxVideoAndAlphaAsync(
+                    _rgbIntermediatePath!,
+                    _alphaTrackPath!,
+                    _outputPath,
+                    cancellationToken).ConfigureAwait(false);
+                return _outputPath;
             }
 
             if (_compressionTasks.Length > 0)
@@ -243,6 +341,8 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
+            _lastUniqueFrame?.Dispose();
+            _lastUniqueFrame = null;
             _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
@@ -278,6 +378,24 @@ internal sealed class RecordingSession : IAsyncDisposable
                     await _realtimeWriter.DisposeAsync().ConfigureAwait(false);
                 }
             }
+            else if (_useRealtimeRgbIntermediate)
+            {
+                _compressionChannel.Writer.TryComplete();
+
+                if (_rgbIntermediateWriter is not null)
+                {
+                    await _rgbIntermediateWriter.DisposeAsync().ConfigureAwait(false);
+                }
+
+                if (_compressionTasks.Length > 0)
+                {
+                    await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
+                }
+                if (!_disableHybridAlphaSpool)
+                {
+                    await _writerTask.ConfigureAwait(false);
+                }
+            }
             else
             {
                 if (_compressionTasks.Length > 0)
@@ -293,6 +411,8 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
+            _lastUniqueFrame?.Dispose();
+            _lastUniqueFrame = null;
             _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
@@ -312,6 +432,19 @@ internal sealed class RecordingSession : IAsyncDisposable
 
                 QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
             }
+            else if (_useRealtimeRgbIntermediate)
+            {
+                if (!_disableHybridRgbIntermediate && _lastUniqueFrame is null)
+                {
+                    throw new InvalidOperationException("RGB intermediate 用の前フレームが見つかりません。");
+                }
+
+                if (!_disableHybridRgbIntermediate)
+                {
+                    QueueFrameForRealtimeRgbIntermediate(_currentFrame, _lastUniqueFrame!);
+                    _lastUniqueFrame = null;
+                }
+            }
         }
 
         var recordedFrame = new RecordedFrame
@@ -325,6 +458,39 @@ internal sealed class RecordingSession : IAsyncDisposable
         if (_useRealtimeEncoding)
         {
             EnsureRealtimeWriterStarted();
+        }
+        else if (_useRealtimeRgbIntermediate)
+        {
+            if (!_disableHybridAlphaSpool)
+            {
+                var alphaFingerprint = ComputeAlphaFingerprint(frame.PixelBuffer.Span);
+                if (_hasLastAlphaFingerprint && alphaFingerprint == _lastAlphaFingerprint)
+                {
+                    recordedFrame.ReusePreviousSpoolFrame = true;
+                    recordedFrame.IsCompressed = _compressSpoolFrames ?? true;
+                }
+                else
+                {
+                    var alphaLease = ExtractAlphaPlane(frame.PixelBuffer, _recordedWidth, _recordedHeight);
+                    _compressSpoolFrames ??= true;
+                    recordedFrame.IsCompressed = _compressSpoolFrames.Value;
+
+                    var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, alphaLease);
+                    if (_writeSynchronously)
+                    {
+                        WriteFrameSynchronously(request);
+                    }
+                    else if (!TryQueueFrameWrite(request))
+                    {
+                        alphaLease.Dispose();
+                        frame.PixelBuffer.Dispose();
+                        return;
+                    }
+
+                    _lastAlphaFingerprint = alphaFingerprint;
+                    _hasLastAlphaFingerprint = true;
+                }
+            }
         }
         else
         {
@@ -346,7 +512,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
-        _lastUniqueFrame = _useRealtimeEncoding ? frame.PixelBuffer : null;
+        _lastUniqueFrame = (_useRealtimeEncoding || _useRealtimeRgbIntermediate) ? frame.PixelBuffer : null;
         _lastUniqueFingerprint = fingerprint;
     }
 
@@ -521,6 +687,26 @@ internal sealed class RecordingSession : IAsyncDisposable
             ResolveCacheRoot(_outputPath));
     }
 
+    private void EnsureRgbIntermediateWriterStarted()
+    {
+        if (!_useRealtimeRgbIntermediate || _rgbIntermediateWriter is not null)
+        {
+            return;
+        }
+
+        if (_rgbIntermediatePath is null)
+        {
+            throw new InvalidOperationException("RGB intermediate path が初期化されていません。");
+        }
+
+        _outputFrameRate = GetOutputFrameRate();
+        _rgbIntermediateWriter = new RealtimeRgbNvencWriter(
+            _recordedWidth,
+            _recordedHeight,
+            _outputFrameRate,
+            _rgbIntermediatePath);
+    }
+
     private void QueueFrameForRealtimeEncode(RecordedFrame frame, PixelBufferLease pixelData)
     {
         EnsureRealtimeWriterStarted();
@@ -534,6 +720,22 @@ internal sealed class RecordingSession : IAsyncDisposable
         var repeatCount = targetTotalFrames - _emittedTimelineFrames;
 
         _realtimeWriter.QueueFrame(pixelData, repeatCount);
+        _emittedTimelineFrames = targetTotalFrames;
+    }
+
+    private void QueueFrameForRealtimeRgbIntermediate(RecordedFrame frame, PixelBufferLease pixelData)
+    {
+        EnsureRgbIntermediateWriterStarted();
+        if (_rgbIntermediateWriter is null)
+        {
+            throw new InvalidOperationException("RGB intermediate writer が初期化されていません。");
+        }
+
+        _accumulatedTimelineFrames += frame.DurationSeconds * _outputFrameRate;
+        var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
+        var repeatCount = targetTotalFrames - _emittedTimelineFrames;
+
+        _rgbIntermediateWriter.QueueFrame(pixelData, repeatCount);
         _emittedTimelineFrames = targetTotalFrames;
     }
 
@@ -623,6 +825,38 @@ internal sealed class RecordingSession : IAsyncDisposable
         return Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
     }
 
+    private static PixelBufferLease ExtractAlphaPlane(PixelBufferLease bgraFrame, uint width, uint height)
+    {
+        var pixelCount = checked((int)(width * height));
+        var alphaLease = PixelBufferLease.Rent(pixelCount);
+
+        var source = bgraFrame.Span;
+        var destination = alphaLease.Buffer.AsSpan(0, pixelCount);
+        var sourceIndex = 3;
+        for (var targetIndex = 0; targetIndex < pixelCount; targetIndex++, sourceIndex += 4)
+        {
+            destination[targetIndex] = source[sourceIndex];
+        }
+
+        return alphaLease;
+    }
+
+    private static ulong ComputeAlphaFingerprint(ReadOnlySpan<byte> bgraFrame)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+
+        var hash = offsetBasis;
+        hash = (hash ^ (ulong)(bgraFrame.Length / 4)) * prime;
+
+        for (var index = 3; index < bgraFrame.Length; index += 4)
+        {
+            hash = (hash ^ bgraFrame[index]) * prime;
+        }
+
+        return hash;
+    }
+
     private static LZ4Level ResolveSpoolCompressionLevel(EncoderOption encoderOption)
     {
         var overrideValue = Environment.GetEnvironmentVariable("SPOUT_DIRECT_SAVER_SPOOL_COMPRESSION");
@@ -633,6 +867,19 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
 
         return LZ4Level.L00_FAST;
+    }
+
+    private static bool IsEnabled(string variableName)
+    {
+        var value = Environment.GetEnvironmentVariable(variableName);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, PixelBufferLease PixelData);

@@ -176,6 +176,7 @@ static IFramePattern CreatePattern(ScenePatternKind scene, uint width, uint heig
     return scene switch
     {
         ScenePatternKind.Complex => new ComplexMovingPattern(width, height),
+        ScenePatternKind.AlphaStress => new ComplexMovingPattern(width, height),
         _ => new SimpleMovingPattern(width, height)
     };
 }
@@ -190,6 +191,7 @@ static IGpuSceneRenderer? CreateGpuRenderer(SenderOptions options)
     return options.Scene switch
     {
         ScenePatternKind.Complex => new ShaderGpuSceneRenderer(options.Width, options.Height),
+        ScenePatternKind.AlphaStress => new ShaderGpuSceneRenderer(options.Width, options.Height, animatedAlpha: true),
         _ => null
     };
 }
@@ -257,7 +259,8 @@ internal sealed record SenderOptions(
 internal enum ScenePatternKind
 {
     Simple,
-    Complex
+    Complex,
+    AlphaStress
 }
 
 internal interface IFramePattern
@@ -639,13 +642,15 @@ internal sealed class ShaderGpuSceneRenderer : IGpuSceneRenderer
     private readonly int _timeLocation;
     private readonly int _resolutionLocation;
 
-    public ShaderGpuSceneRenderer(uint width, uint height)
+    public ShaderGpuSceneRenderer(uint width, uint height, bool animatedAlpha = false)
     {
         _width = checked((int)width);
         _height = checked((int)height);
 
         var vertexShader = GLShader.CreateShader(VertexShader, VertexShaderSource);
-        var fragmentShader = GLShader.CreateShader(FragmentShader, FragmentShaderSource);
+        var fragmentShader = GLShader.CreateShader(
+            FragmentShader,
+            animatedAlpha ? AlphaStressFragmentShaderSource : FragmentShaderSource);
         try
         {
             _program = GLShader.CreateProgram(vertexShader, fragmentShader);
@@ -791,6 +796,66 @@ internal sealed class ShaderGpuSceneRenderer : IGpuSceneRenderer
 
             color = clamp(color, 0.0, 1.0);
             gl_FragColor = vec4(color, 1.0);
+        }
+        """;
+
+    private const string AlphaStressFragmentShaderSource = """
+        #version 120
+
+        uniform float uTime;
+        uniform vec2 uResolution;
+
+        float hash(vec2 p)
+        {
+            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+
+        vec3 palette(float t)
+        {
+            return 0.5 + 0.5 * cos(vec3(0.2, 1.1, 2.2) + (t * 6.28318));
+        }
+
+        void main()
+        {
+            vec2 uv = gl_FragCoord.xy / uResolution.xy;
+            vec2 centered = uv * 2.0 - 1.0;
+            centered.x *= uResolution.x / uResolution.y;
+
+            vec2 grid = floor(uv * vec2(240.0, 135.0));
+            float t = uTime * 0.9;
+
+            float n0 = hash(grid + floor(t * 9.0));
+            float n1 = hash(grid.yx + floor(t * 13.0) + 37.0);
+            float n2 = hash(grid + floor(t * 17.0) + 91.0);
+
+            vec3 color = palette(n0 + (t * 0.07)) * 0.45;
+            color += palette(n1 + (t * 0.11)) * 0.25;
+            color += vec3(n2 * 0.22, n0 * 0.18, n1 * 0.14);
+
+            float stripes = 0.5 + 0.5 * sin((centered.x * 18.0) + (centered.y * 9.0) + (t * 7.5));
+            color += vec3(0.18, 0.12, 0.08) * stripes;
+
+            float alpha = 0.18 + 0.22 * stripes;
+            for (int i = 0; i < 18; i++)
+            {
+                float fi = float(i);
+                vec2 center = vec2(
+                    sin((fi * 1.73) + (t * (0.8 + fi * 0.05))),
+                    cos((fi * 1.21) - (t * (0.6 + fi * 0.04))));
+                center *= vec2(0.92, 0.66);
+                float radius = 0.06 + 0.025 * sin(t * 1.7 + fi);
+                float dist = length(centered - center);
+                float blob = smoothstep(radius, radius - 0.025, dist);
+                vec3 tint = palette(fi * 0.071 + t * 0.05);
+                color = mix(color, tint, blob * 0.6);
+                alpha += blob * (0.15 + 0.03 * sin(t * 2.1 + fi * 0.7));
+            }
+
+            float mask = 0.5 + 0.5 * sin((centered.x * 27.0) - (centered.y * 23.0) + (t * 11.0));
+            alpha += 0.24 * mask;
+            color = clamp(color, 0.0, 1.0);
+            alpha = clamp(alpha, 0.08, 1.0);
+            gl_FragColor = vec4(color, alpha);
         }
         """;
 }

@@ -141,8 +141,10 @@ public partial class MainWindow : Window
         _recordingStartedAt = DateTimeOffset.UtcNow;
         _recordingTimer.Start();
 
-        RecorderStatusTextBlock.Text = SelectedEncoderOption.RequiresRealtimeEncoding
-            ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
+        RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
+            ? "録画を開始しました。RGB をリアルタイム圧縮し、alpha を一時保存しています。"
+            : SelectedEncoderOption.RequiresRealtimeEncoding
+                ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
             : "録画を開始しました。変化フレームのみを一時保存しています。";
         PreviewStatusTextBlock.Text = "録画中はライブ入力プレビューを停止して録画を優先します。";
         HeaderStatusTextBlock.Text = "録画中";
@@ -164,8 +166,10 @@ public partial class MainWindow : Window
         try
         {
             HeaderStatusTextBlock.Text = "エンコード中";
-            RecorderStatusTextBlock.Text = SelectedEncoderOption.RequiresRealtimeEncoding
-                ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"
+            RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
+                ? "録画を停止しました。RGB を確定し、alpha と mux しています。"
+                : SelectedEncoderOption.RequiresRealtimeEncoding
+                    ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"
                 : "録画を停止しました。可変fps動画を書き出しています。";
 
             var outputPath = await _recordingSession.FinalizeAsync(_videoExportService, CancellationToken.None);

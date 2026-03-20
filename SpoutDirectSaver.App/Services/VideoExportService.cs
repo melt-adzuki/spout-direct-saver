@@ -14,6 +14,87 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class VideoExportService
 {
+    public async Task ExportAlphaTrackAsync(
+        string spoolPath,
+        IReadOnlyList<RecordedFrame> frames,
+        uint width,
+        uint height,
+        double outputFrameRate,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            Arguments =
+                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt gray -cues_to_front 1 \"{outputPath}\"",
+            WorkingDirectory = Path.GetDirectoryName(spoolPath)!,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        await RunFfmpegWithRawInputAsync(
+            startInfo,
+            destination => WriteRawVideoAsync(
+                destination,
+                spoolPath,
+                frames,
+                checked((int)(width * height)),
+                outputFrameRate,
+                cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task MuxVideoAndAlphaAsync(
+        string rgbVideoPath,
+        string alphaVideoPath,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            Arguments =
+                $"-y -i \"{rgbVideoPath}\" -i \"{alphaVideoPath}\" -map 0:v:0 -map 1:v:0 -c copy -cues_to_front 1 \"{outputPath}\"",
+            WorkingDirectory = Path.GetDirectoryName(outputPath)!,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        await RunFfmpegAsync(startInfo, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task RemuxSingleVideoAsync(
+        string inputPath,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            Arguments =
+                $"-y -i \"{inputPath}\" -map 0:v:0 -c copy -cues_to_front 1 \"{outputPath}\"",
+            WorkingDirectory = Path.GetDirectoryName(outputPath)!,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        await RunFfmpegAsync(startInfo, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task ExportAsync(
         EncoderOption encoderOption,
         string spoolPath,
@@ -38,61 +119,31 @@ internal sealed class VideoExportService
             CreateNoWindow = true
         };
 
-        try
-        {
-            using var process = new Process
-            {
-                StartInfo = startInfo
-            };
-
-            process.Start();
-
-            await WriteRawVideoAsync(
-                process.StandardInput.BaseStream,
+        await RunFfmpegWithRawInputAsync(
+            startInfo,
+            destination => WriteRawVideoAsync(
+                destination,
                 spoolPath,
                 frames,
-                width,
-                height,
+                checked((int)(width * height * 4)),
                 outputFrameRate,
-                cancellationToken).ConfigureAwait(false);
-            process.StandardInput.Close();
-
-            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-
-            var output = await outputTask.ConfigureAwait(false);
-            var error = await errorTask.ConfigureAwait(false);
-
-            if (process.ExitCode != 0)
-            {
-                var details = string.IsNullOrWhiteSpace(error) ? output : error;
-                throw new InvalidOperationException($"FFmpeg の書き出しに失敗しました。\n{details.Trim()}");
-            }
-        }
-        catch (Win32Exception ex)
-        {
-            throw new InvalidOperationException(
-                "ffmpeg を起動できませんでした。PATH の通った ffmpeg.exe を用意してください。",
-                ex);
-        }
+                cancellationToken),
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteRawVideoAsync(
         Stream destination,
         string spoolPath,
         IReadOnlyList<RecordedFrame> frames,
-        uint width,
-        uint height,
+        int frameSize,
         double outputFrameRate,
         CancellationToken cancellationToken)
     {
-        var frameSize = checked((int)(width * height * 4));
         var rawBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
         byte[] compressedBuffer = Array.Empty<byte>();
         var emittedFrames = 0;
         var accumulatedTimelineFrames = 0.0;
+        var hasPreviousDecodedFrame = false;
 
         try
         {
@@ -108,17 +159,24 @@ internal sealed class VideoExportService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (frame.SpoolLength <= 0)
+                if (frame.ReusePreviousSpoolFrame)
+                {
+                    if (!hasPreviousDecodedFrame)
+                    {
+                        throw new InvalidOperationException("前フレーム再利用を要求されましたが、復元済みフレームがありません。");
+                    }
+                }
+                else if (frame.SpoolLength <= 0)
                 {
                     throw new InvalidOperationException("一時フレームスプールのメタデータが壊れています。");
                 }
 
-                if (spoolStream.Position != frame.SpoolOffset)
+                if (!frame.ReusePreviousSpoolFrame && spoolStream.Position != frame.SpoolOffset)
                 {
                     spoolStream.Seek(frame.SpoolOffset, SeekOrigin.Begin);
                 }
 
-                if (frame.IsCompressed)
+                if (!frame.ReusePreviousSpoolFrame && frame.IsCompressed)
                 {
                     if (compressedBuffer.Length < frame.SpoolLength)
                     {
@@ -141,7 +199,7 @@ internal sealed class VideoExportService
                         rawBuffer,
                         frameSize);
                 }
-                else
+                else if (!frame.ReusePreviousSpoolFrame)
                 {
                     if (frame.SpoolLength != frameSize)
                     {
@@ -154,6 +212,8 @@ internal sealed class VideoExportService
                         frameSize,
                         cancellationToken).ConfigureAwait(false);
                 }
+
+                hasPreviousDecodedFrame = true;
 
                 accumulatedTimelineFrames += frame.DurationSeconds * outputFrameRate;
                 var targetTotalFrames = Math.Max(emittedFrames + 1, (int)Math.Round(accumulatedTimelineFrames));
@@ -213,5 +273,75 @@ internal sealed class VideoExportService
         LZ4Pickler.Unpickle(
             compressedFrame,
             destinationBuffer.AsSpan(0, expectedBytes));
+    }
+
+    private static async Task RunFfmpegWithRawInputAsync(
+        ProcessStartInfo startInfo,
+        Func<Stream, Task> inputWriter,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var process = new Process
+            {
+                StartInfo = startInfo
+            };
+
+            process.Start();
+            await inputWriter(process.StandardInput.BaseStream).ConfigureAwait(false);
+            process.StandardInput.Close();
+
+            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+            var output = await outputTask.ConfigureAwait(false);
+            var error = await errorTask.ConfigureAwait(false);
+
+            if (process.ExitCode != 0)
+            {
+                var details = string.IsNullOrWhiteSpace(error) ? output : error;
+                throw new InvalidOperationException($"FFmpeg の書き出しに失敗しました。\n{details.Trim()}");
+            }
+        }
+        catch (Win32Exception ex)
+        {
+            throw new InvalidOperationException(
+                "ffmpeg を起動できませんでした。PATH の通った ffmpeg.exe を用意してください。",
+                ex);
+        }
+    }
+
+    private static async Task RunFfmpegAsync(
+        ProcessStartInfo startInfo,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var process = new Process
+            {
+                StartInfo = startInfo
+            };
+
+            process.Start();
+            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+            var output = await outputTask.ConfigureAwait(false);
+            var error = await errorTask.ConfigureAwait(false);
+
+            if (process.ExitCode != 0)
+            {
+                var details = string.IsNullOrWhiteSpace(error) ? output : error;
+                throw new InvalidOperationException($"FFmpeg の処理に失敗しました。\n{details.Trim()}");
+            }
+        }
+        catch (Win32Exception ex)
+        {
+            throw new InvalidOperationException(
+                "ffmpeg を起動できませんでした。PATH の通った ffmpeg.exe を用意してください。",
+                ex);
+        }
     }
 }

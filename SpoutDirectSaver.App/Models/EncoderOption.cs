@@ -37,6 +37,8 @@ internal sealed class EncoderOption
 
     public bool RequiresRealtimeEncoding => false;
 
+    public bool UsesRealtimeRgbIntermediate => Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
+
     public string BuildArguments(uint width, uint height, double frameRate, string outputPath)
         => BuildArgumentsCore(width, height, frameRate, "-i -", outputPath);
 

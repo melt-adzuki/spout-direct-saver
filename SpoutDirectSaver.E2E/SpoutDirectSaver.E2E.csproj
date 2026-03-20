@@ -30,6 +30,7 @@
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeGrayFfv1Writer.cs" Link="Services\RealtimeGrayFfv1Writer.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeFfmpegWriter.cs" Link="Services\RealtimeFfmpegWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeHybridWriter.cs" Link="Services\RealtimeHybridWriter.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeRgbNvencWriter.cs" Link="Services\RealtimeRgbNvencWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RecordingSession.cs" Link="Services\RecordingSession.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\SpoutPollingService.cs" Link="Services\SpoutPollingService.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\VideoExportService.cs" Link="Services\VideoExportService.cs" />

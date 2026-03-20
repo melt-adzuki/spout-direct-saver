@@ -17,4 +17,6 @@ internal sealed class RecordedFrame
     public int SpoolLength { get; set; }
 
     public bool IsCompressed { get; set; }
+
+    public bool ReusePreviousSpoolFrame { get; set; }
 }
