@@ -2,11 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Compression;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Buffers.Binary;
+using K4os.Compression.LZ4;
 using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
@@ -14,8 +14,6 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class RecordingSession : IAsyncDisposable
 {
     private const double MinimumFrameDurationSeconds = 1.0 / 120.0;
-    private const int RawSpoolThresholdBytes = 3840 * 2160 * 4;
-
     private readonly object _gate = new();
     private readonly EncoderOption _encoderOption;
     private readonly string _outputPath;
@@ -24,6 +22,10 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly List<RecordedFrame> _frames = [];
     private readonly Channel<FrameWriteRequest> _writeChannel;
     private readonly Task _writerTask;
+    private readonly bool _blockOnBackpressure;
+    private readonly FileOptions _spoolFileOptions;
+    private readonly bool _writeSynchronously;
+    private readonly FileStream? _syncSpoolStream;
 
     private RecordedFrame? _currentFrame;
     private byte[]? _lastUniqueFrame;
@@ -36,10 +38,23 @@ internal sealed class RecordingSession : IAsyncDisposable
     private bool _disposed;
     private bool? _compressSpoolFrames;
 
-    public RecordingSession(EncoderOption encoderOption, string outputPath)
+    public RecordingSession(
+        EncoderOption encoderOption,
+        string outputPath,
+        int channelCapacity = 8,
+        bool blockOnBackpressure = false,
+        bool? compressSpoolFrames = null,
+        bool writeThroughSpool = false,
+        bool writeSynchronously = false)
     {
         _encoderOption = encoderOption;
         _outputPath = outputPath;
+        _blockOnBackpressure = blockOnBackpressure;
+        _compressSpoolFrames = compressSpoolFrames;
+        _writeSynchronously = writeSynchronously;
+        _spoolFileOptions = writeThroughSpool
+            ? FileOptions.Asynchronous | FileOptions.WriteThrough
+            : FileOptions.Asynchronous;
         _temporaryDirectory = Path.Combine(
             ResolveCacheRoot(outputPath),
             Guid.NewGuid().ToString("N"));
@@ -47,24 +62,32 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         Directory.CreateDirectory(_temporaryDirectory);
 
-        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(8)
+        _writeChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
         {
             SingleReader = true,
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        _writerTask = Task.Factory.StartNew(
-            static state =>
-            {
-                var session = (RecordingSession)state!;
-                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                session.WriteFramesAsync().GetAwaiter().GetResult();
-            },
-            this,
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
+        if (_writeSynchronously)
+        {
+            _syncSpoolStream = CreateSpoolStream();
+            _writerTask = Task.CompletedTask;
+        }
+        else
+        {
+            _writerTask = Task.Factory.StartNew(
+                static state =>
+                {
+                    var session = (RecordingSession)state!;
+                    using var schedulingScope = WindowsScheduling.EnterWriterProfile();
+                    session.WriteFramesAsync().GetAwaiter().GetResult();
+                },
+                this,
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+        }
     }
 
     public void AppendFrame(FramePacket frame)
@@ -121,6 +144,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         try
         {
             await _writerTask.ConfigureAwait(false);
+            _syncSpoolStream?.Dispose();
 
             await exportService.ExportAsync(
                 _encoderOption,
@@ -135,6 +159,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
+            _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
     }
@@ -167,6 +192,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
+            _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
     }
@@ -180,11 +206,15 @@ internal sealed class RecordingSession : IAsyncDisposable
             TimestampUtc = frame.TimestampUtc
         };
 
-        _compressSpoolFrames ??= frame.PixelData.Length < RawSpoolThresholdBytes;
+        _compressSpoolFrames ??= true;
         recordedFrame.IsCompressed = _compressSpoolFrames.Value;
 
         var request = new FrameWriteRequest(recordedFrame, frame.PixelData);
-        if (!_writeChannel.Writer.TryWrite(request))
+        if (_writeSynchronously)
+        {
+            WriteFrameSynchronously(request);
+        }
+        else if (!TryQueueFrameWrite(request))
         {
             return;
         }
@@ -214,32 +244,73 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private async Task WriteFramesAsync()
     {
-        await using var fileStream = new FileStream(
+        await using var fileStream = CreateSpoolStream();
+
+        await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            await WriteFrameAsync(fileStream, request).ConfigureAwait(false);
+        }
+
+        await fileStream.FlushAsync().ConfigureAwait(false);
+    }
+
+    private void WriteFrameSynchronously(FrameWriteRequest request)
+    {
+        ObjectDisposedException.ThrowIf(_syncSpoolStream is null, this);
+
+        var frameOffset = _syncSpoolStream.Position;
+        if (request.Frame.IsCompressed)
+        {
+            var compressedFrame = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
+            _syncSpoolStream.Write(compressedFrame);
+        }
+        else
+        {
+            _syncSpoolStream.Write(request.PixelData);
+        }
+
+        request.Frame.SpoolOffset = frameOffset;
+        request.Frame.SpoolLength = checked((int)(_syncSpoolStream.Position - frameOffset));
+        _syncSpoolStream.Flush();
+    }
+
+    private async Task WriteFrameAsync(FileStream fileStream, FrameWriteRequest request)
+    {
+        var frameOffset = fileStream.Position;
+        if (request.Frame.IsCompressed)
+        {
+            var compressedFrame = LZ4Pickler.Pickle(request.PixelData, LZ4Level.L00_FAST);
+            await fileStream.WriteAsync(compressedFrame).ConfigureAwait(false);
+        }
+        else
+        {
+            await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
+        }
+
+        request.Frame.SpoolOffset = frameOffset;
+        request.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
+    }
+
+    private FileStream CreateSpoolStream()
+    {
+        return new FileStream(
             _spoolPath,
             FileMode.Create,
             FileAccess.Write,
             FileShare.Read,
             4 * 1024 * 1024,
-            FileOptions.Asynchronous);
+            _spoolFileOptions);
+    }
 
-        await foreach (var request in _writeChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+    private bool TryQueueFrameWrite(FrameWriteRequest request)
+    {
+        if (_blockOnBackpressure)
         {
-            var frameOffset = fileStream.Position;
-            if (request.Frame.IsCompressed)
-            {
-                await using var compressionStream = new ZLibStream(fileStream, CompressionLevel.Fastest, leaveOpen: true);
-                await compressionStream.WriteAsync(request.PixelData).ConfigureAwait(false);
-            }
-            else
-            {
-                await fileStream.WriteAsync(request.PixelData).ConfigureAwait(false);
-            }
-
-            request.Frame.SpoolOffset = frameOffset;
-            request.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
+            _writeChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
+            return true;
         }
 
-        await fileStream.FlushAsync().ConfigureAwait(false);
+        return _writeChannel.Writer.TryWrite(request);
     }
 
     private double GetOutputFrameRate()

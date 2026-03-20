@@ -4,10 +4,10 @@ using System.Diagnostics;
 using System.IO;
 using System.Buffers;
 using System.Collections.Generic;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using K4os.Compression.LZ4;
 using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
@@ -136,11 +136,10 @@ internal sealed class VideoExportService
                         frame.SpoolLength,
                         cancellationToken).ConfigureAwait(false);
 
-                    await InflateFrameAsync(
-                        compressedBuffer.AsMemory(0, frame.SpoolLength),
+                    InflateFrame(
+                        compressedBuffer.AsSpan(0, frame.SpoolLength),
                         rawBuffer,
-                        frameSize,
-                        cancellationToken).ConfigureAwait(false);
+                        frameSize);
                 }
                 else
                 {
@@ -201,19 +200,18 @@ internal sealed class VideoExportService
         }
     }
 
-    private static async Task InflateFrameAsync(
-        ReadOnlyMemory<byte> compressedFrame,
+    private static void InflateFrame(
+        ReadOnlySpan<byte> compressedFrame,
         byte[] destinationBuffer,
-        int expectedBytes,
-        CancellationToken cancellationToken)
+        int expectedBytes)
     {
-        if (!MemoryMarshal.TryGetArray(compressedFrame, out ArraySegment<byte> segment) || segment.Array is null)
+        if (LZ4Pickler.UnpickledSize(compressedFrame) != expectedBytes)
         {
-            throw new InvalidOperationException("圧縮フレームの読み出しに失敗しました。");
+            throw new InvalidOperationException("LZ4 スプールフレームの復元サイズが想定と一致しません。");
         }
 
-        using var memoryStream = new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false, publiclyVisible: false);
-        await using var compressionStream = new ZLibStream(memoryStream, CompressionMode.Decompress, leaveOpen: false);
-        await ReadExactAsync(compressionStream, destinationBuffer, expectedBytes, cancellationToken).ConfigureAwait(false);
+        LZ4Pickler.Unpickle(
+            compressedFrame,
+            destinationBuffer.AsSpan(0, expectedBytes));
     }
 }

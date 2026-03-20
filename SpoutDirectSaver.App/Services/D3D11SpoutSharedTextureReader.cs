@@ -18,7 +18,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private ID3D11Device? _device;
     private ID3D11DeviceContext? _deviceContext;
     private ID3D11Texture2D? _sharedTexture;
-    private ID3D11Texture2D? _stagingTexture;
+    private readonly ID3D11Texture2D?[] _stagingTextures = new ID3D11Texture2D?[2];
     private IDXGIKeyedMutex? _keyedMutex;
     private int _deviceAdapterIndex = int.MinValue;
     private IntPtr _sharedHandle;
@@ -26,6 +26,9 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private uint _width;
     private uint _height;
     private Format _format = Format.Unknown;
+    private int _copyIndex;
+    private int _readIndex;
+    private bool _hasPrimedReadback;
 
     public D3D11SpoutSharedTextureReader()
     {
@@ -117,7 +120,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     public bool TryReadFrame(IntPtr destination, int destinationLength, out string? errorMessage)
     {
         var requiredBytes = checked((int)(_width * _height * 4));
-        if (_sharedTexture is null || _stagingTexture is null)
+        if (_sharedTexture is null || _stagingTextures[0] is null || _stagingTextures[1] is null)
         {
             errorMessage = "共有テクスチャが初期化されていません。";
             return false;
@@ -139,9 +142,17 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             }
 
             sharedAccessAcquired = true;
-            _deviceContext!.CopyResource(_stagingTexture, _sharedTexture);
-            _deviceContext.Flush();
-            var mapped = _deviceContext.Map(_stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            var copyTexture = _stagingTextures[_copyIndex]!;
+            var readTexture = _stagingTextures[_readIndex]!;
+            _deviceContext!.CopyResource(copyTexture, _sharedTexture);
+
+            if (!_hasPrimedReadback)
+            {
+                readTexture = copyTexture;
+                _hasPrimedReadback = true;
+            }
+
+            var mapped = _deviceContext.Map(readTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
 
             try
             {
@@ -152,8 +163,10 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             }
             finally
             {
-                _deviceContext.Unmap(_stagingTexture, 0);
+                _deviceContext.Unmap(readTexture, 0);
             }
+
+            (_copyIndex, _readIndex) = (_readIndex, _copyIndex);
 
             errorMessage = null;
             return true;
@@ -200,7 +213,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             ResourceOptionFlags.None);
 
         _sharedTexture = sharedTexture;
-        _stagingTexture = _device.CreateTexture2D(stagingDescription);
+        _stagingTextures[0] = _device.CreateTexture2D(stagingDescription);
+        _stagingTextures[1] = _device.CreateTexture2D(stagingDescription);
         _keyedMutex = sharedTexture.QueryInterfaceOrNull<IDXGIKeyedMutex>();
         _accessMutex = _keyedMutex is null
             ? new Mutex(false, $"{senderName}_SpoutAccessMutex")
@@ -210,6 +224,9 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _width = width;
         _height = height;
         _format = format;
+        _copyIndex = 0;
+        _readIndex = 1;
+        _hasPrimedReadback = false;
     }
 
     private void EnsureDevice(int adapterIndex)
@@ -269,8 +286,10 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _accessMutex = null;
         _keyedMutex?.Dispose();
         _keyedMutex = null;
-        _stagingTexture?.Dispose();
-        _stagingTexture = null;
+        _stagingTextures[0]?.Dispose();
+        _stagingTextures[0] = null;
+        _stagingTextures[1]?.Dispose();
+        _stagingTextures[1] = null;
         _sharedTexture?.Dispose();
         _sharedTexture = null;
         _sharedHandle = IntPtr.Zero;
@@ -278,6 +297,9 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _width = 0;
         _height = 0;
         _format = Format.Unknown;
+        _copyIndex = 0;
+        _readIndex = 1;
+        _hasPrimedReadback = false;
     }
 
     private bool TryAcquireTextureAccess()

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Spout.Interop;
 using SpoutDirectSaver.App.Models;
@@ -306,24 +307,25 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 continue;
             }
 
-            var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
-            Marshal.Copy(buffer, managedCopy, 0, bufferLength);
-
             session ??= new RecordingSession(
                 EncoderOption.CreateDefaults()[0],
-                outputPath);
+                outputPath,
+                channelCapacity: 8,
+                blockOnBackpressure: false);
             var acceptedFrameTick = Stopwatch.GetTimestamp();
-            session.AppendFrame(new FramePacket(
-                managedCopy,
-                width,
-                height,
-                options.SenderName,
-                receiver.SenderFps,
-                acceptedFrameTick,
-                DateTimeOffset.UtcNow));
             frameCount++;
             if (senderFrame > 0)
             {
+                var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
+                Marshal.Copy(buffer, managedCopy, 0, bufferLength);
+                session.AppendFrame(new FramePacket(
+                    managedCopy,
+                    width,
+                    height,
+                    options.SenderName,
+                    receiver.SenderFps,
+                    acceptedFrameTick,
+                    DateTimeOffset.UtcNow));
                 if (senderFrame != lastObservedSenderFrame)
                 {
                     uniqueFrameCount++;
@@ -336,6 +338,16 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             }
             else
             {
+                var managedCopy = GC.AllocateUninitializedArray<byte>(bufferLength);
+                Marshal.Copy(buffer, managedCopy, 0, bufferLength);
+                session.AppendFrame(new FramePacket(
+                    managedCopy,
+                    width,
+                    height,
+                    options.SenderName,
+                    receiver.SenderFps,
+                    acceptedFrameTick,
+                    DateTimeOffset.UtcNow));
                 var fingerprint = ComputeFingerprint(managedCopy);
                 if (lastFallbackFingerprint != fingerprint ||
                     lastFallbackFrame is null ||
@@ -592,7 +604,7 @@ static Process? LaunchTestSenderIfRequested(E2eOptions options)
     {
         FileName = "dotnet",
         Arguments =
-            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {options.CaptureSeconds + 3} --send-texture",
+            $"run --project \"{senderProjectPath}\" -- --name \"{options.SenderName}\" --width {options.Width} --height {options.Height} --fps {options.FrameRate:0.###} --seconds {(options.CaptureSeconds * 2) + 3} --send-texture",
         RedirectStandardOutput = true,
         RedirectStandardError = true,
         UseShellExecute = false,
