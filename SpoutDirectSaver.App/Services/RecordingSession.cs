@@ -40,8 +40,6 @@ internal sealed class RecordingSession : IAsyncDisposable
     private RecordedFrame? _currentFrame;
     private PixelBufferLease? _lastUniqueFrame;
     private ulong _lastUniqueFingerprint;
-    private ulong _lastAlphaFingerprint;
-    private bool _hasLastAlphaFingerprint;
     private uint _recordedWidth;
     private uint _recordedHeight;
     private double _nominalSourceFps;
@@ -226,11 +224,9 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
             else if (_useRealtimeRgbIntermediate)
             {
-                if (!_disableHybridRgbIntermediate &&
-                    _currentFrame is not null &&
-                    _lastUniqueFrame is not null)
+                if (_currentFrame is not null && _lastUniqueFrame is not null)
                 {
-                    QueueFrameForRealtimeRgbIntermediate(_currentFrame, _lastUniqueFrame);
+                    QueueHybridFrame(_currentFrame, _lastUniqueFrame);
                     _lastUniqueFrame = null;
                 }
 
@@ -304,20 +300,18 @@ internal sealed class RecordingSession : IAsyncDisposable
                     return _outputPath;
                 }
 
-                if (_disableHybridAlphaSpool)
-                {
-                    await exportService.RemuxSingleVideoAsync(
-                        _rgbIntermediatePath!,
-                        _outputPath,
-                        cancellationToken).ConfigureAwait(false);
-                    return _outputPath;
-                }
-
-                await exportService.MuxVideoAndAlphaAsync(
+                await exportService.RemuxSingleVideoAsync(
                     _rgbIntermediatePath!,
-                    _alphaTrackPath!,
                     _outputPath,
                     cancellationToken).ConfigureAwait(false);
+
+                if (!_disableHybridAlphaSpool)
+                {
+                    var alphaSidecarPath = BuildAlphaSidecarPath(_outputPath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(alphaSidecarPath)!);
+                    File.Copy(_alphaTrackPath!, alphaSidecarPath, overwrite: true);
+                }
+
                 return _outputPath;
             }
 
@@ -434,16 +428,13 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
             else if (_useRealtimeRgbIntermediate)
             {
-                if (!_disableHybridRgbIntermediate && _lastUniqueFrame is null)
+                if (_lastUniqueFrame is null)
                 {
                     throw new InvalidOperationException("RGB intermediate 用の前フレームが見つかりません。");
                 }
 
-                if (!_disableHybridRgbIntermediate)
-                {
-                    QueueFrameForRealtimeRgbIntermediate(_currentFrame, _lastUniqueFrame!);
-                    _lastUniqueFrame = null;
-                }
+                QueueHybridFrame(_currentFrame, _lastUniqueFrame);
+                _lastUniqueFrame = null;
             }
         }
 
@@ -461,36 +452,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         else if (_useRealtimeRgbIntermediate)
         {
-            if (!_disableHybridAlphaSpool)
-            {
-                var alphaFingerprint = ComputeAlphaFingerprint(frame.PixelBuffer.Span);
-                if (_hasLastAlphaFingerprint && alphaFingerprint == _lastAlphaFingerprint)
-                {
-                    recordedFrame.ReusePreviousSpoolFrame = true;
-                    recordedFrame.IsCompressed = _compressSpoolFrames ?? true;
-                }
-                else
-                {
-                    var alphaLease = ExtractAlphaPlane(frame.PixelBuffer, _recordedWidth, _recordedHeight);
-                    _compressSpoolFrames ??= true;
-                    recordedFrame.IsCompressed = _compressSpoolFrames.Value;
-
-                    var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, alphaLease);
-                    if (_writeSynchronously)
-                    {
-                        WriteFrameSynchronously(request);
-                    }
-                    else if (!TryQueueFrameWrite(request))
-                    {
-                        alphaLease.Dispose();
-                        frame.PixelBuffer.Dispose();
-                        return;
-                    }
-
-                    _lastAlphaFingerprint = alphaFingerprint;
-                    _hasLastAlphaFingerprint = true;
-                }
-            }
+            recordedFrame.IsCompressed = _compressSpoolFrames ?? true;
         }
         else
         {
@@ -534,7 +496,24 @@ internal sealed class RecordingSession : IAsyncDisposable
             await foreach (var request in _compressionChannel.Reader.ReadAllAsync().ConfigureAwait(false))
             {
                 byte[] payload;
-                if (request.Frame.IsCompressed)
+                if (request.ExtractAlphaOnly)
+                {
+                    var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
+                    try
+                    {
+                        payload = request.Frame.IsCompressed
+                            ? LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel)
+                            : alphaBuffer;
+                    }
+                    finally
+                    {
+                        if (!request.Frame.IsCompressed)
+                        {
+                            // payload owns alphaBuffer as-is
+                        }
+                    }
+                }
+                else if (request.Frame.IsCompressed)
                 {
                     payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
                 }
@@ -597,7 +576,20 @@ internal sealed class RecordingSession : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_syncSpoolStream is null, this);
 
         var frameOffset = _syncSpoolStream.Position;
-        if (request.Frame.IsCompressed)
+        if (request.ExtractAlphaOnly)
+        {
+            var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
+            if (request.Frame.IsCompressed)
+            {
+                var compressedFrame = LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel);
+                _syncSpoolStream.Write(compressedFrame);
+            }
+            else
+            {
+                _syncSpoolStream.Write(alphaBuffer, 0, alphaBuffer.Length);
+            }
+        }
+        else if (request.Frame.IsCompressed)
         {
             var compressedFrame = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
             _syncSpoolStream.Write(compressedFrame);
@@ -739,6 +731,32 @@ internal sealed class RecordingSession : IAsyncDisposable
         _emittedTimelineFrames = targetTotalFrames;
     }
 
+    private void QueueHybridFrame(RecordedFrame frame, PixelBufferLease pixelData)
+    {
+        if (!_disableHybridAlphaSpool)
+        {
+            pixelData.Retain();
+            var request = new FrameWriteRequest(frame.FrameIndex, frame, pixelData, ExtractAlphaOnly: true);
+            if (_writeSynchronously)
+            {
+                WriteFrameSynchronously(request);
+            }
+            else if (!TryQueueFrameWrite(request))
+            {
+                pixelData.Dispose();
+                throw new InvalidOperationException("alpha スプールへのフレーム投入に失敗しました。");
+            }
+        }
+
+        if (!_disableHybridRgbIntermediate)
+        {
+            QueueFrameForRealtimeRgbIntermediate(frame, pixelData);
+            return;
+        }
+
+        pixelData.Dispose();
+    }
+
     private void TryDeleteTemporaryDirectory()
     {
         if (string.IsNullOrWhiteSpace(_temporaryDirectory) || !Directory.Exists(_temporaryDirectory))
@@ -777,6 +795,13 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
 
         return Path.Combine(Path.GetTempPath(), "SpoutDirectSaver");
+    }
+
+    private static string BuildAlphaSidecarPath(string outputPath)
+    {
+        var directory = Path.GetDirectoryName(outputPath) ?? string.Empty;
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);
+        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mkv");
     }
 
     private static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
@@ -825,36 +850,18 @@ internal sealed class RecordingSession : IAsyncDisposable
         return Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
     }
 
-    private static PixelBufferLease ExtractAlphaPlane(PixelBufferLease bgraFrame, uint width, uint height)
+    private static byte[] ExtractAlphaPlane(ReadOnlySpan<byte> bgraFrame)
     {
-        var pixelCount = checked((int)(width * height));
-        var alphaLease = PixelBufferLease.Rent(pixelCount);
-
-        var source = bgraFrame.Span;
-        var destination = alphaLease.Buffer.AsSpan(0, pixelCount);
+        var pixelCount = bgraFrame.Length / 4;
+        var alphaBuffer = GC.AllocateUninitializedArray<byte>(pixelCount);
+        var destination = alphaBuffer.AsSpan();
         var sourceIndex = 3;
         for (var targetIndex = 0; targetIndex < pixelCount; targetIndex++, sourceIndex += 4)
         {
-            destination[targetIndex] = source[sourceIndex];
+            destination[targetIndex] = bgraFrame[sourceIndex];
         }
 
-        return alphaLease;
-    }
-
-    private static ulong ComputeAlphaFingerprint(ReadOnlySpan<byte> bgraFrame)
-    {
-        const ulong offsetBasis = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-
-        var hash = offsetBasis;
-        hash = (hash ^ (ulong)(bgraFrame.Length / 4)) * prime;
-
-        for (var index = 3; index < bgraFrame.Length; index += 4)
-        {
-            hash = (hash ^ bgraFrame[index]) * prime;
-        }
-
-        return hash;
+        return alphaBuffer;
     }
 
     private static LZ4Level ResolveSpoolCompressionLevel(EncoderOption encoderOption)
@@ -882,7 +889,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                value.Equals("yes", StringComparison.OrdinalIgnoreCase);
     }
 
-    private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, PixelBufferLease PixelData);
+    private sealed record FrameWriteRequest(int Sequence, RecordedFrame Frame, PixelBufferLease PixelData, bool ExtractAlphaOnly = false);
 
     private sealed record PreparedFrameWriteRequest(int Sequence, RecordedFrame Frame, byte[] Payload, int Length);
 }

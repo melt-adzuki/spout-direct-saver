@@ -124,11 +124,11 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         var frameCountSenderName = string.Empty;
         var frameCountSupportProbed = false;
         var frameCountSupported = false;
+        var currentReceiveConfiguration = ReceiveConfiguration.ImageFallback;
 
         try
         {
-            receiver.SetCPUmode(true);
-            receiver.BufferMode = false;
+            ApplyReceiveConfiguration(receiver, ReceiveConfiguration.ImageFallback);
             receiver.Buffers = ReceiveBufferCount;
             receiver.SetFrameCount(true);
             frameCounter.SetFrameCount(true);
@@ -167,6 +167,16 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     connectedWidth != width ||
                     connectedHeight != height ||
                     !string.Equals(connectedSenderName, senderName, StringComparison.Ordinal);
+
+                var desiredConfiguration = IsSharedTextureCapable(receiver)
+                    ? ReceiveConfiguration.SharedTexturePreferred
+                    : ReceiveConfiguration.ImageFallback;
+                if (desiredConfiguration != currentReceiveConfiguration)
+                {
+                    ApplyReceiveConfiguration(receiver, desiredConfiguration);
+                    currentReceiveConfiguration = desiredConfiguration;
+                    senderWasUpdated = true;
+                }
 
                 var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
                 if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
@@ -414,6 +424,26 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         return true;
     }
 
+    private static bool IsSharedTextureCapable(SpoutReceiver receiver)
+    {
+        return receiver.SenderGLDX && !receiver.SenderCPU && receiver.SenderHandle != IntPtr.Zero;
+    }
+
+    private static void ApplyReceiveConfiguration(SpoutReceiver receiver, ReceiveConfiguration configuration)
+    {
+        switch (configuration)
+        {
+            case ReceiveConfiguration.SharedTexturePreferred:
+                receiver.SetCPUmode(false);
+                receiver.BufferMode = true;
+                break;
+            default:
+                receiver.SetCPUmode(true);
+                receiver.BufferMode = false;
+                break;
+        }
+    }
+
     private static bool TryReceiveSharedTextureFrame(
         D3D11SpoutSharedTextureReader sharedTextureReader,
         SpoutFrameCount frameCounter,
@@ -580,5 +610,11 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
 
         return WaitForNextFrame(frameCounter, senderFps);
+    }
+
+    private enum ReceiveConfiguration
+    {
+        ImageFallback,
+        SharedTexturePreferred
     }
 }
