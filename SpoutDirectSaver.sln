@@ -9,8 +9,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.TestSender
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.E2E", "SpoutDirectSaver.E2E\SpoutDirectSaver.E2E.csproj", "{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SpoutDirectSaver.VideoAnalysis", "SpoutDirectSaver.VideoAnalysis\SpoutDirectSaver.VideoAnalysis.csproj", "{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -57,18 +55,6 @@ Global
 		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x64.Build.0 = Release|Any CPU
 		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x86.ActiveCfg = Release|Any CPU
 		{2020DC9A-6D47-4CE4-94B0-9EC8039E731E}.Release|x86.Build.0 = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|x64.Build.0 = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Debug|x86.Build.0 = Debug|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|Any CPU.Build.0 = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|x64.ActiveCfg = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|x64.Build.0 = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|x86.ActiveCfg = Release|Any CPU
-		{24EDDC98-7198-4CDF-93F4-F6EAAF58FE2F}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

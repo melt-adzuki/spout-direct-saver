@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using Spout.Interop;
 using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
+using SpoutDirectSaver.E2E;
 using Vortice.DXGI;
 
 var options = E2eOptions.Parse(args);
@@ -52,6 +53,8 @@ Console.WriteLine($"record_unique_min_1s_fps={recordResult.FrameRateStats.Minimu
 Console.WriteLine($"record_output={recordResult.OutputPath}");
 
     await ProbeVideoAsync(recordResult.OutputPath);
+    var contentAnalysis = await ContentVideoAnalysis.AnalyzeAsync(recordResult.OutputPath);
+    contentAnalysis.PrintToConsole();
 }
 finally
 {

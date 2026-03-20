@@ -4,267 +4,250 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 
-var options = AnalysisOptions.Parse(args);
-if (!File.Exists(options.InputPath))
+namespace SpoutDirectSaver.E2E;
+
+internal static class ContentVideoAnalysis
 {
-    Console.Error.WriteLine($"Input file was not found: {options.InputPath}");
-    return 1;
-}
-
-var probe = await VideoProbe.ReadAsync(options.InputPath);
-var analysisWidth = options.AnalysisWidth;
-var analysisHeight = Math.Max(1, (int)Math.Round(probe.Height * (analysisWidth / (double)probe.Width)));
-var frameSize = checked(analysisWidth * analysisHeight);
-
-Console.WriteLine($"input={options.InputPath}");
-Console.WriteLine($"codec={probe.CodecName}");
-Console.WriteLine($"size={probe.Width}x{probe.Height}");
-Console.WriteLine($"nominal_fps={probe.AverageFrameRate:0.###}");
-Console.WriteLine($"analysis_size={analysisWidth}x{analysisHeight}");
-
-var samples = await DecodeAndAnalyzeAsync(options.InputPath, analysisWidth, analysisHeight, probe.FramePtsSeconds);
-if (samples.Count == 0)
-{
-    Console.Error.WriteLine("No frames were decoded.");
-    return 1;
-}
-
-var diffScores = samples
-    .Skip(1)
-    .Select(sample => sample.SignatureMeanAbsoluteDifference)
-    .ToArray();
-
-var otsuThreshold = diffScores.Length == 0 ? 0.0 : OtsuThreshold.Compute(diffScores);
-var motionThreshold = diffScores.Length == 0 ? 0.0 : Quantiles.Compute(diffScores.Where(value => value > 0.0).ToArray(), 0.25);
-var exactStats = VisualUpdateStats.Build(
-    samples,
-    static sample => sample.IsExactSignatureRepeat,
-    "exact_signature");
-var motionStutterStats = VisualUpdateStats.BuildMotionStutter(
-    samples,
-    probe.AverageFrameRate,
-    motionThreshold,
-    "motion_stutter");
-var perceptualStats = VisualUpdateStats.Build(
-    samples,
-    sample => sample.SignatureMeanAbsoluteDifference <= otsuThreshold,
-    $"perceptual_otsu(threshold={otsuThreshold:0.###})");
-
-Console.WriteLine($"exact_signature_avg_fps={exactStats.AverageFps:0.00}");
-Console.WriteLine($"exact_signature_min_1s_fps={exactStats.MinimumOneSecondFps:0.00}");
-Console.WriteLine($"exact_signature_repeat_ratio={exactStats.RepeatFrameRatio:0.000}");
-Console.WriteLine($"exact_signature_update_count={exactStats.UpdateCount}");
-Console.WriteLine($"exact_signature_longest_repeat_run={exactStats.LongestRepeatRunFrames}");
-Console.WriteLine($"motion_threshold={motionThreshold:0.###}");
-Console.WriteLine($"motion_stutter_avg_fps={motionStutterStats.AverageFps:0.00}");
-Console.WriteLine($"motion_stutter_min_1s_fps={motionStutterStats.MinimumOneSecondFps:0.00}");
-Console.WriteLine($"motion_stutter_repeat_ratio={motionStutterStats.RepeatFrameRatio:0.000}");
-Console.WriteLine($"motion_stutter_update_count={motionStutterStats.UpdateCount}");
-Console.WriteLine($"motion_stutter_longest_repeat_run={motionStutterStats.LongestRepeatRunFrames}");
-Console.WriteLine($"experimental_perceptual_threshold={otsuThreshold:0.###}");
-Console.WriteLine($"experimental_perceptual_avg_fps={perceptualStats.AverageFps:0.00}");
-Console.WriteLine($"experimental_perceptual_min_1s_fps={perceptualStats.MinimumOneSecondFps:0.00}");
-Console.WriteLine($"experimental_perceptual_longest_repeat_run={perceptualStats.LongestRepeatRunFrames}");
-
-PrintWorstWindows("exact_signature", exactStats.WorstWindows);
-PrintWorstWindows("motion_stutter", motionStutterStats.WorstWindows);
-PrintWorstWindows("perceptual", perceptualStats.WorstWindows);
-
-if (options.CsvPath is not null)
-{
-    await WriteCsvAsync(options.CsvPath, samples, otsuThreshold);
-    Console.WriteLine($"csv={options.CsvPath}");
-}
-
-return 0;
-
-static async Task<List<FrameSample>> DecodeAndAnalyzeAsync(
-    string inputPath,
-    int analysisWidth,
-    int analysisHeight,
-    IReadOnlyList<double> framePtsSeconds)
-{
-    var process = new Process
+    public static async Task<ContentAnalysisReport> AnalyzeAsync(string inputPath, int analysisWidth = 64, string? csvPath = null)
     {
-        StartInfo = new ProcessStartInfo
+        if (!File.Exists(inputPath))
         {
-            FileName = "ffmpeg",
-            Arguments =
-                $"-v error -nostdin -i \"{inputPath}\" -vf \"scale={analysisWidth}:{analysisHeight}:flags=area,format=gray\" -pix_fmt gray -f rawvideo -",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
+            throw new FileNotFoundException("Input file was not found.", inputPath);
         }
-    };
 
-    process.Start();
-
-    var frameSize = checked(analysisWidth * analysisHeight);
-    var stdout = process.StandardOutput.BaseStream;
-    var previousFrame = ArrayPool<byte>.Shared.Rent(frameSize);
-    var currentFrame = ArrayPool<byte>.Shared.Rent(frameSize);
-    var previousSignature = ArrayPool<byte>.Shared.Rent(SignatureBuilder.SignatureLength);
-
-    var samples = new List<FrameSample>(framePtsSeconds.Count);
-    var frameIndex = 0;
-    var hasPrevious = false;
-    var currentSignatureBuffer = ArrayPool<byte>.Shared.Rent(SignatureBuilder.SignatureLength);
-
-    try
-    {
-        while (true)
+        var probe = await VideoProbe.ReadAsync(inputPath).ConfigureAwait(false);
+        var analysisHeight = Math.Max(1, (int)Math.Round(probe.Height * (analysisWidth / (double)probe.Width)));
+        var samples = await DecodeAndAnalyzeAsync(inputPath, analysisWidth, analysisHeight, probe.FramePtsSeconds).ConfigureAwait(false);
+        if (samples.Count == 0)
         {
-            var bytesRead = await ReadFullFrameAsync(stdout, currentFrame.AsMemory(0, frameSize)).ConfigureAwait(false);
-            if (bytesRead == 0)
+            throw new InvalidOperationException("No frames were decoded.");
+        }
+
+        var diffScores = samples
+            .Skip(1)
+            .Select(sample => sample.SignatureMeanAbsoluteDifference)
+            .ToArray();
+
+        var otsuThreshold = diffScores.Length == 0 ? 0.0 : OtsuThreshold.Compute(diffScores);
+        var motionThreshold = diffScores.Length == 0 ? 0.0 : Quantiles.Compute(diffScores.Where(value => value > 0.0).ToArray(), 0.25);
+        var exactStats = VisualUpdateStats.Build(
+            samples,
+            static sample => sample.IsExactSignatureRepeat,
+            "exact_signature");
+        var motionStutterStats = VisualUpdateStats.BuildMotionStutter(
+            samples,
+            probe.AverageFrameRate,
+            motionThreshold,
+            "motion_stutter");
+        var perceptualStats = VisualUpdateStats.Build(
+            samples,
+            sample => sample.SignatureMeanAbsoluteDifference <= otsuThreshold,
+            "experimental_perceptual");
+
+        if (!string.IsNullOrWhiteSpace(csvPath))
+        {
+            await WriteCsvAsync(csvPath!, samples, otsuThreshold).ConfigureAwait(false);
+        }
+
+        return new ContentAnalysisReport(
+            inputPath,
+            probe.CodecName,
+            probe.Width,
+            probe.Height,
+            probe.AverageFrameRate,
+            analysisWidth,
+            analysisHeight,
+            motionThreshold,
+            otsuThreshold,
+            exactStats,
+            motionStutterStats,
+            perceptualStats,
+            csvPath);
+    }
+
+    private static async Task<List<FrameSample>> DecodeAndAnalyzeAsync(
+        string inputPath,
+        int analysisWidth,
+        int analysisHeight,
+        IReadOnlyList<double> framePtsSeconds)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
             {
-                break;
+                FileName = "ffmpeg",
+                Arguments =
+                    $"-v error -nostdin -i \"{inputPath}\" -vf \"scale={analysisWidth}:{analysisHeight}:flags=area,format=gray\" -pix_fmt gray -f rawvideo -",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
             }
+        };
 
-            if (bytesRead != frameSize)
+        process.Start();
+
+        var frameSize = checked(analysisWidth * analysisHeight);
+        var stdout = process.StandardOutput.BaseStream;
+        var previousFrame = ArrayPool<byte>.Shared.Rent(frameSize);
+        var currentFrame = ArrayPool<byte>.Shared.Rent(frameSize);
+        var previousSignature = ArrayPool<byte>.Shared.Rent(SignatureBuilder.SignatureLength);
+        var currentSignatureBuffer = ArrayPool<byte>.Shared.Rent(SignatureBuilder.SignatureLength);
+        var samples = new List<FrameSample>(framePtsSeconds.Count);
+        var frameIndex = 0;
+        var hasPrevious = false;
+
+        try
+        {
+            while (true)
             {
-                throw new InvalidOperationException($"Unexpected frame size. Expected {frameSize} bytes but got {bytesRead}.");
-            }
+                var bytesRead = await ReadFullFrameAsync(stdout, currentFrame.AsMemory(0, frameSize)).ConfigureAwait(false);
+                if (bytesRead == 0)
+                {
+                    break;
+                }
 
-            var currentSignature = currentSignatureBuffer.AsSpan(0, SignatureBuilder.SignatureLength);
-            SignatureBuilder.Build(currentFrame.AsSpan(0, frameSize), analysisWidth, analysisHeight, currentSignature);
+                if (bytesRead != frameSize)
+                {
+                    throw new InvalidOperationException($"Unexpected frame size. Expected {frameSize} bytes but got {bytesRead}.");
+                }
 
-            var ptsSeconds = frameIndex < framePtsSeconds.Count
-                ? framePtsSeconds[frameIndex]
-                : frameIndex;
+                var currentSignature = currentSignatureBuffer.AsSpan(0, SignatureBuilder.SignatureLength);
+                SignatureBuilder.Build(currentFrame.AsSpan(0, frameSize), analysisWidth, analysisHeight, currentSignature);
 
-            if (!hasPrevious)
-            {
+                var ptsSeconds = frameIndex < framePtsSeconds.Count
+                    ? framePtsSeconds[frameIndex]
+                    : frameIndex;
+
+                if (!hasPrevious)
+                {
+                    currentSignature.CopyTo(previousSignature);
+                    currentFrame.AsSpan(0, frameSize).CopyTo(previousFrame);
+                    samples.Add(new FrameSample(frameIndex, ptsSeconds, false, 0.0));
+                    hasPrevious = true;
+                    frameIndex++;
+                    continue;
+                }
+
+                var exactSignatureRepeat = currentSignature.SequenceEqual(previousSignature.AsSpan(0, SignatureBuilder.SignatureLength));
+                var meanAbsoluteDifference = ComputeSignatureDifference(
+                    currentSignature,
+                    previousSignature.AsSpan(0, SignatureBuilder.SignatureLength));
+
+                samples.Add(new FrameSample(frameIndex, ptsSeconds, exactSignatureRepeat, meanAbsoluteDifference));
                 currentSignature.CopyTo(previousSignature);
                 currentFrame.AsSpan(0, frameSize).CopyTo(previousFrame);
-                samples.Add(new FrameSample(frameIndex, ptsSeconds, false, 0.0));
-                hasPrevious = true;
                 frameIndex++;
-                continue;
             }
 
-            var exactSignatureRepeat = currentSignature.SequenceEqual(previousSignature.AsSpan(0, SignatureBuilder.SignatureLength));
-            var meanAbsoluteDifference = ComputeSignatureDifference(
-                currentSignature,
-                previousSignature.AsSpan(0, SignatureBuilder.SignatureLength));
-
-            samples.Add(new FrameSample(frameIndex, ptsSeconds, exactSignatureRepeat, meanAbsoluteDifference));
-
-            currentSignature.CopyTo(previousSignature);
-            currentFrame.AsSpan(0, frameSize).CopyTo(previousFrame);
-            frameIndex++;
-        }
-
-        await process.WaitForExitAsync().ConfigureAwait(false);
-        var stderr = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"ffmpeg exited with code {process.ExitCode}: {stderr}");
-        }
-
-        return samples;
-    }
-    finally
-    {
-        ArrayPool<byte>.Shared.Return(previousFrame);
-        ArrayPool<byte>.Shared.Return(currentFrame);
-        ArrayPool<byte>.Shared.Return(previousSignature);
-        ArrayPool<byte>.Shared.Return(currentSignatureBuffer);
-        process.Dispose();
-    }
-}
-
-static double ComputeSignatureDifference(ReadOnlySpan<byte> current, ReadOnlySpan<byte> previous)
-{
-    long total = 0;
-    for (var index = 0; index < current.Length; index++)
-    {
-        total += Math.Abs(current[index] - previous[index]);
-    }
-
-    return total / (double)current.Length;
-}
-
-static async Task<int> ReadFullFrameAsync(Stream stream, Memory<byte> buffer)
-{
-    var totalRead = 0;
-    while (totalRead < buffer.Length)
-    {
-        var read = await stream.ReadAsync(buffer[totalRead..]).ConfigureAwait(false);
-        if (read == 0)
-        {
-            return totalRead;
-        }
-
-        totalRead += read;
-    }
-
-    return totalRead;
-}
-
-static async Task WriteCsvAsync(string path, IReadOnlyList<FrameSample> samples, double perceptualThreshold)
-{
-    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-    await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
-    await writer.WriteLineAsync("frame_index,pts_seconds,exact_signature_repeat,signature_mean_abs_diff,perceptual_repeat").ConfigureAwait(false);
-
-    foreach (var sample in samples)
-    {
-        await writer.WriteLineAsync(
-            string.Create(
-                CultureInfo.InvariantCulture,
-                $"{sample.FrameIndex},{sample.PtsSeconds:0.######},{sample.IsExactSignatureRepeat},{sample.SignatureMeanAbsoluteDifference:0.######},{sample.SignatureMeanAbsoluteDifference <= perceptualThreshold}")).ConfigureAwait(false);
-    }
-}
-
-static void PrintWorstWindows(string label, IReadOnlyList<WindowMetric> windows)
-{
-    for (var index = 0; index < windows.Count; index++)
-    {
-        var window = windows[index];
-        Console.WriteLine(
-            $"{label}_worst_window_{index + 1}={window.StartSeconds:0.###}-{window.EndSeconds:0.###}s fps={window.FramesPerSecond:0.00}");
-    }
-}
-
-internal sealed record AnalysisOptions(string InputPath, int AnalysisWidth, string? CsvPath)
-{
-    public static AnalysisOptions Parse(string[] args)
-    {
-        if (args.Length == 0)
-        {
-            throw new InvalidOperationException("Usage: SpoutDirectSaver.VideoAnalysis <inputPath> [--analysis-width 64] [--csv output.csv]");
-        }
-
-        string? inputPath = null;
-        var analysisWidth = 64;
-        string? csvPath = null;
-
-        for (var index = 0; index < args.Length; index++)
-        {
-            switch (args[index])
+            await process.WaitForExitAsync().ConfigureAwait(false);
+            var stderr = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+            if (process.ExitCode != 0)
             {
-                case "--analysis-width":
-                    analysisWidth = int.Parse(args[++index], CultureInfo.InvariantCulture);
-                    break;
-                case "--csv":
-                    csvPath = args[++index];
-                    break;
-                default:
-                    if (!args[index].StartsWith("--", StringComparison.Ordinal))
-                    {
-                        inputPath ??= args[index];
-                    }
-                    break;
+                throw new InvalidOperationException($"ffmpeg exited with code {process.ExitCode}: {stderr}");
             }
-        }
 
-        if (string.IsNullOrWhiteSpace(inputPath))
+            return samples;
+        }
+        finally
         {
-            throw new InvalidOperationException("An input path is required.");
+            ArrayPool<byte>.Shared.Return(previousFrame);
+            ArrayPool<byte>.Shared.Return(currentFrame);
+            ArrayPool<byte>.Shared.Return(previousSignature);
+            ArrayPool<byte>.Shared.Return(currentSignatureBuffer);
+        }
+    }
+
+    private static double ComputeSignatureDifference(ReadOnlySpan<byte> current, ReadOnlySpan<byte> previous)
+    {
+        long total = 0;
+        for (var index = 0; index < current.Length; index++)
+        {
+            total += Math.Abs(current[index] - previous[index]);
         }
 
-        return new AnalysisOptions(inputPath, analysisWidth, csvPath);
+        return total / (double)current.Length;
+    }
+
+    private static async Task<int> ReadFullFrameAsync(Stream stream, Memory<byte> buffer)
+    {
+        var totalRead = 0;
+        while (totalRead < buffer.Length)
+        {
+            var read = await stream.ReadAsync(buffer[totalRead..]).ConfigureAwait(false);
+            if (read == 0)
+            {
+                return totalRead;
+            }
+
+            totalRead += read;
+        }
+
+        return totalRead;
+    }
+
+    private static async Task WriteCsvAsync(string path, IReadOnlyList<FrameSample> samples, double perceptualThreshold)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
+        await writer.WriteLineAsync("frame_index,pts_seconds,exact_signature_repeat,signature_mean_abs_diff,perceptual_repeat").ConfigureAwait(false);
+
+        foreach (var sample in samples)
+        {
+            await writer.WriteLineAsync(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{sample.FrameIndex},{sample.PtsSeconds:0.######},{sample.IsExactSignatureRepeat},{sample.SignatureMeanAbsoluteDifference:0.######},{sample.SignatureMeanAbsoluteDifference <= perceptualThreshold}")).ConfigureAwait(false);
+        }
+    }
+}
+
+internal sealed record ContentAnalysisReport(
+    string InputPath,
+    string Codec,
+    int Width,
+    int Height,
+    double NominalFps,
+    int AnalysisWidth,
+    int AnalysisHeight,
+    double MotionThreshold,
+    double PerceptualThreshold,
+    VisualUpdateStats ExactSignature,
+    VisualUpdateStats MotionStutter,
+    VisualUpdateStats ExperimentalPerceptual,
+    string? CsvPath)
+{
+    public void PrintToConsole()
+    {
+        Console.WriteLine($"content_analysis_input={InputPath}");
+        Console.WriteLine($"content_analysis_codec={Codec}");
+        Console.WriteLine($"content_analysis_size={Width}x{Height}");
+        Console.WriteLine($"content_analysis_nominal_fps={NominalFps:0.###}");
+        Console.WriteLine($"content_analysis_analysis_size={AnalysisWidth}x{AnalysisHeight}");
+        PrintStats("exact_signature", ExactSignature);
+        Console.WriteLine($"content_analysis_motion_threshold={MotionThreshold:0.###}");
+        PrintStats("motion_stutter", MotionStutter);
+        Console.WriteLine($"content_analysis_experimental_perceptual_threshold={PerceptualThreshold:0.###}");
+        PrintStats("experimental_perceptual", ExperimentalPerceptual);
+        if (!string.IsNullOrWhiteSpace(CsvPath))
+        {
+            Console.WriteLine($"content_analysis_csv={CsvPath}");
+        }
+    }
+
+    private static void PrintStats(string label, VisualUpdateStats stats)
+    {
+        Console.WriteLine($"content_analysis_{label}_avg_fps={stats.AverageFps:0.00}");
+        Console.WriteLine($"content_analysis_{label}_min_1s_fps={stats.MinimumOneSecondFps:0.00}");
+        Console.WriteLine($"content_analysis_{label}_repeat_ratio={stats.RepeatFrameRatio:0.000}");
+        Console.WriteLine($"content_analysis_{label}_update_count={stats.UpdateCount}");
+        Console.WriteLine($"content_analysis_{label}_longest_repeat_run={stats.LongestRepeatRunFrames}");
+        for (var index = 0; index < stats.WorstWindows.Count; index++)
+        {
+            var window = stats.WorstWindows[index];
+            Console.WriteLine(
+                $"content_analysis_{label}_worst_window_{index + 1}={window.StartSeconds:0.###}-{window.EndSeconds:0.###}s fps={window.FramesPerSecond:0.00}");
+        }
     }
 }
 
@@ -423,7 +406,6 @@ internal sealed record VisualUpdateStats(
 
         var duration = Math.Max(samples[^1].PtsSeconds - samples[0].PtsSeconds, 1.0 / 60.0);
         var averageFps = updateTimes.Count / duration;
-
         var windowMetrics = ComputeWindowMetrics(updateTimes, samples);
         var minimum = windowMetrics.Count == 0
             ? averageFps
