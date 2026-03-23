@@ -40,6 +40,11 @@ internal static class WindowsScheduling
         return WindowsThreadSchedulingScope.TryEnter("Distribution", ThreadPriority.AboveNormal, AvrtPriority.Normal);
     }
 
+    public static IDisposable EnterBackgroundWorkProfile()
+    {
+        return WindowsThreadSchedulingScope.TryEnterWithoutMmcss(ThreadPriority.BelowNormal);
+    }
+
     private sealed class WindowsThreadSchedulingScope : IDisposable
     {
         private readonly IntPtr _mmcssHandle;
@@ -81,6 +86,23 @@ internal static class WindowsScheduling
             }
 
             return new WindowsThreadSchedulingScope(handle, previousPriority);
+        }
+
+        public static IDisposable TryEnterWithoutMmcss(ThreadPriority threadPriority)
+        {
+            var currentThread = Thread.CurrentThread;
+            var previousPriority = currentThread.Priority;
+
+            try
+            {
+                currentThread.Priority = threadPriority;
+            }
+            catch
+            {
+                // Ignore thread priority failures and keep going.
+            }
+
+            return new WindowsThreadSchedulingScope(IntPtr.Zero, previousPriority);
         }
 
         public void Dispose()

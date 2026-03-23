@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <Compile Include="..\SpoutDirectSaver.App\Models\CaptureStatus.cs" Link="Models\CaptureStatus.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Models\CapturePixelFormat.cs" Link="Models\CapturePixelFormat.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\EncoderOption.cs" Link="Models\EncoderOption.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\FramePacket.cs" Link="Models\FramePacket.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\LivePreviewFrame.cs" Link="Models\LivePreviewFrame.cs" />

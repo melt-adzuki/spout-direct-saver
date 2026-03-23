@@ -39,16 +39,16 @@ internal sealed class EncoderOption
 
     public bool UsesRealtimeRgbIntermediate => Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
 
-    public string BuildArguments(uint width, uint height, double frameRate, string outputPath)
-        => BuildArgumentsCore(width, height, frameRate, "-i -", outputPath);
+    public string BuildArguments(uint width, uint height, double frameRate, CapturePixelFormat pixelFormat, string outputPath)
+        => BuildArgumentsCore(width, height, frameRate, pixelFormat, "-i -", outputPath);
 
-    public string BuildPipeArguments(uint width, uint height, double frameRate, string inputPath, string outputPath)
-        => BuildArgumentsCore(width, height, frameRate, $"-blocksize 33554432 -i {Quote(inputPath)}", outputPath);
+    public string BuildPipeArguments(uint width, uint height, double frameRate, CapturePixelFormat pixelFormat, string inputPath, string outputPath)
+        => BuildArgumentsCore(width, height, frameRate, pixelFormat, $"-blocksize 33554432 -i {Quote(inputPath)}", outputPath);
 
-    private string BuildArgumentsCore(uint width, uint height, double frameRate, string inputSpecifier, string outputPath)
+    private string BuildArgumentsCore(uint width, uint height, double frameRate, CapturePixelFormat pixelFormat, string inputSpecifier, string outputPath)
     {
         var gop = Math.Max(1, (int)Math.Round(frameRate));
-        var rawInput = $"-f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {frameRate:0.###} {inputSpecifier}";
+        var rawInput = $"-f rawvideo -pixel_format {pixelFormat.ToFfmpegPixelFormat()} -video_size {width}x{height} -framerate {frameRate:0.###} {inputSpecifier}";
 
         return Kind switch
         {

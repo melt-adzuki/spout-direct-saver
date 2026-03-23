@@ -102,6 +102,7 @@ internal sealed class VideoExportService
         uint width,
         uint height,
         double outputFrameRate,
+        CapturePixelFormat pixelFormat,
         string outputPath,
         CancellationToken cancellationToken)
     {
@@ -110,7 +111,7 @@ internal sealed class VideoExportService
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments = encoderOption.BuildArguments(width, height, outputFrameRate, outputPath),
+            Arguments = encoderOption.BuildArguments(width, height, outputFrameRate, pixelFormat, outputPath),
             WorkingDirectory = Path.GetDirectoryName(spoolPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
