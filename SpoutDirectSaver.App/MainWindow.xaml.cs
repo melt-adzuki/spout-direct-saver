@@ -141,7 +141,9 @@ public partial class MainWindow : Window
         _recordingStartedAt = DateTimeOffset.UtcNow;
         _recordingTimer.Start();
 
-        RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
+        RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimePackedIntermediate
+            ? "録画を開始しました。RGB と alpha を横並びにパックして、1 本の HEVC 動画へリアルタイム圧縮しています。"
+            : SelectedEncoderOption.UsesRealtimeRgbIntermediate
             ? "録画を開始しました。RGB をリアルタイム圧縮し、alpha sidecar を一時保存しています。"
             : SelectedEncoderOption.RequiresRealtimeEncoding
                 ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
@@ -166,7 +168,9 @@ public partial class MainWindow : Window
         try
         {
             HeaderStatusTextBlock.Text = "エンコード中";
-            RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
+            RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimePackedIntermediate
+                ? "録画を停止しました。packed HEVC 動画を確定しています。"
+                : SelectedEncoderOption.UsesRealtimeRgbIntermediate
                 ? "録画を停止しました。RGB を確定し、alpha sidecar を書き出しています。"
                 : SelectedEncoderOption.RequiresRealtimeEncoding
                     ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"

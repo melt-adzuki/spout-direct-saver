@@ -8,7 +8,14 @@ using SpoutDirectSaver.E2E;
 using Vortice.DXGI;
 
 var options = E2eOptions.Parse(args);
-var encoderOption = EncoderOption.CreateDefaults()[0];
+var encoderPreference = Environment.GetEnvironmentVariable("SPOUT_DIRECT_SAVER_E2E_ENCODER");
+var encoderOptions = EncoderOption.CreateDefaults();
+var encoderOption =
+    string.Equals(encoderPreference, "packed", StringComparison.OrdinalIgnoreCase)
+        ? Array.Find(
+            encoderOptions,
+            static option => option.Kind == EncoderProfileKind.HevcNvencPackedAlphaMkv) ?? encoderOptions[0]
+        : encoderOptions[0];
 WindowsScheduling.TryPromoteCurrentProcess(ProcessPriorityClass.High);
 using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
 var outputDirectory = Path.Combine(Environment.CurrentDirectory, ".tmp-e2e-output");
@@ -19,6 +26,7 @@ Console.WriteLine($"sender={options.SenderName}");
 Console.WriteLine($"captureSeconds={options.CaptureSeconds}");
 Console.WriteLine($"testSenderScene={options.TestSenderScene}");
 Console.WriteLine($"warmupMs={options.WarmupMilliseconds}");
+Console.WriteLine($"encoder={encoderOption.DisplayName}");
 Console.WriteLine($"output={outputPath}");
 
 Process? senderProcess = null;

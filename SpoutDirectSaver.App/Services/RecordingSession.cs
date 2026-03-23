@@ -33,6 +33,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly FileStream? _syncSpoolStream;
     private readonly int _compressionWorkerCount;
     private readonly bool _useRealtimeEncoding;
+    private readonly bool _useRealtimePackedIntermediate;
     private readonly bool _useRealtimeRgbIntermediate;
     private readonly bool _disableHybridRgbIntermediate;
     private readonly bool _disableHybridAlphaSpool;
@@ -59,7 +60,9 @@ internal sealed class RecordingSession : IAsyncDisposable
     private bool? _compressSpoolFrames;
     private int _remainingCompressionWorkers;
     private RealtimeHybridWriter? _realtimeWriter;
+    private RealtimePackedNvencWriter? _packedIntermediateWriter;
     private RealtimeRgbNvencWriter? _rgbIntermediateWriter;
+    private readonly string? _packedIntermediatePath;
     private readonly string? _rgbIntermediatePath;
     private readonly string? _alphaTrackPath;
 
@@ -78,6 +81,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         _compressSpoolFrames = compressSpoolFrames;
         _writeSynchronously = writeSynchronously;
         _useRealtimeEncoding = encoderOption.RequiresRealtimeEncoding;
+        _useRealtimePackedIntermediate =
+            !_useRealtimeEncoding &&
+            encoderOption.Kind == EncoderProfileKind.HevcNvencPackedAlphaMkv;
         _useRealtimeRgbIntermediate =
             !_useRealtimeEncoding &&
             encoderOption.Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
@@ -93,6 +99,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             _temporaryDirectory = string.Empty;
             _spoolPath = string.Empty;
+            _packedIntermediatePath = null;
+            _rgbIntermediatePath = null;
+            _alphaTrackPath = null;
             _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(1);
             _compressionWorkerCount = 0;
             _remainingCompressionWorkers = 0;
@@ -106,6 +115,9 @@ internal sealed class RecordingSession : IAsyncDisposable
             ResolveCacheRoot(outputPath),
             Guid.NewGuid().ToString("N"));
         _spoolPath = Path.Combine(_temporaryDirectory, "frames.bin");
+        _packedIntermediatePath = _useRealtimePackedIntermediate
+            ? Path.Combine(_temporaryDirectory, "packed.mkv")
+            : null;
         _rgbIntermediatePath = _useRealtimeRgbIntermediate
             ? Path.Combine(_temporaryDirectory, "rgb.mp4")
             : null;
@@ -114,6 +126,17 @@ internal sealed class RecordingSession : IAsyncDisposable
             : null;
 
         Directory.CreateDirectory(_temporaryDirectory);
+
+        if (_useRealtimePackedIntermediate)
+        {
+            _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(1);
+            _compressionWorkerCount = 0;
+            _remainingCompressionWorkers = 0;
+            _compressionTasks = Array.Empty<Task>();
+            _syncSpoolStream = null;
+            _writerTask = Task.CompletedTask;
+            return;
+        }
 
         _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
         {
@@ -216,6 +239,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         RecordedFrame[] framesToEncode = [];
         RealtimeHybridWriter? realtimeWriter = null;
+        RealtimePackedNvencWriter? packedIntermediateWriter = null;
         RealtimeRgbNvencWriter? rgbIntermediateWriter = null;
 
         lock (_gate)
@@ -237,6 +261,16 @@ internal sealed class RecordingSession : IAsyncDisposable
                 }
 
                 realtimeWriter = _realtimeWriter;
+            }
+            else if (_useRealtimePackedIntermediate)
+            {
+                if (_currentFrame is not null && _lastUniqueFrame is not null)
+                {
+                    QueueFrameForRealtimePackedIntermediate(_currentFrame, _lastUniqueFrame);
+                    _lastUniqueFrame = null;
+                }
+
+                packedIntermediateWriter = _packedIntermediateWriter;
             }
             else if (_useRealtimeRgbIntermediate)
             {
@@ -270,6 +304,21 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
 
             LogAlphaDebugCounts();
+
+            if (_useRealtimePackedIntermediate)
+            {
+                if (packedIntermediateWriter is null || _packedIntermediatePath is null)
+                {
+                    throw new InvalidOperationException("Packed intermediate encoder が初期化されていません。");
+                }
+
+                await packedIntermediateWriter.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                await exportService.RemuxSingleVideoAsync(
+                    _packedIntermediatePath,
+                    _outputPath,
+                    cancellationToken).ConfigureAwait(false);
+                return _outputPath;
+            }
 
             if (_useRealtimeRgbIntermediate)
             {
@@ -391,6 +440,13 @@ internal sealed class RecordingSession : IAsyncDisposable
                     await _realtimeWriter.DisposeAsync().ConfigureAwait(false);
                 }
             }
+            else if (_useRealtimePackedIntermediate)
+            {
+                if (_packedIntermediateWriter is not null)
+                {
+                    await _packedIntermediateWriter.DisposeAsync().ConfigureAwait(false);
+                }
+            }
             else if (_useRealtimeRgbIntermediate)
             {
                 _compressionChannel.Writer.TryComplete();
@@ -446,6 +502,16 @@ internal sealed class RecordingSession : IAsyncDisposable
 
                 QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
             }
+            else if (_useRealtimePackedIntermediate)
+            {
+                if (_lastUniqueFrame is null)
+                {
+                    throw new InvalidOperationException("packed intermediate 用の前フレームが見つかりません。");
+                }
+
+                QueueFrameForRealtimePackedIntermediate(_currentFrame, _lastUniqueFrame);
+                _lastUniqueFrame = null;
+            }
             else if (_useRealtimeRgbIntermediate)
             {
                 if (_lastUniqueFrame is null)
@@ -469,6 +535,10 @@ internal sealed class RecordingSession : IAsyncDisposable
         if (_useRealtimeEncoding)
         {
             EnsureRealtimeWriterStarted();
+        }
+        else if (_useRealtimePackedIntermediate)
+        {
+            EnsurePackedIntermediateWriterStarted();
         }
         else if (_useRealtimeRgbIntermediate)
         {
@@ -494,7 +564,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
-        _lastUniqueFrame = (_useRealtimeEncoding || _useRealtimeRgbIntermediate) ? frame.PixelBuffer : null;
+        _lastUniqueFrame = (_useRealtimeEncoding || _useRealtimePackedIntermediate || _useRealtimeRgbIntermediate) ? frame.PixelBuffer : null;
         _lastUniqueFingerprint = fingerprint;
     }
 
@@ -746,6 +816,27 @@ internal sealed class RecordingSession : IAsyncDisposable
             _recordedPixelFormat);
     }
 
+    private void EnsurePackedIntermediateWriterStarted()
+    {
+        if (!_useRealtimePackedIntermediate || _packedIntermediateWriter is not null)
+        {
+            return;
+        }
+
+        if (_packedIntermediatePath is null)
+        {
+            throw new InvalidOperationException("Packed intermediate path が初期化されていません。");
+        }
+
+        _outputFrameRate = GetOutputFrameRate();
+        _packedIntermediateWriter = new RealtimePackedNvencWriter(
+            _recordedWidth,
+            _recordedHeight,
+            _outputFrameRate,
+            _packedIntermediatePath,
+            _recordedPixelFormat);
+    }
+
     private void QueueFrameForRealtimeEncode(RecordedFrame frame, PixelBufferLease pixelData)
     {
         EnsureRealtimeWriterStarted();
@@ -775,6 +866,22 @@ internal sealed class RecordingSession : IAsyncDisposable
         var repeatCount = targetTotalFrames - _emittedTimelineFrames;
 
         _rgbIntermediateWriter.QueueFrame(pixelData, repeatCount);
+        _emittedTimelineFrames = targetTotalFrames;
+    }
+
+    private void QueueFrameForRealtimePackedIntermediate(RecordedFrame frame, PixelBufferLease pixelData)
+    {
+        EnsurePackedIntermediateWriterStarted();
+        if (_packedIntermediateWriter is null)
+        {
+            throw new InvalidOperationException("Packed intermediate writer が初期化されていません。");
+        }
+
+        _accumulatedTimelineFrames += frame.DurationSeconds * _outputFrameRate;
+        var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
+        var repeatCount = targetTotalFrames - _emittedTimelineFrames;
+
+        _packedIntermediateWriter.QueueFrame(pixelData, repeatCount);
         _emittedTimelineFrames = targetTotalFrames;
     }
 

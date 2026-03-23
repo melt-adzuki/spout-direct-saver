@@ -4,6 +4,7 @@ namespace SpoutDirectSaver.App.Models;
 
 internal enum EncoderProfileKind
 {
+    HevcNvencPackedAlphaMkv,
     HevcNvencFfv1AlphaMkv,
     PngMov,
     Ffv1Mkv
@@ -39,6 +40,10 @@ internal sealed class EncoderOption
 
     public bool UsesRealtimeRgbIntermediate => Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
 
+    public bool UsesRealtimePackedIntermediate => Kind == EncoderProfileKind.HevcNvencPackedAlphaMkv;
+
+    public bool UsesAnyRealtimeIntermediate => UsesRealtimeRgbIntermediate || UsesRealtimePackedIntermediate;
+
     public string BuildArguments(uint width, uint height, double frameRate, CapturePixelFormat pixelFormat, string outputPath)
         => BuildArgumentsCore(width, height, frameRate, pixelFormat, "-i -", outputPath);
 
@@ -52,6 +57,8 @@ internal sealed class EncoderOption
 
         return Kind switch
         {
+            EncoderProfileKind.HevcNvencPackedAlphaMkv =>
+                $"-y {rawInput} -an -c:v hevc_nvenc -preset:v p1 -tune:v ll -rc:v vbr -cq:v 21 -b:v 0 -g:v {gop} -pix_fmt yuv420p -profile:v main -cues_to_front 1 {Quote(outputPath)}",
             EncoderProfileKind.HevcNvencFfv1AlphaMkv =>
                 $"-y {rawInput} -an -filter_complex \"[0:v]split=2[rgb][alpha];[alpha]alphaextract,format=gray[aout]\" -map \"[rgb]\" -c:v:0 hevc_nvenc -preset:v:0 p1 -tune:v:0 ll -rc:v:0 vbr -cq:v:0 21 -b:v:0 0 -g:v:0 {gop} -pix_fmt:v:0 yuv420p -profile:v:0 main -map \"[aout]\" -c:v:1 ffv1 -level:v:1 3 -coder:v:1 1 -context:v:1 1 -g:v:1 1 -slicecrc:v:1 1 -pix_fmt:v:1 gray -cues_to_front 1 {Quote(outputPath)}",
             EncoderProfileKind.PngMov =>
@@ -73,6 +80,12 @@ internal sealed class EncoderOption
                 "HEVC NVENC / MKV + FFV1 alpha sidecar",
                 ".mkv",
                 "録画中は RGB 本体を HEVC NVENC(yuv420p) でリアルタイム圧縮し、alpha は grayscale FFV1 の sidecar 動画として別保存します。再生互換性と temp 帯域の両立を優先した構成です。",
+                "Matroska MKV (*.mkv)|*.mkv"),
+            new(
+                EncoderProfileKind.HevcNvencPackedAlphaMkv,
+                "HEVC NVENC / MKV (RGB+Alpha packed)",
+                ".mkv",
+                "RGB を左半分、alpha グレースケールを右半分に横並びパックして、1 本の HEVC NVENC 動画へリアルタイム圧縮します。preview は packed 表示になりますが、alpha sidecar を使わない分、比較検証向けの試験構成です。",
                 "Matroska MKV (*.mkv)|*.mkv"),
             new(
                 EncoderProfileKind.PngMov,
