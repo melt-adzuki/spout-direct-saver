@@ -45,6 +45,8 @@ Console.WriteLine($"receive_only_sender_frame_delta={receiveOnly.SenderFrameDelt
     var recordResult = await RecordAndExportAsync(options, encoderOption, outputPath);
 Console.WriteLine($"record_frames_seen={recordResult.TotalFramesSeen}");
 Console.WriteLine($"record_unique_frames={recordResult.UniqueFramesSeen}");
+Console.WriteLine($"record_source_rgb_unique_frames={recordResult.SourceRgbUniqueFrames}");
+Console.WriteLine($"record_source_alpha_unique_frames={recordResult.SourceAlphaUniqueFrames}");
 Console.WriteLine($"record_elapsed={recordResult.CaptureElapsed.TotalSeconds:0.000}");
 Console.WriteLine($"record_capture_fps={recordResult.TotalFramesSeen / recordResult.CaptureElapsed.TotalSeconds:0.00}");
 Console.WriteLine($"record_unique_capture_fps={recordResult.UniqueFramesSeen / recordResult.CaptureElapsed.TotalSeconds:0.00}");
@@ -164,7 +166,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
                 continue;
             }
 
-            if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
+            if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height, preserveSourceColorOrder: false))
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -253,7 +255,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
         BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
 }
 
-static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, EncoderOption encoderOption, string outputPath)
+static async Task<(int TotalFramesSeen, int UniqueFramesSeen, int SourceRgbUniqueFrames, int SourceAlphaUniqueFrames, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, EncoderOption encoderOption, string outputPath)
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
@@ -294,6 +296,10 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     var frameCountSenderName = string.Empty;
     var frameCountSupportProbed = false;
     var frameCountSupported = false;
+    ulong? lastSourceRgbFingerprint = null;
+    ulong? lastSourceAlphaFingerprint = null;
+    var sourceRgbUniqueFrames = 0;
+    var sourceAlphaUniqueFrames = 0;
 
     try
     {
@@ -347,7 +353,15 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 continue;
             }
 
-            if (!TryReadFrame(receiver, sharedTextureReader, options, buffer, ref width, ref height))
+            var capturePixelFormat = CapturePixelFormat.Bgra32;
+            if (!TryReadFrame(
+                    receiver,
+                    sharedTextureReader,
+                    options,
+                    buffer,
+                    ref width,
+                    ref height,
+                    preserveSourceColorOrder: false))
             {
                 WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps);
                 continue;
@@ -380,8 +394,22 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             {
                 var managedCopy = PixelBufferLease.Rent(bufferLength);
                 Marshal.Copy(buffer, managedCopy.Buffer, 0, bufferLength);
+                var sourceRgbFingerprint = ComputeRgbFingerprint(managedCopy.Span);
+                var sourceAlphaFingerprint = ComputeAlphaFingerprint(managedCopy.Span);
+                if (lastSourceRgbFingerprint != sourceRgbFingerprint)
+                {
+                    sourceRgbUniqueFrames++;
+                    lastSourceRgbFingerprint = sourceRgbFingerprint;
+                }
+
+                if (lastSourceAlphaFingerprint != sourceAlphaFingerprint)
+                {
+                    sourceAlphaUniqueFrames++;
+                    lastSourceAlphaFingerprint = sourceAlphaFingerprint;
+                }
                 session.AppendFrame(new FramePacket(
                     managedCopy,
+                    capturePixelFormat,
                     width,
                     height,
                     options.SenderName,
@@ -400,15 +428,32 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
             }
             else
             {
-                var managedCopy = PixelBufferLease.Rent(bufferLength);
-                Marshal.Copy(buffer, managedCopy.Buffer, 0, bufferLength);
-                var fingerprint = ComputeFingerprint(managedCopy.Span);
+                var frameBytes = GC.AllocateUninitializedArray<byte>(bufferLength);
+                Marshal.Copy(buffer, frameBytes, 0, bufferLength);
+                var sourceRgbFingerprint = ComputeRgbFingerprint(frameBytes);
+                var sourceAlphaFingerprint = ComputeAlphaFingerprint(frameBytes);
+                if (lastSourceRgbFingerprint != sourceRgbFingerprint)
+                {
+                    sourceRgbUniqueFrames++;
+                    lastSourceRgbFingerprint = sourceRgbFingerprint;
+                }
+
+                if (lastSourceAlphaFingerprint != sourceAlphaFingerprint)
+                {
+                    sourceAlphaUniqueFrames++;
+                    lastSourceAlphaFingerprint = sourceAlphaFingerprint;
+                }
+                var fingerprint = ComputeFingerprint(frameBytes);
                 var shouldCountAsUnique =
                     lastFallbackFingerprint != fingerprint ||
                     lastFallbackFrame is null ||
-                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy.Span);
+                    !lastFallbackFrame.AsSpan().SequenceEqual(frameBytes);
+                byte[]? fallbackFrameCopy = shouldCountAsUnique ? frameBytes : null;
+                var managedCopy = PixelBufferLease.Rent(bufferLength);
+                frameBytes.AsSpan().CopyTo(managedCopy.Buffer.AsSpan(0, bufferLength));
                 session.AppendFrame(new FramePacket(
                     managedCopy,
+                    capturePixelFormat,
                     width,
                     height,
                     options.SenderName,
@@ -421,8 +466,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                     uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
                     firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastFallbackFingerprint = fingerprint;
-                    lastFallbackFrame = GC.AllocateUninitializedArray<byte>(managedCopy.Length);
-                    managedCopy.Span.CopyTo(lastFallbackFrame);
+                    lastFallbackFrame = fallbackFrameCopy;
                 }
             }
             if (!useSharedFrameCounter)
@@ -445,6 +489,8 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
         return (
             frameCount,
             uniqueFrameCount,
+            sourceRgbUniqueFrames,
+            sourceAlphaUniqueFrames,
             captureElapsed,
             savedPath,
             BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
@@ -616,7 +662,14 @@ static bool PrepareDirectSharedTextureReceive(SpoutReceiver receiver, string sen
     }
 }
 
-static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader sharedTextureReader, E2eOptions options, IntPtr buffer, ref uint width, ref uint height)
+static bool TryReadFrame(
+    SpoutReceiver receiver,
+    D3D11SpoutSharedTextureReader sharedTextureReader,
+    E2eOptions options,
+    IntPtr buffer,
+    ref uint width,
+    ref uint height,
+    bool preserveSourceColorOrder)
 {
     switch (options.ReceiveMode)
     {
@@ -626,7 +679,7 @@ static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader s
                 return false;
             }
 
-            return sharedTextureReader.TryReadFrame(buffer, checked((int)(width * height * 4)), out _);
+            return sharedTextureReader.TryReadFrame(buffer, checked((int)(width * height * 4)), preserveSourceColorOrder, out _);
 
         default:
             unsafe
@@ -717,6 +770,53 @@ static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
     {
         return (current ^ value) * prime;
     }
+}
+
+static ulong ComputeRgbFingerprint(ReadOnlySpan<byte> pixelData)
+{
+    const ulong offsetBasis = 14695981039346656037UL;
+    const ulong prime = 1099511628211UL;
+
+    var hash = offsetBasis;
+    if (pixelData.IsEmpty)
+    {
+        return hash;
+    }
+
+    var pixelCount = pixelData.Length / 4;
+    var checkpoints = 64;
+    for (var i = 0; i < checkpoints; i++)
+    {
+        var pixelIndex = (int)(((long)Math.Max(pixelCount - 1, 0) * i) / Math.Max(checkpoints - 1, 1));
+        var offset = pixelIndex * 4;
+        hash = (hash ^ pixelData[offset]) * prime;
+        hash = (hash ^ pixelData[offset + 1]) * prime;
+        hash = (hash ^ pixelData[offset + 2]) * prime;
+    }
+
+    return hash;
+}
+
+static ulong ComputeAlphaFingerprint(ReadOnlySpan<byte> pixelData)
+{
+    const ulong offsetBasis = 14695981039346656037UL;
+    const ulong prime = 1099511628211UL;
+
+    var hash = offsetBasis;
+    if (pixelData.IsEmpty)
+    {
+        return hash;
+    }
+
+    var pixelCount = pixelData.Length / 4;
+    var checkpoints = 64;
+    for (var i = 0; i < checkpoints; i++)
+    {
+        var pixelIndex = (int)(((long)Math.Max(pixelCount - 1, 0) * i) / Math.Max(checkpoints - 1, 1));
+        hash = (hash ^ pixelData[(pixelIndex * 4) + 3]) * prime;
+    }
+
+    return hash;
 }
 
 static FrameRateStats BuildFrameRateStats(IReadOnlyList<long> acceptedFrameTicks, long captureStartedTicks, long captureEndedTicks)

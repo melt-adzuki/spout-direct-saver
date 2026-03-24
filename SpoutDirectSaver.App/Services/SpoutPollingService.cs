@@ -179,8 +179,11 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     senderWasUpdated = true;
                 }
 
+                var recordingMode = Volatile.Read(ref _recordingModeEnabled) != 0;
+                var frameHandler = FrameArrived;
                 var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
-                if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
+                if ((currentReceiveConfiguration == ReceiveConfiguration.ImageFallback || !recordingMode) &&
+                    (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength))
                 {
                     EnsurePreviewBufferSize(requiredLength);
                     senderWasUpdated = true;
@@ -204,6 +207,14 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                 preferSharedTextureReadback &= frameCountSupported;
 
+                PixelBufferLease? directFrame = null;
+                var capturePixelFormat = CapturePixelFormat.Bgra32;
+                var preserveSourceColorOrder = false;
+                if (recordingMode && frameHandler is not null)
+                {
+                    directFrame = PixelBufferLease.Rent(requiredLength);
+                }
+
                 if (preferSharedTextureReadback)
                 {
                     if (!TryReceiveSharedTextureFrame(
@@ -212,11 +223,14 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             connectedSenderName,
                             ref frameCountSupportProbed,
                             ref frameCountSupported,
+                            directFrame?.Buffer,
                             _previewBackBuffer,
-                            _previewBufferLength,
+                            directFrame is not null ? requiredLength : _previewBufferLength,
+                            preserveSourceColorOrder,
                             effectiveSenderFps,
                             cancellationToken))
                     {
+                        directFrame?.Dispose();
                         continue;
                     }
                 }
@@ -224,10 +238,16 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                              receiver,
                              connectedSenderName,
                              connectedWidth,
-                             connectedHeight))
+                             connectedHeight,
+                             _previewBackBuffer))
                 {
+                    directFrame?.Dispose();
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     continue;
+                }
+                else if (directFrame is not null)
+                {
+                    Marshal.Copy(_previewBackBuffer, directFrame.Buffer, 0, requiredLength);
                 }
 
                 if (senderWasUpdated)
@@ -255,7 +275,12 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                     if (!preferSharedTextureReadback)
                     {
+                        directFrame?.Dispose();
                         WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                    }
+                    else
+                    {
+                        directFrame?.Dispose();
                     }
                     continue;
                 }
@@ -265,6 +290,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     : receiver.SenderFrame;
                 if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
                 {
+                    directFrame?.Dispose();
                     if (!preferSharedTextureReadback)
                     {
                         WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
@@ -274,37 +300,38 @@ internal sealed class SpoutPollingService : IAsyncDisposable
 
                 lastAcceptedSenderFrame = senderFrame;
                 var acceptedFrameTicks = Stopwatch.GetTimestamp();
-                var recordingMode = Volatile.Read(ref _recordingModeEnabled) != 0;
                 if (!recordingMode)
                 {
                     PublishPreviewFrame(width, height, senderName, effectiveSenderFps, acceptedFrameTicks);
                 }
 
-                var frameHandler = FrameArrived;
                 if (frameHandler is not null)
                 {
-                    var frameCopy = PixelBufferLease.Rent(_previewBufferLength);
-                    var sourceBuffer = recordingMode ? _previewBackBuffer : _previewFrontBuffer;
-                    if (!recordingMode)
+                    var frameCopy = directFrame;
+                    var framePixelFormat = capturePixelFormat;
+                    if (frameCopy is null)
                     {
+                        frameCopy = PixelBufferLease.Rent(_previewBufferLength);
+                        framePixelFormat = CapturePixelFormat.Bgra32;
                         lock (_previewGate)
                         {
-                            Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
+                            Marshal.Copy(_previewFrontBuffer, frameCopy.Buffer, 0, _previewBufferLength);
                         }
-                    }
-                    else
-                    {
-                        Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
                     }
 
                     frameHandler.Invoke(this, new FramePacket(
                         frameCopy,
+                        framePixelFormat,
                         width,
                         height,
                         senderName,
                         effectiveSenderFps,
                         acceptedFrameTicks,
                         DateTimeOffset.UtcNow));
+                }
+                else
+                {
+                    directFrame?.Dispose();
                 }
 
                 if (!preferSharedTextureReadback)
@@ -366,7 +393,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         SpoutReceiver receiver,
         string senderName,
         uint width,
-        uint height)
+        uint height,
+        IntPtr destinationBuffer)
     {
         var senderNameBytes = new byte[256];
         if (!string.IsNullOrWhiteSpace(senderName))
@@ -384,7 +412,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 (sbyte*)senderNamePtr,
                 ref receivedWidth,
                 ref receivedHeight,
-                (byte*)_previewBackBuffer,
+                (byte*)destinationBuffer,
                 0x80E1u,
                 false,
                 0);
@@ -467,8 +495,10 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         string senderName,
         ref bool frameCountSupportProbed,
         ref bool frameCountSupported,
+        byte[]? destination,
         IntPtr destinationBuffer,
         int destinationLength,
+        bool preserveSourceColorOrder,
         double senderFps,
         CancellationToken cancellationToken)
     {
@@ -484,7 +514,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return sharedTextureReader.TryReadFrame(destinationBuffer, destinationLength, out _);
+        return destination is not null
+            ? sharedTextureReader.TryReadFrame(destination, preserveSourceColorOrder, out _)
+            : sharedTextureReader.TryReadFrame(destinationBuffer, destinationLength, preserveSourceColorOrder, out _);
     }
 
     private static string ReadNullTerminatedAscii(byte[] buffer)

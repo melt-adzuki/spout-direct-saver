@@ -60,7 +60,7 @@ internal sealed class RealtimeFfmpegWriter : IAsyncDisposable
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments = encoderOption.BuildPipeArguments(width, height, frameRate, pipePath, outputPath),
+            Arguments = encoderOption.BuildPipeArguments(width, height, frameRate, CapturePixelFormat.Bgra32, pipePath, outputPath),
             WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardOutput = true,
             RedirectStandardError = true,

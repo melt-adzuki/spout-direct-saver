@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using SharpGen.Runtime;
 using Spout.Interop;
+using SpoutDirectSaver.App.Models;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -40,6 +41,10 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     public uint Height => _height;
 
     public Format Format => _format;
+
+    public CapturePixelFormat NativePixelFormat => IsRgbaCompatibleFormat(_format)
+        ? CapturePixelFormat.Rgba32
+        : CapturePixelFormat.Bgra32;
 
     public bool Matches(string senderName, IntPtr sharedHandle, uint width, uint height, Format format)
     {
@@ -142,18 +147,18 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         }
     }
 
-    public bool TryReadFrame(byte[] destination, out string? errorMessage)
+    public bool TryReadFrame(byte[] destination, bool preserveSourceColorOrder, out string? errorMessage)
     {
         unsafe
         {
             fixed (byte* destinationPtr = destination)
             {
-                return TryReadFrame((IntPtr)destinationPtr, destination.Length, out errorMessage);
+                return TryReadFrame((IntPtr)destinationPtr, destination.Length, preserveSourceColorOrder, out errorMessage);
             }
         }
     }
 
-    public bool TryReadFrame(IntPtr destination, int destinationLength, out string? errorMessage)
+    public bool TryReadFrame(IntPtr destination, int destinationLength, bool preserveSourceColorOrder, out string? errorMessage)
     {
         var requiredBytes = checked((int)(_width * _height * 4));
         if (_sharedTexture is null || Array.Exists(_stagingTextures, static texture => texture is null))
@@ -199,7 +204,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             {
                 unsafe
                 {
-                    CopyMappedTextureToBgraBuffer(mapped, (byte*)destination);
+                    CopyMappedTextureToBuffer(mapped, (byte*)destination, preserveSourceColorOrder);
                 }
             }
             finally
@@ -394,7 +399,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             Format.R8G8B8A8_UNorm_SRgb;
     }
 
-    private unsafe void CopyMappedTextureToBgraBuffer(MappedSubresource mapped, byte* destination)
+    private unsafe void CopyMappedTextureToBuffer(MappedSubresource mapped, byte* destination, bool preserveSourceColorOrder)
     {
         var width = checked((int)_width);
         var height = checked((int)_height);
@@ -413,6 +418,12 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                     ForceOpaqueAlpha(destinationRow, width);
                 }
 
+                continue;
+            }
+
+            if (preserveSourceColorOrder && IsRgbaCompatibleFormat(_format))
+            {
+                Buffer.MemoryCopy(sourceRow, destinationRow, destinationRowPitch, destinationRowPitch);
                 continue;
             }
 
@@ -437,6 +448,14 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             Format.B8G8R8X8_Typeless or
             Format.B8G8R8X8_UNorm or
             Format.B8G8R8X8_UNorm_SRgb;
+    }
+
+    private static bool IsRgbaCompatibleFormat(Format format)
+    {
+        return format is
+            Format.R8G8B8A8_Typeless or
+            Format.R8G8B8A8_UNorm or
+            Format.R8G8B8A8_UNorm_SRgb;
     }
 
     private static unsafe void ForceOpaqueAlpha(byte* destinationRow, int width)
