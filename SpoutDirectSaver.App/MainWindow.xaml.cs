@@ -142,7 +142,7 @@ public partial class MainWindow : Window
         _recordingTimer.Start();
 
         RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
-            ? "録画を開始しました。RGB をリアルタイム圧縮し、alpha sidecar を一時保存しています。"
+            ? "録画を開始しました。RGB をリアルタイム圧縮し、alpha sidecar を一時保存しています。停止後に PNG/MOV へ確定します。"
             : SelectedEncoderOption.RequiresRealtimeEncoding
                 ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
             : "録画を開始しました。変化フレームのみを一時保存しています。";
@@ -167,7 +167,7 @@ public partial class MainWindow : Window
         {
             HeaderStatusTextBlock.Text = "エンコード中";
             RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
-                ? "録画を停止しました。RGB を確定し、alpha sidecar を書き出しています。"
+                ? "録画を停止しました。RGB を確定し、alpha sidecar を PNG/MOV へ書き出しています。"
                 : SelectedEncoderOption.RequiresRealtimeEncoding
                     ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"
                 : "録画を停止しました。可変fps動画を書き出しています。";

@@ -110,7 +110,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             ? Path.Combine(_temporaryDirectory, "rgb.mp4")
             : null;
         _alphaTrackPath = _useRealtimeRgbIntermediate
-            ? Path.Combine(_temporaryDirectory, "alpha.mkv")
+            ? Path.Combine(_temporaryDirectory, "alpha.mov")
             : null;
 
         Directory.CreateDirectory(_temporaryDirectory);
@@ -892,7 +892,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         var directory = Path.GetDirectoryName(outputPath) ?? string.Empty;
         var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);
-        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mkv");
+        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mov");
     }
 
     private static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
@@ -971,7 +971,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         return alphaBuffer;
     }
 
-    private static ulong ComputeAlphaFingerprint(ReadOnlySpan<byte> pixelData)
+    private ulong ComputeAlphaFingerprint(ReadOnlySpan<byte> pixelData)
     {
         const ulong offsetBasis = 14695981039346656037UL;
         const ulong prime = 1099511628211UL;
@@ -982,6 +982,54 @@ internal sealed class RecordingSession : IAsyncDisposable
             return hash;
         }
 
+        var width = (int)_recordedWidth;
+        var height = (int)_recordedHeight;
+        if (width <= 0 || height <= 0 || pixelData.Length < checked(width * height * 4))
+        {
+            return ComputeAlphaFingerprintFallback(pixelData);
+        }
+
+        const int tileColumns = 16;
+        const int tileRows = 9;
+        const int samplesPerTileX = 4;
+        const int samplesPerTileY = 4;
+
+        for (var tileY = 0; tileY < tileRows; tileY++)
+        {
+            var startY = (tileY * height) / tileRows;
+            var endY = Math.Max(startY + 1, ((tileY + 1) * height) / tileRows);
+
+            for (var tileX = 0; tileX < tileColumns; tileX++)
+            {
+                var startX = (tileX * width) / tileColumns;
+                var endX = Math.Max(startX + 1, ((tileX + 1) * width) / tileColumns);
+                ulong accumulator = 0;
+                var sampleCount = 0;
+
+                for (var sampleY = 0; sampleY < samplesPerTileY; sampleY++)
+                {
+                    var y = startY + (((endY - startY - 1) * sampleY) / Math.Max(samplesPerTileY - 1, 1));
+                    for (var sampleX = 0; sampleX < samplesPerTileX; sampleX++)
+                    {
+                        var x = startX + (((endX - startX - 1) * sampleX) / Math.Max(samplesPerTileX - 1, 1));
+                        accumulator += pixelData[((y * width + x) * 4) + 3];
+                        sampleCount++;
+                    }
+                }
+
+                hash = (hash ^ (accumulator / (ulong)Math.Max(sampleCount, 1))) * prime;
+            }
+        }
+
+        return hash;
+    }
+
+    private static ulong ComputeAlphaFingerprintFallback(ReadOnlySpan<byte> pixelData)
+    {
+        const ulong offsetBasis = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+
+        var hash = offsetBasis;
         var pixelCount = pixelData.Length / 4;
         var checkpoints = 2048;
         for (var index = 0; index < checkpoints; index++)

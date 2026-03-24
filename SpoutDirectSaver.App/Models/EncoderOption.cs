@@ -70,9 +70,9 @@ internal sealed class EncoderOption
         [
             new(
                 EncoderProfileKind.HevcNvencFfv1AlphaMkv,
-                "HEVC NVENC / MKV + FFV1 alpha sidecar",
+                "HEVC NVENC / MKV + PNG alpha sidecar",
                 ".mkv",
-                "録画中は RGB 本体を HEVC NVENC(yuv420p) でリアルタイム圧縮し、alpha は grayscale FFV1 の sidecar 動画として別保存します。再生互換性と temp 帯域の両立を優先した構成です。",
+                "録画中は RGB 本体を HEVC NVENC(yuv420p) でリアルタイム圧縮し、alpha は change-only spool から PNG/MOV の sidecar 動画として別保存します。再生しやすさと録画中の安定性を優先した構成です。",
                 "Matroska MKV (*.mkv)|*.mkv"),
             new(
                 EncoderProfileKind.PngMov,

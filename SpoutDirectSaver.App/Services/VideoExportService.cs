@@ -29,7 +29,7 @@ internal sealed class VideoExportService
         {
             FileName = "ffmpeg",
             Arguments =
-                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt gray -cues_to_front 1 \"{outputPath}\"",
+                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -c:v png -pred mixed -pix_fmt gray -movflags +faststart -video_track_timescale 120000 \"{outputPath}\"",
             WorkingDirectory = Path.GetDirectoryName(spoolPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
