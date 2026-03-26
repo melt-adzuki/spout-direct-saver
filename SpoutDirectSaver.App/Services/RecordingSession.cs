@@ -180,7 +180,10 @@ internal sealed class RecordingSession : IAsyncDisposable
                 }
 
                 var fingerprint = ComputeFingerprint(frame.PixelBuffer.Span);
-                if (fingerprint == _lastUniqueFingerprint)
+                if (fingerprint == _lastUniqueFingerprint &&
+                    _lastUniqueFrame is not null &&
+                    _lastUniqueFrame.Length == frame.PixelBuffer.Length &&
+                    _lastUniqueFrame.Span.SequenceEqual(frame.PixelBuffer.Span))
                 {
                     frame.PixelBuffer.Dispose();
                     return;
@@ -436,6 +439,11 @@ internal sealed class RecordingSession : IAsyncDisposable
                 QueueHybridFrame(_currentFrame, _lastUniqueFrame);
                 _lastUniqueFrame = null;
             }
+            else
+            {
+                _lastUniqueFrame?.Dispose();
+                _lastUniqueFrame = null;
+            }
         }
 
         var recordedFrame = new RecordedFrame
@@ -459,22 +467,38 @@ internal sealed class RecordingSession : IAsyncDisposable
             _compressSpoolFrames ??= true;
             recordedFrame.IsCompressed = _compressSpoolFrames.Value;
 
+            frame.PixelBuffer.Retain();
+            var comparisonFrame = frame.PixelBuffer;
             var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, frame.PixelBuffer);
-            if (_writeSynchronously)
+            try
             {
-                WriteFrameSynchronously(request);
+                if (_writeSynchronously)
+                {
+                    WriteFrameSynchronously(request);
+                }
+                else if (!TryQueueFrameWrite(request))
+                {
+                    comparisonFrame.Dispose();
+                    frame.PixelBuffer.Dispose();
+                    return;
+                }
             }
-            else if (!TryQueueFrameWrite(request))
+            catch
             {
-                frame.PixelBuffer.Dispose();
-                return;
+                comparisonFrame.Dispose();
+                throw;
             }
+
+            _lastUniqueFrame = comparisonFrame;
         }
 
         _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
-        _lastUniqueFrame = (_useRealtimeEncoding || _useRealtimeRgbIntermediate) ? frame.PixelBuffer : null;
+        if (_useRealtimeEncoding || _useRealtimeRgbIntermediate)
+        {
+            _lastUniqueFrame = frame.PixelBuffer;
+        }
         _lastUniqueFingerprint = fingerprint;
     }
 

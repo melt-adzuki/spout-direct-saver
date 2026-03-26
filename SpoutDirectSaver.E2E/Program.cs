@@ -34,6 +34,7 @@ try
 var receiveOnly = MeasureReceiveOnly(options);
 Console.WriteLine($"receive_only_frames={receiveOnly.FrameCount}");
 Console.WriteLine($"receive_only_unique_frames={receiveOnly.UniqueFrameCount}");
+Console.WriteLine($"receive_only_weak_fingerprint_unique_frames={receiveOnly.WeakFingerprintUniqueFrameCount}");
 Console.WriteLine($"receive_only_elapsed={receiveOnly.Elapsed.TotalSeconds:0.000}");
 Console.WriteLine($"receive_only_fps={receiveOnly.FrameCount / receiveOnly.Elapsed.TotalSeconds:0.00}");
 Console.WriteLine($"receive_only_unique_fps={receiveOnly.UniqueFrameCount / receiveOnly.Elapsed.TotalSeconds:0.00}");
@@ -45,6 +46,7 @@ Console.WriteLine($"receive_only_sender_frame_delta={receiveOnly.SenderFrameDelt
     var recordResult = await RecordAndExportAsync(options, encoderOption, outputPath);
 Console.WriteLine($"record_frames_seen={recordResult.TotalFramesSeen}");
 Console.WriteLine($"record_unique_frames={recordResult.UniqueFramesSeen}");
+Console.WriteLine($"record_weak_fingerprint_unique_frames={recordResult.WeakFingerprintUniqueFramesSeen}");
 Console.WriteLine($"record_elapsed={recordResult.CaptureElapsed.TotalSeconds:0.000}");
 Console.WriteLine($"record_capture_fps={recordResult.TotalFramesSeen / recordResult.CaptureElapsed.TotalSeconds:0.00}");
 Console.WriteLine($"record_unique_capture_fps={recordResult.UniqueFramesSeen / recordResult.CaptureElapsed.TotalSeconds:0.00}");
@@ -65,7 +67,7 @@ finally
     }
 }
 
-static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Elapsed, uint Width, uint Height, FrameRateStats FrameRateStats) MeasureReceiveOnly(E2eOptions options)
+static (int FrameCount, int UniqueFrameCount, int WeakFingerprintUniqueFrameCount, int SenderFrameDelta, TimeSpan Elapsed, uint Width, uint Height, FrameRateStats FrameRateStats) MeasureReceiveOnly(E2eOptions options)
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
@@ -91,6 +93,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     var firstFrameSeen = false;
     var frameCount = 0;
     var uniqueFrameCount = 0;
+    var weakFingerprintUniqueFrameCount = 0;
     var width = 0u;
     var height = 0u;
     var senderFrameStart = -1;
@@ -99,6 +102,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     var lastAcceptedSenderFrame = -1;
     var diagnosticsPrinted = false;
     ulong? lastFallbackFingerprint = null;
+    ulong? lastWeakFingerprint = null;
     var duration = TimeSpan.FromSeconds(options.CaptureSeconds);
     var started = Stopwatch.StartNew();
     var endTicks = Stopwatch.GetTimestamp() + (long)(duration.TotalSeconds * Stopwatch.Frequency);
@@ -188,6 +192,12 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
             }
 
             frameCount++;
+            var weakFingerprint = ComputeFingerprintFromBuffer(buffer, bufferLength);
+            if (lastWeakFingerprint != weakFingerprint)
+            {
+                weakFingerprintUniqueFrameCount++;
+                lastWeakFingerprint = weakFingerprint;
+            }
             senderFrameStart = senderFrameStart < 0 ? senderFrame : senderFrameStart;
             senderFrameEnd = senderFrame;
             if (senderFrame > 0)
@@ -246,6 +256,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
     return (
         frameCount,
         uniqueFrameCount,
+        weakFingerprintUniqueFrameCount,
         Math.Max(senderFrameEnd - senderFrameStart, 0),
         started.Elapsed,
         width,
@@ -253,7 +264,7 @@ static (int FrameCount, int UniqueFrameCount, int SenderFrameDelta, TimeSpan Ela
         BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
 }
 
-static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, EncoderOption encoderOption, string outputPath)
+static async Task<(int TotalFramesSeen, int UniqueFramesSeen, int WeakFingerprintUniqueFramesSeen, TimeSpan CaptureElapsed, string OutputPath, FrameRateStats FrameRateStats)> RecordAndExportAsync(E2eOptions options, EncoderOption encoderOption, string outputPath)
 {
     using var receiver = new SpoutReceiver();
     using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
@@ -281,8 +292,10 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
     var bufferLength = 0;
     var frameCount = 0;
     var uniqueFrameCount = 0;
+    var weakFingerprintUniqueFrameCount = 0;
     var lastObservedSenderFrame = -1;
     ulong? lastFallbackFingerprint = null;
+    ulong? lastWeakFingerprint = null;
     var started = Stopwatch.StartNew();
     var endTicks = Stopwatch.GetTimestamp() + (long)(TimeSpan.FromSeconds(options.CaptureSeconds).TotalSeconds * Stopwatch.Frequency);
     var nextPollTicks = Stopwatch.GetTimestamp();
@@ -376,6 +389,12 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 blockOnBackpressure: true);
             var acceptedFrameTick = Stopwatch.GetTimestamp();
             frameCount++;
+            var weakFingerprint = ComputeFingerprintFromBuffer(buffer, bufferLength);
+            if (lastWeakFingerprint != weakFingerprint)
+            {
+                weakFingerprintUniqueFrameCount++;
+                lastWeakFingerprint = weakFingerprint;
+            }
             if (senderFrame > 0)
             {
                 var managedCopy = PixelBufferLease.Rent(bufferLength);
@@ -403,10 +422,12 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                 var managedCopy = PixelBufferLease.Rent(bufferLength);
                 Marshal.Copy(buffer, managedCopy.Buffer, 0, bufferLength);
                 var fingerprint = ComputeFingerprint(managedCopy.Span);
+                var snapshot = GC.AllocateUninitializedArray<byte>(managedCopy.Length);
+                managedCopy.Span.CopyTo(snapshot);
                 var shouldCountAsUnique =
                     lastFallbackFingerprint != fingerprint ||
                     lastFallbackFrame is null ||
-                    !lastFallbackFrame.AsSpan().SequenceEqual(managedCopy.Span);
+                    !lastFallbackFrame.AsSpan().SequenceEqual(snapshot);
                 session.AppendFrame(new FramePacket(
                     managedCopy,
                     width,
@@ -421,8 +442,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
                     uniqueAcceptedFrameTicks.Add(acceptedFrameTick);
                     firstAcceptedFrameTick ??= acceptedFrameTick;
                     lastFallbackFingerprint = fingerprint;
-                    lastFallbackFrame = GC.AllocateUninitializedArray<byte>(managedCopy.Length);
-                    managedCopy.Span.CopyTo(lastFallbackFrame);
+                    lastFallbackFrame = snapshot;
                 }
             }
             if (!useSharedFrameCounter)
@@ -445,6 +465,7 @@ static async Task<(int TotalFramesSeen, int UniqueFramesSeen, TimeSpan CaptureEl
         return (
             frameCount,
             uniqueFrameCount,
+            weakFingerprintUniqueFrameCount,
             captureElapsed,
             savedPath,
             BuildFrameRateStats(uniqueAcceptedFrameTicks, captureStartedTicks, captureEndedTicks));
@@ -676,6 +697,16 @@ static unsafe bool IsLikelyAllZeroFrame(IntPtr buffer, int length)
     }
 
     return true;
+}
+
+static unsafe ulong ComputeFingerprintFromBuffer(IntPtr buffer, int length)
+{
+    if (buffer == IntPtr.Zero || length <= 0)
+    {
+        return ComputeFingerprint(ReadOnlySpan<byte>.Empty);
+    }
+
+    return ComputeFingerprint(new ReadOnlySpan<byte>((void*)buffer, length));
 }
 
 static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
