@@ -642,7 +642,14 @@ static bool TryReadFrame(SpoutReceiver receiver, D3D11SpoutSharedTextureReader s
     switch (options.ReceiveMode)
     {
         case ReceiveMode.D3D11SharedTexture:
-            if (!sharedTextureReader.TrySynchronizeSender(receiver, receiver.SenderName, out _))
+            if (!sharedTextureReader.TrySynchronizeSender(
+                    receiver.SenderName,
+                    receiver.SenderHandle,
+                    receiver.SenderWidth,
+                    receiver.SenderHeight,
+                    (Format)receiver.SenderFormat,
+                    receiver.Adapter,
+                    out _))
             {
                 return false;
             }

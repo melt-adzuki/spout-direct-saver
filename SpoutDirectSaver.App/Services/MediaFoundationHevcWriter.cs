@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
+using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
 
 namespace SpoutDirectSaver.App.Services;
@@ -15,6 +16,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
     private readonly IMFSinkWriter _sinkWriter;
     private readonly int _streamIndex;
     private readonly long _frameDurationHns;
+    private readonly IMFDXGIDeviceManager? _deviceManager;
     private long _submittedFrameCount;
     private bool _completed;
     private bool _disposed;
@@ -24,6 +26,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         uint height,
         double frameRate,
         string outputPath,
+        ID3D11Device? device = null,
         uint averageBitrate = 40_000_000)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
@@ -36,6 +39,12 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.LowLatency, 1u);
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssClass, "Capture");
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssPriority, 2u);
+        if (device is not null)
+        {
+            _deviceManager = MediaFactory.MFCreateDXGIDeviceManager();
+            _deviceManager.ResetDevice(device).CheckError();
+            sinkWriterAttributes.Set(SinkWriterAttributeKeys.D3DManager, _deviceManager);
+        }
 
         _sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, sinkWriterAttributes);
 
@@ -107,6 +116,36 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         }
     }
 
+    public void WriteTextureFrame(ID3D11Texture2D texture, int repeatCount)
+    {
+        if (repeatCount <= 0)
+        {
+            return;
+        }
+
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_completed)
+        {
+            throw new InvalidOperationException("Media Foundation writer は既に完了しています。");
+        }
+
+        if (_deviceManager is null)
+        {
+            throw new InvalidOperationException("GPU texture 書き込み用の D3D manager が初期化されていません。");
+        }
+
+        for (var index = 0; index < repeatCount; index++)
+        {
+            using var mediaBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(typeof(ID3D11Texture2D).GUID, texture, 0, false);
+            using var sample = MediaFactory.MFCreateSample();
+            sample.AddBuffer(mediaBuffer);
+            sample.SampleTime = _submittedFrameCount * _frameDurationHns;
+            sample.SampleDuration = _frameDurationHns;
+            _sinkWriter.WriteSample(_streamIndex, sample);
+            _submittedFrameCount++;
+        }
+    }
+
     public void Complete()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -128,6 +167,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
 
         _disposed = true;
         _sinkWriter.Dispose();
+        _deviceManager?.Dispose();
         ShutdownMediaFoundationIfNeeded();
     }
 

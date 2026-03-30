@@ -16,6 +16,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     private const int ReceiveBufferCount = 4;
     private readonly object _startGate = new();
     private readonly object _previewGate = new();
+    private readonly long _previewIntervalTicks = ResolvePreviewIntervalTicks();
 
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _workerTask;
@@ -25,14 +26,24 @@ internal sealed class SpoutPollingService : IAsyncDisposable
     private LivePreviewFrame _latestPreviewFrame;
     private bool _hasPreviewFrame;
     private int _recordingModeEnabled;
+    private int _gpuRecordingModeEnabled;
+    private long _nextPreviewCaptureTicks;
 
     public event EventHandler<FramePacket>? FrameArrived;
 
     public event EventHandler<CaptureStatus>? StatusChanged;
 
-    public void SetRecordingMode(bool enabled)
+    public void SetRecordingMode(bool enabled, bool preferGpuFrames)
     {
         Interlocked.Exchange(ref _recordingModeEnabled, enabled ? 1 : 0);
+        Interlocked.Exchange(ref _gpuRecordingModeEnabled, enabled && preferGpuFrames ? 1 : 0);
+        if (enabled)
+        {
+            lock (_previewGate)
+            {
+                _hasPreviewFrame = false;
+            }
+        }
     }
 
     public bool TryReadLatestPreviewFrame(Action<LivePreviewFrame> reader)
@@ -156,6 +167,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         frameCountSenderName = string.Empty;
                         frameCountSupportProbed = false;
                         frameCountSupported = false;
+                        _nextPreviewCaptureTicks = 0;
                     }
 
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
@@ -179,21 +191,14 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     senderWasUpdated = true;
                 }
 
-                var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
-                if (_previewBackBuffer == IntPtr.Zero || _previewBufferLength != requiredLength)
-                {
-                    EnsurePreviewBufferSize(requiredLength);
-                    senderWasUpdated = true;
-                }
-
-                var preferSharedTextureReadback = TryPrepareSharedTextureReadback(
+                var preferSharedTextureCapture = TryPrepareSharedTextureReadback(
                     receiver,
                     sharedTextureReader,
                     frameCounter,
                     connectedSenderName,
                     ref frameCountSenderName,
                     out var effectiveSenderFps);
-                if (preferSharedTextureReadback && !frameCountSupportProbed)
+                if (preferSharedTextureCapture && !frameCountSupportProbed)
                 {
                     frameCountSupportProbed = true;
                     frameCountSupported =
@@ -202,33 +207,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         frameCounter.SenderFrame > 0;
                 }
 
-                preferSharedTextureReadback &= frameCountSupported;
-
-                if (preferSharedTextureReadback)
-                {
-                    if (!TryReceiveSharedTextureFrame(
-                            sharedTextureReader,
-                            frameCounter,
-                            connectedSenderName,
-                            ref frameCountSupportProbed,
-                            ref frameCountSupported,
-                            _previewBackBuffer,
-                            _previewBufferLength,
-                            effectiveSenderFps,
-                            cancellationToken))
-                    {
-                        continue;
-                    }
-                }
-                else if (!TryReceivePreviewImage(
-                             receiver,
-                             connectedSenderName,
-                             connectedWidth,
-                             connectedHeight))
-                {
-                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
-                    continue;
-                }
+                preferSharedTextureCapture &= frameCountSupported;
 
                 if (senderWasUpdated)
                 {
@@ -244,6 +223,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     lastAcceptedSenderFrame = -1;
                     frameCountSupportProbed = false;
                     frameCountSupported = false;
+                    _nextPreviewCaptureTicks = 0;
 
                     RaiseStatus(new CaptureStatus(
                         true,
@@ -253,61 +233,117 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                         effectiveSenderFps,
                         message));
 
-                    if (!preferSharedTextureReadback)
+                    if (!preferSharedTextureCapture)
                     {
                         WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     }
+
                     continue;
                 }
 
-                var senderFrame = preferSharedTextureReadback
+                if (preferSharedTextureCapture)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!TryAwaitSharedFrame(
+                            frameCounter,
+                            connectedSenderName,
+                            ref frameCountSupportProbed,
+                            ref frameCountSupported,
+                            effectiveSenderFps))
+                    {
+                        continue;
+                    }
+                }
+
+                var senderFrame = preferSharedTextureCapture
                     ? frameCounter.SenderFrame
                     : receiver.SenderFrame;
                 if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
                 {
-                    if (!preferSharedTextureReadback)
+                    if (!preferSharedTextureCapture)
                     {
                         WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                     }
+
                     continue;
                 }
 
                 lastAcceptedSenderFrame = senderFrame;
                 var acceptedFrameTicks = Stopwatch.GetTimestamp();
                 var recordingMode = Volatile.Read(ref _recordingModeEnabled) != 0;
+                var gpuRecordingMode = recordingMode && Volatile.Read(ref _gpuRecordingModeEnabled) != 0;
+
                 if (!recordingMode)
                 {
-                    PublishPreviewFrame(width, height, senderName, effectiveSenderFps, acceptedFrameTicks);
+                    TryPublishPreviewFrame(
+                        receiver,
+                        sharedTextureReader,
+                        preferSharedTextureCapture,
+                        connectedWidth,
+                        connectedHeight,
+                        connectedSenderName,
+                        effectiveSenderFps,
+                        acceptedFrameTicks);
                 }
 
                 var frameHandler = FrameArrived;
                 if (frameHandler is not null)
                 {
-                    var frameCopy = PixelBufferLease.Rent(_previewBufferLength);
-                    var sourceBuffer = recordingMode ? _previewBackBuffer : _previewFrontBuffer;
-                    if (!recordingMode)
+                    FramePacket? framePacket = null;
+                    try
                     {
-                        lock (_previewGate)
+                        if (gpuRecordingMode && preferSharedTextureCapture)
                         {
-                            Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
-                        }
-                    }
-                    else
-                    {
-                        Marshal.Copy(sourceBuffer, frameCopy.Buffer, 0, _previewBufferLength);
-                    }
+                            if (!sharedTextureReader.TryCaptureFrame(out var gpuFrame, out var alphaBuffer, out var errorMessage))
+                            {
+                                throw new InvalidOperationException(errorMessage ?? "GPU capture frame の作成に失敗しました。");
+                            }
 
-                    frameHandler.Invoke(this, new FramePacket(
-                        frameCopy,
-                        width,
-                        height,
-                        senderName,
-                        effectiveSenderFps,
-                        acceptedFrameTicks,
-                        DateTimeOffset.UtcNow));
+                            framePacket = new FramePacket(
+                                null,
+                                gpuFrame,
+                                alphaBuffer,
+                                connectedWidth,
+                                connectedHeight,
+                                connectedSenderName,
+                                effectiveSenderFps,
+                                acceptedFrameTicks,
+                                DateTimeOffset.UtcNow);
+                        }
+                        else
+                        {
+                            var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
+                            var frameCopy = PixelBufferLease.Rent(requiredLength);
+                            CaptureCpuFrame(
+                                receiver,
+                                sharedTextureReader,
+                                preferSharedTextureCapture,
+                                connectedSenderName,
+                                connectedWidth,
+                                connectedHeight,
+                                frameCopy);
+                            framePacket = new FramePacket(
+                                frameCopy,
+                                null,
+                                null,
+                                connectedWidth,
+                                connectedHeight,
+                                connectedSenderName,
+                                effectiveSenderFps,
+                                acceptedFrameTicks,
+                                DateTimeOffset.UtcNow);
+                        }
+
+                        frameHandler.Invoke(this, framePacket);
+                        framePacket = null;
+                    }
+                    finally
+                    {
+                        framePacket?.Dispose();
+                    }
                 }
 
-                if (!preferSharedTextureReadback)
+                if (!preferSharedTextureCapture)
                 {
                     WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
                 }
@@ -321,6 +357,73 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         {
             receiver.ReleaseReceiver();
             receiver.CloseOpenGL();
+        }
+    }
+
+    private void TryPublishPreviewFrame(
+        SpoutReceiver receiver,
+        D3D11SpoutSharedTextureReader sharedTextureReader,
+        bool preferSharedTextureCapture,
+        uint width,
+        uint height,
+        string senderName,
+        double senderFps,
+        long stopwatchTicks)
+    {
+        if (_previewIntervalTicks > 0 && stopwatchTicks < Volatile.Read(ref _nextPreviewCaptureTicks))
+        {
+            return;
+        }
+
+        var requiredLength = checked((int)(width * height * 4));
+        EnsurePreviewBufferSize(requiredLength);
+
+        CaptureCpuFrame(receiver, sharedTextureReader, preferSharedTextureCapture, senderName, width, height, _previewBackBuffer, requiredLength);
+        PublishPreviewFrame(width, height, senderName, senderFps, stopwatchTicks);
+        Volatile.Write(ref _nextPreviewCaptureTicks, stopwatchTicks + _previewIntervalTicks);
+    }
+
+    private void CaptureCpuFrame(
+        SpoutReceiver receiver,
+        D3D11SpoutSharedTextureReader sharedTextureReader,
+        bool preferSharedTextureCapture,
+        string senderName,
+        uint width,
+        uint height,
+        PixelBufferLease destination)
+    {
+        unsafe
+        {
+            fixed (byte* destinationPtr = destination.Buffer)
+            {
+                CaptureCpuFrame(receiver, sharedTextureReader, preferSharedTextureCapture, senderName, width, height, (IntPtr)destinationPtr, destination.Length);
+            }
+        }
+    }
+
+    private void CaptureCpuFrame(
+        SpoutReceiver receiver,
+        D3D11SpoutSharedTextureReader sharedTextureReader,
+        bool preferSharedTextureCapture,
+        string senderName,
+        uint width,
+        uint height,
+        IntPtr destinationBuffer,
+        int destinationLength)
+    {
+        if (preferSharedTextureCapture)
+        {
+            if (!sharedTextureReader.TryReadFrame(destinationBuffer, destinationLength, out var errorMessage))
+            {
+                throw new InvalidOperationException(errorMessage ?? "shared texture の readback に失敗しました。");
+            }
+
+            return;
+        }
+
+        if (!TryReceivePreviewImage(receiver, senderName, width, height, destinationBuffer))
+        {
+            throw new InvalidOperationException("Spout 画像の受信に失敗しました。");
         }
     }
 
@@ -362,11 +465,12 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
     }
 
-    private unsafe bool TryReceivePreviewImage(
+    private static unsafe bool TryReceivePreviewImage(
         SpoutReceiver receiver,
         string senderName,
         uint width,
-        uint height)
+        uint height,
+        IntPtr destinationBuffer)
     {
         var senderNameBytes = new byte[256];
         if (!string.IsNullOrWhiteSpace(senderName))
@@ -384,7 +488,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 (sbyte*)senderNamePtr,
                 ref receivedWidth,
                 ref receivedHeight,
-                (byte*)_previewBackBuffer,
+                (byte*)destinationBuffer,
                 0x80E1u,
                 false,
                 0);
@@ -459,32 +563,6 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                 receiver.BufferMode = false;
                 break;
         }
-    }
-
-    private static bool TryReceiveSharedTextureFrame(
-        D3D11SpoutSharedTextureReader sharedTextureReader,
-        SpoutFrameCount frameCounter,
-        string senderName,
-        ref bool frameCountSupportProbed,
-        ref bool frameCountSupported,
-        IntPtr destinationBuffer,
-        int destinationLength,
-        double senderFps,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!TryAwaitSharedFrame(
-                frameCounter,
-                senderName,
-                ref frameCountSupportProbed,
-                ref frameCountSupported,
-                senderFps))
-        {
-            return false;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-        return sharedTextureReader.TryReadFrame(destinationBuffer, destinationLength, out _);
     }
 
     private static string ReadNullTerminatedAscii(byte[] buffer)
@@ -627,6 +705,21 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
 
         return WaitForNextFrame(frameCounter, senderFps);
+    }
+
+    private static long ResolvePreviewIntervalTicks()
+    {
+        const double defaultPreviewFps = 15.0;
+        var overrideValue = Environment.GetEnvironmentVariable("SPOUT_DIRECT_SAVER_PREVIEW_FPS");
+        var previewFps = defaultPreviewFps;
+        if (!string.IsNullOrWhiteSpace(overrideValue) &&
+            double.TryParse(overrideValue, out var parsed) &&
+            parsed > 0.0)
+        {
+            previewFps = Math.Clamp(parsed, 1.0, 60.0);
+        }
+
+        return (long)Math.Round(Stopwatch.Frequency / previewFps);
     }
 
     private enum ReceiveConfiguration

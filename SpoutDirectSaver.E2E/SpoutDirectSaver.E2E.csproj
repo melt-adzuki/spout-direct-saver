@@ -12,6 +12,7 @@
   <ItemGroup>
     <PackageReference Include="K4os.Compression.LZ4.Streams" Version="1.3.8" />
     <PackageReference Include="Spout.NETCore" Version="2.7.17" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
@@ -21,6 +22,7 @@
     <Compile Include="..\SpoutDirectSaver.App\Models\CaptureStatus.cs" Link="Models\CaptureStatus.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\EncoderOption.cs" Link="Models\EncoderOption.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\FramePacket.cs" Link="Models\FramePacket.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Models\GpuTextureFrame.cs" Link="Models\GpuTextureFrame.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\LivePreviewFrame.cs" Link="Models\LivePreviewFrame.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\PixelBufferLease.cs" Link="Models\PixelBufferLease.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\RecordedFrame.cs" Link="Models\RecordedFrame.cs" />

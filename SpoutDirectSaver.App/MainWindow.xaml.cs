@@ -135,7 +135,7 @@ public partial class MainWindow : Window
         ResetPreviewArea();
 
         _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
-        _spoutPollingService.SetRecordingMode(true);
+        _spoutPollingService.SetRecordingMode(true, SelectedEncoderOption.UsesRealtimeRgbIntermediate);
         _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
         BeginRecordingLatencyScope();
         _recordingStartedAt = DateTimeOffset.UtcNow;
@@ -176,7 +176,7 @@ public partial class MainWindow : Window
             _lastRecordedFilePath = outputPath;
             _recordingSession = null;
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
-            _spoutPollingService.SetRecordingMode(false);
+            _spoutPollingService.SetRecordingMode(false, false);
 
             LoadPreview(outputPath);
             RecorderStatusTextBlock.Text = $"保存完了: {outputPath}";
@@ -196,7 +196,7 @@ public partial class MainWindow : Window
             }
 
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
-            _spoutPollingService.SetRecordingMode(false);
+            _spoutPollingService.SetRecordingMode(false, false);
         }
         finally
         {
@@ -205,7 +205,7 @@ public partial class MainWindow : Window
             _isStopping = false;
             if (_recordingSession is null)
             {
-                _spoutPollingService.SetRecordingMode(false);
+                _spoutPollingService.SetRecordingMode(false, false);
             }
             UpdateRecordingElapsed();
             UpdateUiState();
@@ -332,11 +332,11 @@ public partial class MainWindow : Window
                 return;
             }
 
-            frame.PixelBuffer.Dispose();
+            frame.Dispose();
         }
         catch (Exception ex)
         {
-            frame.PixelBuffer.Dispose();
+            frame.Dispose();
             _ = Dispatcher.BeginInvoke(() =>
             {
                 RecorderStatusTextBlock.Text = $"録画を継続できませんでした: {ex.Message}";
