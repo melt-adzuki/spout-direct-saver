@@ -37,7 +37,9 @@
     <Compile Include="..\SpoutDirectSaver.App\Models\LivePreviewFrame.cs" Link="Models\LivePreviewFrame.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\PixelBufferLease.cs" Link="Models\PixelBufferLease.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\RecordedFrame.cs" Link="Models\RecordedFrame.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\D3D11Nv12TextureConverter.cs" Link="Services\D3D11Nv12TextureConverter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\D3D11SpoutSharedTextureReader.cs" Link="Services\D3D11SpoutSharedTextureReader.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\DebugTrace.cs" Link="Services\DebugTrace.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\MediaFoundationHevcWriter.cs" Link="Services\MediaFoundationHevcWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\PixelConversion.cs" Link="Services\PixelConversion.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeGrayFfv1Writer.cs" Link="Services\RealtimeGrayFfv1Writer.cs" />

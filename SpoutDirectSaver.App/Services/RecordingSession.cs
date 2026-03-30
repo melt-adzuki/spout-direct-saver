@@ -20,6 +20,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly string _outputPath;
     private readonly string _temporaryDirectory;
     private readonly string _spoolPath;
+    private readonly string _traceId = Guid.NewGuid().ToString("N")[..8];
     private readonly List<RecordedFrame> _frames = [];
     private readonly Channel<FrameWriteRequest> _compressionChannel;
     private readonly ConcurrentDictionary<int, PreparedFrameWriteRequest> _preparedFrames = new();
@@ -110,6 +111,9 @@ internal sealed class RecordingSession : IAsyncDisposable
             : null;
 
         Directory.CreateDirectory(_temporaryDirectory);
+        DebugTrace.WriteLine(
+            "RecordingSession",
+            $"create session={_traceId} output={_outputPath} temp={_temporaryDirectory} spool={_spoolPath} hybrid={_useRealtimeRgbIntermediate}");
 
         _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
         {
@@ -218,6 +222,7 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     public async Task<string> FinalizeAsync(VideoExportService exportService, CancellationToken cancellationToken)
     {
+        DebugTrace.WriteLine("RecordingSession", $"finalize start session={_traceId} temp={_temporaryDirectory}");
         RecordedFrame[] framesToEncode = [];
         RealtimeHybridWriter? realtimeWriter = null;
         RealtimeRgbNvencWriter? rgbIntermediateWriter = null;
@@ -361,6 +366,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
         finally
         {
+            DebugTrace.WriteLine("RecordingSession", $"finalize finally session={_traceId} tempExists={Directory.Exists(_temporaryDirectory)}");
             _lastUniqueFrame?.Dispose();
             _lastUniqueFrame = null;
             _lastGpuFrame?.Dispose();
@@ -380,6 +386,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
 
         _disposed = true;
+        DebugTrace.WriteLine("RecordingSession", $"dispose session={_traceId} temp={_temporaryDirectory}");
 
         lock (_gate)
         {
@@ -491,13 +498,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
             else if (_useRealtimeRgbIntermediate)
             {
-                if (_lastUniqueFrame is null)
-                {
-                    throw new InvalidOperationException("RGB intermediate 用の前フレームが見つかりません。");
-                }
-
-                QueueHybridFrame(_currentFrame, _lastUniqueFrame);
-                _lastUniqueFrame = null;
+                FlushPendingHybridFrame();
             }
             else
             {
@@ -568,14 +569,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         if (_currentFrame is not null)
         {
             FinalizeCurrentFrame(frame.StopwatchTicks);
-            if (_lastGpuFrame is null || _lastAlphaFrame is null)
-            {
-                throw new InvalidOperationException("GPU intermediate 用の前フレームが見つかりません。");
-            }
-
-            QueueHybridFrame(_currentFrame, _lastGpuFrame, _lastAlphaFrame);
-            _lastGpuFrame = null;
-            _lastAlphaFrame = null;
+            FlushPendingHybridFrame();
         }
 
         _compressSpoolFrames ??= true;
@@ -590,8 +584,37 @@ internal sealed class RecordingSession : IAsyncDisposable
         _frameCounter++;
         _frames.Add(recordedFrame);
         _currentFrame = recordedFrame;
+        _lastUniqueFrame?.Dispose();
+        _lastUniqueFrame = null;
         _lastGpuFrame = frame.GpuTexture!;
         _lastAlphaFrame = frame.AlphaBuffer!;
+    }
+
+    private void FlushPendingHybridFrame()
+    {
+        if (_currentFrame is null)
+        {
+            return;
+        }
+
+        if (_lastGpuFrame is not null && _lastAlphaFrame is not null)
+        {
+            QueueHybridFrame(_currentFrame, _lastGpuFrame, _lastAlphaFrame);
+            _lastGpuFrame = null;
+            _lastAlphaFrame = null;
+            _lastUniqueFrame?.Dispose();
+            _lastUniqueFrame = null;
+            return;
+        }
+
+        if (_lastUniqueFrame is not null)
+        {
+            QueueHybridFrame(_currentFrame, _lastUniqueFrame);
+            _lastUniqueFrame = null;
+            return;
+        }
+
+        throw new InvalidOperationException("hybrid 録画用の前フレームが見つかりません。");
     }
 
     private void FinalizeCurrentFrame(long completedStopwatchTicks)
@@ -876,6 +899,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
 
         _outputFrameRate = GetOutputFrameRate();
+        DebugTrace.WriteLine(
+            "RecordingSession",
+            $"start rgb writer session={_traceId} path={_rgbIntermediatePath} mode=gpu");
         _rgbIntermediateWriter = new RealtimeRgbNvencWriter(
             _recordedWidth,
             _recordedHeight,
@@ -897,6 +923,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
 
         _outputFrameRate = GetOutputFrameRate();
+        DebugTrace.WriteLine(
+            "RecordingSession",
+            $"start rgb writer session={_traceId} path={_rgbIntermediatePath} mode=cpu");
         _rgbIntermediateWriter = new RealtimeRgbNvencWriter(
             _recordedWidth,
             _recordedHeight,
@@ -1010,6 +1039,12 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     private void TryDeleteTemporaryDirectory()
     {
+        if (IsEnabled("SPOUT_DIRECT_SAVER_KEEP_TEMP"))
+        {
+            DebugTrace.WriteLine("RecordingSession", $"keep temp session={_traceId} temp={_temporaryDirectory}");
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(_temporaryDirectory) || !Directory.Exists(_temporaryDirectory))
         {
             return;
@@ -1017,6 +1052,7 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         try
         {
+            DebugTrace.WriteLine("RecordingSession", $"delete temp session={_traceId} temp={_temporaryDirectory}");
             Directory.Delete(_temporaryDirectory, true);
         }
         catch

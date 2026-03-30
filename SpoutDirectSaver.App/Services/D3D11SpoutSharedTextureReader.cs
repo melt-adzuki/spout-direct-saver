@@ -18,7 +18,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private const int KeyedMutexTimeoutMilliseconds = 67;
     private const int AccessMutexTimeoutMilliseconds = 67;
     private const int StagingTextureCount = 3;
-    private const int RecordingTextureCount = 3;
+    private const int RecordingTextureCount = 10;
     private readonly IDXGIFactory1 _dxgiFactory;
     private readonly object _recordingSlotGate = new();
     private readonly Queue<int> _availableRecordingSlotIndices = new();
@@ -114,8 +114,36 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         }
         catch (Exception ex)
         {
+            var primaryError = ex.Message;
             ResetResources();
-            errorMessage = $"共有テクスチャを開けませんでした: {ex.Message}";
+
+            if (adapterIndex >= 0)
+            {
+                try
+                {
+                    EnsureDevice(-1);
+                    RecreateResources(senderName, sharedHandle, width, height, format);
+                    errorMessage = null;
+                    DebugTrace.WriteLine(
+                        "D3D11SpoutSharedTextureReader",
+                        $"adapter fallback succeeded sender={senderName} originalAdapter={adapterIndex}");
+                    return true;
+                }
+                catch (Exception fallbackEx)
+                {
+                    ResetResources();
+                    errorMessage = $"共有テクスチャを開けませんでした: primary={primaryError}; fallback={fallbackEx.Message}";
+                    DebugTrace.WriteLine(
+                        "D3D11SpoutSharedTextureReader",
+                        $"sync failed sender={senderName} adapter={adapterIndex} error={errorMessage}");
+                    return false;
+                }
+            }
+
+            errorMessage = $"共有テクスチャを開けませんでした: {primaryError}";
+            DebugTrace.WriteLine(
+                "D3D11SpoutSharedTextureReader",
+                $"sync failed sender={senderName} adapter={adapterIndex} error={errorMessage}");
             return false;
         }
     }
@@ -424,6 +452,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _deviceContext.Draw(3, 0);
         _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
         ClearRenderTargets();
+        _deviceContext.Flush();
     }
 
     private unsafe void ExtractAlphaPlane(RecordingTextureSlot slot, byte[] destination)
@@ -454,8 +483,10 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
         _deviceContext.PSSetConstantBuffer(0, (ID3D11Buffer)null!);
         ClearRenderTargets();
+        _deviceContext.Flush();
 
         _deviceContext.CopyResource(_alphaReadbackTexture!, _alphaRenderTexture!);
+        _deviceContext.Flush();
         var mappedAlpha = _deviceContext.Map(_alphaReadbackTexture!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
 
         try

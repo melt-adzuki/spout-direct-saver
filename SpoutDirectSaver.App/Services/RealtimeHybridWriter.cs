@@ -96,6 +96,7 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
         if (!_disableMainWriter)
         {
             _mainWriter.Complete();
+            _mainWriter.Dispose();
         }
 
         if (!_disableAlphaWriter)

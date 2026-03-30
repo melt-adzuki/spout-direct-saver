@@ -36,6 +36,9 @@ public partial class MainWindow : Window
     private bool _isSeekingPreview;
     private long _lastRenderedPreviewTicks;
     private GCLatencyMode? _recordingLatencyModeRestore;
+    private string? _lastRecordingFaultMessage;
+    private bool _recordingCpuFallbackActive;
+    private volatile bool _recordingFrameAcceptanceEnabled;
 
     public MainWindow()
     {
@@ -135,8 +138,15 @@ public partial class MainWindow : Window
         ResetPreviewArea();
 
         _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
-        _spoutPollingService.SetRecordingMode(true, SelectedEncoderOption.UsesRealtimeRgbIntermediate);
+        _lastRecordingFaultMessage = null;
+        _recordingCpuFallbackActive = false;
+        _recordingFrameAcceptanceEnabled = false;
         _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
+        _spoutPollingService.SetRecordingMode(true, SelectedEncoderOption.UsesRealtimeRgbIntermediate);
+        _recordingFrameAcceptanceEnabled = true;
+        DebugTrace.WriteLine(
+            "MainWindow",
+            $"start recording output={_outputPath} preferGpu={SelectedEncoderOption.UsesRealtimeRgbIntermediate}");
         BeginRecordingLatencyScope();
         _recordingStartedAt = DateTimeOffset.UtcNow;
         _recordingTimer.Start();
@@ -165,6 +175,7 @@ public partial class MainWindow : Window
 
         try
         {
+            DebugTrace.WriteLine("MainWindow", "stop recording clicked");
             HeaderStatusTextBlock.Text = "エンコード中";
             RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
                 ? "録画を停止しました。RGB を確定し、alpha sidecar を書き出しています。"
@@ -175,6 +186,9 @@ public partial class MainWindow : Window
             var outputPath = await _recordingSession.FinalizeAsync(_videoExportService, CancellationToken.None);
             _lastRecordedFilePath = outputPath;
             _recordingSession = null;
+            _lastRecordingFaultMessage = null;
+            _recordingCpuFallbackActive = false;
+            _recordingFrameAcceptanceEnabled = false;
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
             _spoutPollingService.SetRecordingMode(false, false);
 
@@ -185,7 +199,12 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            RecorderStatusTextBlock.Text = $"保存に失敗しました: {ex.Message}";
+            var failureMessage =
+                ex.Message == "録画中にフレームを受信できませんでした。" &&
+                !string.IsNullOrWhiteSpace(_lastRecordingFaultMessage)
+                    ? _lastRecordingFaultMessage
+                    : ex.Message;
+            RecorderStatusTextBlock.Text = $"保存に失敗しました: {failureMessage}";
             PreviewStatusTextBlock.Text = "保存失敗のためプレビューを開始できませんでした。";
             HeaderStatusTextBlock.Text = "エラー";
 
@@ -194,6 +213,9 @@ public partial class MainWindow : Window
                 await _recordingSession.DisposeAsync();
                 _recordingSession = null;
             }
+
+            _recordingCpuFallbackActive = false;
+            _recordingFrameAcceptanceEnabled = false;
 
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
             _spoutPollingService.SetRecordingMode(false, false);
@@ -205,6 +227,7 @@ public partial class MainWindow : Window
             _isStopping = false;
             if (_recordingSession is null)
             {
+                _recordingFrameAcceptanceEnabled = false;
                 _spoutPollingService.SetRecordingMode(false, false);
             }
             UpdateRecordingElapsed();
@@ -315,7 +338,13 @@ public partial class MainWindow : Window
                     ? "受信中"
                     : "入力待ち";
 
-            if (_recordingSession is null && !_isStopping)
+            if (_recordingSession is not null && !_isStopping && LooksLikeCaptureFault(status.Message))
+            {
+                _lastRecordingFaultMessage = status.Message;
+                RecorderStatusTextBlock.Text = status.Message;
+                HeaderStatusTextBlock.Text = "エラー";
+            }
+            else if (_recordingSession is null && !_isStopping)
             {
                 RecorderStatusTextBlock.Text = status.Message;
             }
@@ -326,17 +355,31 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (!_isStopping && _recordingSession is not null)
+            DebugTrace.WriteLine(
+                "MainWindow",
+                $"frame arrived stopping={_isStopping} sessionPresent={_recordingSession is not null} gpu={frame.GpuTexture is not null} cpu={frame.PixelBuffer is not null}");
+            if (!_isStopping && _recordingSession is not null && _recordingFrameAcceptanceEnabled)
             {
+                DebugTrace.WriteLine("MainWindow", "append frame");
                 _recordingSession.AppendFrame(frame);
                 return;
             }
 
+            DebugTrace.WriteLine(
+                "MainWindow",
+                $"dispose frame without append acceptanceEnabled={_recordingFrameAcceptanceEnabled}");
             frame.Dispose();
         }
         catch (Exception ex)
         {
+            DebugTrace.WriteLine("MainWindow", $"append exception {ex.Message}");
             frame.Dispose();
+            if (TryFallbackRecordingToCpu(frame, ex))
+            {
+                return;
+            }
+
+            _lastRecordingFaultMessage = ex.Message;
             _ = Dispatcher.BeginInvoke(() =>
             {
                 RecorderStatusTextBlock.Text = $"録画を継続できませんでした: {ex.Message}";
@@ -464,6 +507,35 @@ public partial class MainWindow : Window
         SeekSlider.Value = 0;
     }
 
+    private bool TryFallbackRecordingToCpu(FramePacket frame, Exception exception)
+    {
+        if (_isStopping ||
+            _recordingSession is null ||
+            _recordingCpuFallbackActive ||
+            !SelectedEncoderOption.UsesRealtimeRgbIntermediate ||
+            frame.GpuTexture is null ||
+            string.IsNullOrWhiteSpace(_outputPath))
+        {
+            return false;
+        }
+
+        var failedSession = _recordingSession;
+        _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _recordingCpuFallbackActive = true;
+        _lastRecordingFaultMessage = $"GPU 録画経路が利用できなかったため CPU 受信へフォールバックしました: {exception.Message}";
+        _spoutPollingService.SetRecordingMode(true, false);
+
+        _ = Dispatcher.BeginInvoke(() =>
+        {
+            RecorderStatusTextBlock.Text = "GPU 録画経路が利用できなかったため、CPU 受信経由で録画を継続しています。";
+            PreviewStatusTextBlock.Text = "録画は継続中です。GPU texture 入力が使えない環境向けにフォールバックしました。";
+            HeaderStatusTextBlock.Text = "録画中";
+        });
+
+        _ = DisposeFailedSessionAsync(failedSession);
+        return true;
+    }
+
     private void UpdateUiState()
     {
         var hasPreview = _previewMedia is not null || !string.IsNullOrWhiteSpace(_lastRecordedFilePath);
@@ -529,5 +601,29 @@ public partial class MainWindow : Window
         }
 
         return TimeSpan.FromMilliseconds(milliseconds).ToString(@"hh\:mm\:ss\.fff");
+    }
+
+    private static bool LooksLikeCaptureFault(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return false;
+        }
+
+        return message.Contains("失敗", StringComparison.Ordinal) ||
+               message.Contains("エラー", StringComparison.Ordinal) ||
+               message.Contains("フォールバック", StringComparison.Ordinal);
+    }
+
+    private static async Task DisposeFailedSessionAsync(RecordingSession failedSession)
+    {
+        try
+        {
+            await failedSession.DisposeAsync();
+        }
+        catch
+        {
+            // Ignore fallback cleanup failures so the replacement session can continue.
+        }
     }
 }

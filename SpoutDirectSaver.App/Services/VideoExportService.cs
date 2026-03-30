@@ -23,6 +23,7 @@ internal sealed class VideoExportService
         string outputPath,
         CancellationToken cancellationToken)
     {
+        await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var startInfo = new ProcessStartInfo
@@ -30,7 +31,7 @@ internal sealed class VideoExportService
             FileName = "ffmpeg",
             Arguments =
                 $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt gray -cues_to_front 1 \"{outputPath}\"",
-            WorkingDirectory = Path.GetDirectoryName(spoolPath)!,
+            WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -56,6 +57,8 @@ internal sealed class VideoExportService
         string outputPath,
         CancellationToken cancellationToken)
     {
+        await WaitForStableFileAsync(rgbVideoPath, cancellationToken).ConfigureAwait(false);
+        await WaitForStableFileAsync(alphaVideoPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var startInfo = new ProcessStartInfo
@@ -78,6 +81,7 @@ internal sealed class VideoExportService
         string outputPath,
         CancellationToken cancellationToken)
     {
+        await WaitForStableFileAsync(inputPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var startInfo = new ProcessStartInfo
@@ -105,13 +109,14 @@ internal sealed class VideoExportService
         string outputPath,
         CancellationToken cancellationToken)
     {
+        await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
             Arguments = encoderOption.BuildArguments(width, height, outputFrameRate, outputPath),
-            WorkingDirectory = Path.GetDirectoryName(spoolPath)!,
+            WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -239,6 +244,48 @@ internal sealed class VideoExportService
         }
     }
 
+    private static async Task WaitForStableFileAsync(string path, CancellationToken cancellationToken)
+    {
+        DebugTrace.WriteLine("VideoExportService", $"wait start path={path}");
+        const int maxAttempts = 300;
+        const int requiredStableObservations = 3;
+        long lastLength = -1;
+        var stableObservations = 0;
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (File.Exists(path))
+            {
+                var fileInfo = new FileInfo(path);
+                if (fileInfo.Exists && fileInfo.Length > 0)
+                {
+                    if (fileInfo.Length == lastLength)
+                    {
+                        stableObservations++;
+                    }
+                    else
+                    {
+                        stableObservations = 1;
+                        lastLength = fileInfo.Length;
+                    }
+
+                    if (stableObservations >= requiredStableObservations)
+                    {
+                        DebugTrace.WriteLine("VideoExportService", $"wait success path={path} size={fileInfo.Length}");
+                        return;
+                    }
+                }
+            }
+
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+
+        DebugTrace.WriteLine("VideoExportService", $"wait fail path={path}");
+        throw new FileNotFoundException($"入力ファイルの準備完了を待てませんでした: {path}", path);
+    }
+
     private static async Task ReadExactAsync(
         Stream stream,
         byte[] buffer,
@@ -307,7 +354,7 @@ internal sealed class VideoExportService
         catch (Win32Exception ex)
         {
             throw new InvalidOperationException(
-                "ffmpeg を起動できませんでした。PATH の通った ffmpeg.exe を用意してください。",
+                $"ffmpeg を起動できませんでした。WorkingDirectory={startInfo.WorkingDirectory}, Message={ex.Message}",
                 ex);
         }
     }
@@ -340,7 +387,7 @@ internal sealed class VideoExportService
         catch (Win32Exception ex)
         {
             throw new InvalidOperationException(
-                "ffmpeg を起動できませんでした。PATH の通った ffmpeg.exe を用意してください。",
+                $"ffmpeg を起動できませんでした。WorkingDirectory={startInfo.WorkingDirectory}, Message={ex.Message}",
                 ex);
         }
     }

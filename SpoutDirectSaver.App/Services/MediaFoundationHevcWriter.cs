@@ -16,7 +16,9 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
     private readonly IMFSinkWriter _sinkWriter;
     private readonly int _streamIndex;
     private readonly long _frameDurationHns;
+    private readonly int _gpuFrameLength;
     private readonly IMFDXGIDeviceManager? _deviceManager;
+    private readonly D3D11Nv12TextureConverter? _nv12Converter;
     private long _submittedFrameCount;
     private bool _completed;
     private bool _disposed;
@@ -44,6 +46,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
             _deviceManager = MediaFactory.MFCreateDXGIDeviceManager();
             _deviceManager.ResetDevice(device).CheckError();
             sinkWriterAttributes.Set(SinkWriterAttributeKeys.D3DManager, _deviceManager);
+            _nv12Converter = new D3D11Nv12TextureConverter(device, device.ImmediateContext, width, height, frameRate);
         }
 
         _sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, sinkWriterAttributes);
@@ -56,22 +59,27 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         MediaFactory.MFSetAttributeSize(outputMediaType, MediaTypeAttributeKeys.FrameSize, width, height).CheckError();
         SetFrameRate(outputMediaType, frameRate);
         MediaFactory.MFSetAttributeRatio(outputMediaType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1).CheckError();
+        ApplyEncodedVideoColorAttributes(outputMediaType);
 
         _streamIndex = _sinkWriter.AddStream(outputMediaType);
 
         using var inputMediaType = MediaFactory.MFCreateMediaType();
         inputMediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
-        inputMediaType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.Rgb32);
+        inputMediaType.Set(MediaTypeAttributeKeys.Subtype, device is not null ? VideoFormatGuids.NV12 : VideoFormatGuids.Rgb32);
+        inputMediaType.Set(MediaTypeAttributeKeys.FixedSizeSamples, 1u);
+        inputMediaType.Set(MediaTypeAttributeKeys.AllSamplesIndependent, 1u);
         inputMediaType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive);
-        inputMediaType.Set(MediaTypeAttributeKeys.DefaultStride, checked((uint)(width * 4)));
-        inputMediaType.Set(MediaTypeAttributeKeys.SampleSize, checked((uint)(width * height * 4)));
+        inputMediaType.Set(MediaTypeAttributeKeys.DefaultStride, checked((uint)(device is not null ? width : width * 4)));
+        inputMediaType.Set(MediaTypeAttributeKeys.SampleSize, checked((uint)(device is not null ? (width * height * 3 / 2) : (width * height * 4))));
         MediaFactory.MFSetAttributeSize(inputMediaType, MediaTypeAttributeKeys.FrameSize, width, height).CheckError();
         SetFrameRate(inputMediaType, frameRate);
         MediaFactory.MFSetAttributeRatio(inputMediaType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1).CheckError();
+        ApplyInputVideoColorAttributes(inputMediaType, device is not null);
 
         _sinkWriter.SetInputMediaType(_streamIndex, inputMediaType, null);
         _sinkWriter.BeginWriting();
         _frameDurationHns = Math.Max(1, (long)Math.Round(HundredNanosecondsPerSecond / frameRate));
+        _gpuFrameLength = checked((int)(width * height * 3 / 2));
     }
 
     public void WriteFrame(byte[] bgraFrame, int frameLength, int repeatCount)
@@ -134,15 +142,45 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
             throw new InvalidOperationException("GPU texture 書き込み用の D3D manager が初期化されていません。");
         }
 
+        if (_nv12Converter is null)
+        {
+            throw new InvalidOperationException("NV12 converter が初期化されていません。");
+        }
+
+        var nv12Texture = _nv12Converter.Convert(texture);
+
         for (var index = 0; index < repeatCount; index++)
         {
-            using var mediaBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(typeof(ID3D11Texture2D).GUID, texture, 0, false);
-            using var sample = MediaFactory.MFCreateSample();
-            sample.AddBuffer(mediaBuffer);
-            sample.SampleTime = _submittedFrameCount * _frameDurationHns;
-            sample.SampleDuration = _frameDurationHns;
-            _sinkWriter.WriteSample(_streamIndex, sample);
-            _submittedFrameCount++;
+            try
+            {
+                using var mediaBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(typeof(ID3D11Texture2D).GUID, nv12Texture, 0, false);
+                using var contiguousBuffer = mediaBuffer.QueryInterfaceOrNull<IMF2DBuffer>();
+                if (contiguousBuffer is not null)
+                {
+                    mediaBuffer.CurrentLength = contiguousBuffer.ContiguousLength;
+                }
+                else
+                {
+                    mediaBuffer.CurrentLength = _gpuFrameLength;
+                }
+
+                MediaFactory.MFCreateVideoSampleFromSurface((IUnknown?)null, out var sample).CheckError();
+                using (sample)
+                {
+                    sample.AddBuffer(mediaBuffer);
+                    sample.SampleTime = _submittedFrameCount * _frameDurationHns;
+                    sample.SampleDuration = _frameDurationHns;
+                    _sinkWriter.WriteSample(_streamIndex, sample);
+                    _submittedFrameCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugTrace.WriteLine(
+                    "MediaFoundationHevcWriter",
+                    $"WriteTextureFrame failed frame={_submittedFrameCount} repeatIndex={index} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+                throw;
+            }
         }
     }
 
@@ -167,6 +205,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
 
         _disposed = true;
         _sinkWriter.Dispose();
+        _nv12Converter?.Dispose();
         _deviceManager?.Dispose();
         ShutdownMediaFoundationIfNeeded();
     }
@@ -206,5 +245,25 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         var fpsNumerator = (uint)Math.Clamp((int)Math.Round(frameRate * 1000.0), 1, int.MaxValue);
         const uint fpsDenominator = 1000;
         MediaFactory.MFSetAttributeRatio(attributes, MediaTypeAttributeKeys.FrameRate, fpsNumerator, fpsDenominator).CheckError();
+    }
+
+    private static void ApplyEncodedVideoColorAttributes(IMFAttributes attributes)
+    {
+        attributes.Set(MediaTypeAttributeKeys.VideoPrimaries, (uint)VideoPrimaries.Bt709);
+        attributes.Set(MediaTypeAttributeKeys.TransferFunction, (uint)VideoTransferFunction.Func709);
+        attributes.Set(MediaTypeAttributeKeys.YuvMatrix, (uint)VideoTransferMatrix.Bt709);
+        attributes.Set(MediaTypeAttributeKeys.VideoNominalRange, (uint)NominalRange.Range16_235);
+    }
+
+    private static void ApplyInputVideoColorAttributes(IMFAttributes attributes, bool gpuNv12Input)
+    {
+        attributes.Set(MediaTypeAttributeKeys.VideoPrimaries, (uint)VideoPrimaries.Bt709);
+        attributes.Set(
+            MediaTypeAttributeKeys.TransferFunction,
+            (uint)(gpuNv12Input ? VideoTransferFunction.Func709 : VideoTransferFunction.FuncSRGB));
+        attributes.Set(MediaTypeAttributeKeys.YuvMatrix, (uint)VideoTransferMatrix.Bt709);
+        attributes.Set(
+            MediaTypeAttributeKeys.VideoNominalRange,
+            (uint)(gpuNv12Input ? NominalRange.Range16_235 : NominalRange.Range0_255));
     }
 }
