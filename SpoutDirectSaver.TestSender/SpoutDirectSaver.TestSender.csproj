@@ -10,7 +10,18 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Spout.NETCore" Version="2.7.17" />
+    <PackageReference Include="Spout.NETCore" Version="2.7.17" ExcludeAssets="compile" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Spout.NETCore">
+      <HintPath>$(PkgSpout_NETCore)\lib\net8.0\Spout.NETCore.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(PkgSpout_NETCore)\lib\net8.0\Spout.dll">
+      <Link>Spout.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <ItemGroup>

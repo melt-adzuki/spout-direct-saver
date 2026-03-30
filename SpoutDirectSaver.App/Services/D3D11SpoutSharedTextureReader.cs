@@ -325,22 +325,22 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     {
         var vertexShaderBytecode = Vortice.D3DCompiler.Compiler.Compile(
             BlitShaderSource,
-            "SpoutDirectSaverBlit.hlsl",
             "vs_main",
+            "SpoutDirectSaverBlit.hlsl",
             "vs_5_0",
             ShaderFlags.OptimizationLevel3,
             EffectFlags.None);
         var copyPixelShaderBytecode = Vortice.D3DCompiler.Compiler.Compile(
             BlitShaderSource,
-            "SpoutDirectSaverBlit.hlsl",
             "ps_copy",
+            "SpoutDirectSaverBlit.hlsl",
             "ps_5_0",
             ShaderFlags.OptimizationLevel3,
             EffectFlags.None);
         var alphaPixelShaderBytecode = Vortice.D3DCompiler.Compiler.Compile(
             BlitShaderSource,
-            "SpoutDirectSaverBlit.hlsl",
             "ps_alpha",
+            "SpoutDirectSaverBlit.hlsl",
             "ps_5_0",
             ShaderFlags.OptimizationLevel3,
             EffectFlags.None);
@@ -417,12 +417,12 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _deviceContext!.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         _deviceContext.VSSetShader(_blitVertexShader);
         _deviceContext.PSSetShader(_copyPixelShader);
-        _deviceContext.PSSetShaderResource(0, _sharedTextureShaderView);
+        _deviceContext.PSSetShaderResource(0, _sharedTextureShaderView!);
         _deviceContext.PSSetSampler(0, _blitSampler);
         SetViewport(_width, _height);
         SetRenderTarget(slot.RenderTargetView);
         _deviceContext.Draw(3, 0);
-        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView?)null);
+        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
         ClearRenderTargets();
     }
 
@@ -451,8 +451,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         SetViewport(_width, _height);
         SetRenderTarget(_alphaRenderTargetView!);
         _deviceContext.Draw(3, 0);
-        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView?)null);
-        _deviceContext.PSSetConstantBuffer(0, (ID3D11Buffer?)null);
+        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
+        _deviceContext.PSSetConstantBuffer(0, (ID3D11Buffer)null!);
         ClearRenderTargets();
 
         _deviceContext.CopyResource(_alphaReadbackTexture!, _alphaRenderTexture!);

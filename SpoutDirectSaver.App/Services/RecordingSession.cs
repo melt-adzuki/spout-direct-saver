@@ -527,9 +527,10 @@ internal sealed class RecordingSession : IAsyncDisposable
             _compressSpoolFrames ??= true;
             recordedFrame.IsCompressed = _compressSpoolFrames.Value;
 
-            frame.PixelBuffer.Retain();
-            var comparisonFrame = frame.PixelBuffer;
-            var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, frame.PixelBuffer);
+            var pixelBuffer = frame.PixelBuffer ?? throw new InvalidOperationException("CPU frame payload が存在しません。");
+            pixelBuffer.Retain();
+            var comparisonFrame = pixelBuffer;
+            var request = new FrameWriteRequest(recordedFrame.FrameIndex, recordedFrame, pixelBuffer);
             try
             {
                 if (_writeSynchronously)

@@ -14,12 +14,23 @@
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
     <PackageReference Include="K4os.Compression.LZ4.Streams" Version="1.3.8" />
     <PackageReference Include="LibVLCSharp.WPF" Version="3.9.6" />
-    <PackageReference Include="Spout.NETCore" Version="2.7.17" />
+    <PackageReference Include="Spout.NETCore" Version="2.7.17" ExcludeAssets="compile" GeneratePathProperty="true" />
     <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23" />
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Spout.NETCore">
+      <HintPath>$(PkgSpout_NETCore)\lib\net8.0\Spout.NETCore.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(PkgSpout_NETCore)\lib\net8.0\Spout.dll">
+      <Link>Spout.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>
