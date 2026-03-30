@@ -855,7 +855,7 @@ VsOutput vs_main(uint vertexId : SV_VertexID)
     VsOutput output;
     float2 pos = float2((vertexId << 1) & 2, vertexId & 2);
     output.position = float4(pos * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    output.uv = float2(pos.x, 1.0 - pos.y);
+    output.uv = pos;
     return output;
 }
 
