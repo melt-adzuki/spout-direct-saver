@@ -24,6 +24,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly Channel<FrameWriteRequest> _compressionChannel;
     private readonly ConcurrentDictionary<int, PreparedFrameWriteRequest> _preparedFrames = new();
     private readonly SemaphoreSlim _preparedFrameSignal = new(0);
+    private readonly SemaphoreSlim? _preparedFrameSlots;
     private readonly Task[] _compressionTasks;
     private readonly Task _writerTask;
     private readonly bool _blockOnBackpressure;
@@ -88,6 +89,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             _temporaryDirectory = string.Empty;
             _spoolPath = string.Empty;
             _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(1);
+            _preparedFrameSlots = null;
             _compressionWorkerCount = 0;
             _remainingCompressionWorkers = 0;
             _compressionTasks = Array.Empty<Task>();
@@ -115,6 +117,8 @@ internal sealed class RecordingSession : IAsyncDisposable
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait
         });
+        var preparedFrameCapacity = Math.Max(channelCapacity, 1);
+        _preparedFrameSlots = new SemaphoreSlim(preparedFrameCapacity, preparedFrameCapacity);
 
         if (_writeSynchronously)
         {
@@ -606,60 +610,78 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             await foreach (var request in _compressionChannel.Reader.ReadAllAsync().ConfigureAwait(false))
             {
-                byte[] payload;
-                var payloadLength = request.PixelData.Length;
-                switch (request.PayloadKind)
+                if (_preparedFrameSlots is null)
                 {
-                    case FramePayloadKind.AlphaFromBgra:
-                    {
-                        var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
-                        payload = request.Frame.IsCompressed
-                            ? LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel)
-                            : alphaBuffer;
-                        payloadLength = request.Frame.IsCompressed ? payload.Length : alphaBuffer.Length;
-                        break;
-                    }
-                    case FramePayloadKind.AlphaPlane:
-                    {
-                        if (request.Frame.IsCompressed)
-                        {
-                            payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
-                            payloadLength = payload.Length;
-                        }
-                        else
-                        {
-                            payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
-                            request.PixelData.Span.CopyTo(payload);
-                            payloadLength = request.PixelData.Length;
-                        }
-
-                        break;
-                    }
-                    default:
-                    {
-                        if (request.Frame.IsCompressed)
-                        {
-                            payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
-                            payloadLength = payload.Length;
-                        }
-                        else
-                        {
-                            payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
-                            request.PixelData.Span.CopyTo(payload);
-                            payloadLength = request.PixelData.Length;
-                        }
-
-                        break;
-                    }
+                    throw new InvalidOperationException("prepared frame slot limiter が初期化されていません。");
                 }
 
-                _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
-                    request.Sequence,
-                    request.Frame,
-                    payload,
-                    payloadLength);
-                request.PixelData.Dispose();
-                _preparedFrameSignal.Release();
+                await _preparedFrameSlots.WaitAsync().ConfigureAwait(false);
+                var preparedFrameQueued = false;
+                byte[] payload;
+                try
+                {
+                    var payloadLength = request.PixelData.Length;
+                    switch (request.PayloadKind)
+                    {
+                        case FramePayloadKind.AlphaFromBgra:
+                        {
+                            var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
+                            payload = request.Frame.IsCompressed
+                                ? LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel)
+                                : alphaBuffer;
+                            payloadLength = request.Frame.IsCompressed ? payload.Length : alphaBuffer.Length;
+                            break;
+                        }
+                        case FramePayloadKind.AlphaPlane:
+                        {
+                            if (request.Frame.IsCompressed)
+                            {
+                                payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
+                                payloadLength = payload.Length;
+                            }
+                            else
+                            {
+                                payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
+                                request.PixelData.Span.CopyTo(payload);
+                                payloadLength = request.PixelData.Length;
+                            }
+
+                            break;
+                        }
+                        default:
+                        {
+                            if (request.Frame.IsCompressed)
+                            {
+                                payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
+                                payloadLength = payload.Length;
+                            }
+                            else
+                            {
+                                payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
+                                request.PixelData.Span.CopyTo(payload);
+                                payloadLength = request.PixelData.Length;
+                            }
+
+                            break;
+                        }
+                    }
+
+                    _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
+                        request.Sequence,
+                        request.Frame,
+                        payload,
+                        payloadLength);
+                    preparedFrameQueued = true;
+                    _preparedFrameSignal.Release();
+                }
+                finally
+                {
+                    request.PixelData.Dispose();
+                    if (!preparedFrameQueued)
+                    {
+                        _preparedFrameSlots.Release();
+                    }
+                }
             }
         }
         finally
@@ -680,9 +702,16 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             if (_preparedFrames.TryRemove(nextSequence, out var prepared))
             {
-                await WritePreparedFrameAsync(fileStream, prepared).ConfigureAwait(false);
-                nextSequence++;
-                continue;
+                try
+                {
+                    await WritePreparedFrameAsync(fileStream, prepared).ConfigureAwait(false);
+                    nextSequence++;
+                    continue;
+                }
+                finally
+                {
+                    _preparedFrameSlots?.Release();
+                }
             }
 
             if (Volatile.Read(ref _remainingCompressionWorkers) == 0)
