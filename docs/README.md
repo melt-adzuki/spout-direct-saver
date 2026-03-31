@@ -93,7 +93,7 @@ Primary concerns:
 -> `FramePacket`
 -> `RecordingSession`
 -> RGB writer
--> alpha writer / spool
+-> alpha HEVC writer / spool
 
 ### CPU Recording Path
 

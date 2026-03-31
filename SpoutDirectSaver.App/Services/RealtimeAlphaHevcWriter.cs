@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 
 namespace SpoutDirectSaver.App.Services;
 
-internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
+internal sealed class RealtimeAlphaHevcWriter : IAsyncDisposable
 {
     private readonly Process _process;
     private readonly NamedPipeServerStream _pipeServer;
@@ -22,7 +22,7 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
     private bool _disposed;
     private bool _pipeClosed;
 
-    public RealtimeGrayFfv1Writer(
+    public RealtimeAlphaHevcWriter(
         uint width,
         uint height,
         double frameRate,
@@ -49,9 +49,10 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
             0,
             8 * 1024 * 1024);
         _pipeConnectionTask = _pipeServer.WaitForConnectionAsync();
+        var gop = Math.Max(1, (int)Math.Round(frameRate));
 
         var arguments =
-            $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {frameRate:0.###} -blocksize 16777216 -i \"{pipePath}\" -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt gray -cues_to_front 1 \"{outputPath}\"";
+            $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {frameRate:0.###} -blocksize 16777216 -i \"{pipePath}\" -an -vf format=yuv420p -c:v hevc_nvenc -preset:v p3 -tune:v hq -rc:v vbr -cq:v 19 -b:v 0 -bf:v 0 -g:v {gop} -pix_fmt:v yuv420p -profile:v main -movflags +faststart -video_track_timescale 120000 \"{outputPath}\"";
 
         var startInfo = new ProcessStartInfo
         {
@@ -85,7 +86,7 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
         _writeTask = Task.Factory.StartNew(
             static state =>
             {
-                var writer = (RealtimeGrayFfv1Writer)state!;
+                var writer = (RealtimeAlphaHevcWriter)state!;
                 using var schedulingScope = WindowsScheduling.EnterWriterProfile();
                 writer.WriteLoopAsync().GetAwaiter().GetResult();
             },

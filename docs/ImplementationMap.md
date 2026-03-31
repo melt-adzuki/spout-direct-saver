@@ -126,11 +126,11 @@ Inspect these first for:
 
 ## Alpha Path
 
-### `SpoutDirectSaver.App/Services/RealtimeGrayFfv1Writer.cs`
+### `SpoutDirectSaver.App/Services/RealtimeAlphaHevcWriter.cs`
 
 Owns:
 
-- realtime grayscale alpha writer
+- realtime HEVC alpha writer
 
 ### `SpoutDirectSaver.App/Services/VideoExportService.cs`
 

@@ -14,7 +14,7 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
     private readonly Channel<PendingFrame> _channel;
     private readonly Task _writerTask;
     private readonly MediaFoundationHevcWriter _mainWriter;
-    private readonly RealtimeGrayFfv1Writer _alphaWriter;
+    private readonly RealtimeAlphaHevcWriter _alphaWriter;
     private readonly string _temporaryDirectory;
     private readonly string _mainVideoPath;
     private readonly string _alphaVideoPath;
@@ -41,10 +41,10 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
         Directory.CreateDirectory(_temporaryDirectory);
 
         _mainVideoPath = Path.Combine(_temporaryDirectory, "rgb.mp4");
-        _alphaVideoPath = Path.Combine(_temporaryDirectory, "alpha.mkv");
+        _alphaVideoPath = Path.Combine(_temporaryDirectory, "alpha.mp4");
 
         _mainWriter = new MediaFoundationHevcWriter(width, height, frameRate, _mainVideoPath);
-        _alphaWriter = new RealtimeGrayFfv1Writer(width, height, frameRate, _alphaVideoPath);
+        _alphaWriter = new RealtimeAlphaHevcWriter(width, height, frameRate, _alphaVideoPath);
 
         _channel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(Math.Max(queueCapacity, 1))
         {
@@ -238,15 +238,15 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
 
         if (_disableAlphaWriter)
         {
-            return $"-y -i \"{_mainVideoPath}\" -map 0:v:0 -c copy -cues_to_front 1 \"{_finalOutputPath}\"";
+            return $"-y -i \"{_mainVideoPath}\" -map 0:v:0 -c copy -movflags +faststart \"{_finalOutputPath}\"";
         }
 
         if (_disableMainWriter)
         {
-            return $"-y -i \"{_alphaVideoPath}\" -map 0:v:0 -c copy -cues_to_front 1 \"{_finalOutputPath}\"";
+            return $"-y -i \"{_alphaVideoPath}\" -map 0:v:0 -c copy -movflags +faststart \"{_finalOutputPath}\"";
         }
 
-        return $"-y -i \"{_mainVideoPath}\" -i \"{_alphaVideoPath}\" -map 0:v:0 -map 1:v:0 -c copy -cues_to_front 1 \"{_finalOutputPath}\"";
+        return $"-y -i \"{_mainVideoPath}\" -i \"{_alphaVideoPath}\" -map 0:v:0 -map 1:v:0 -c copy -movflags +faststart \"{_finalOutputPath}\"";
     }
 
     private static bool IsEnabled(string variableName)

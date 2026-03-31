@@ -153,9 +153,9 @@ static List<BenchmarkCase> BuildCases()
                     bytesWritten);
             }),
         BenchmarkCase.Ffmpeg(
-            "alpha_ffv1_gray_mkv",
+            "alpha_hevc_gray_mp4",
             "alpha-sidecar",
-            ".mkv",
+            ".mp4",
             RawInputKind.Gray,
             static options =>
             [
@@ -166,19 +166,24 @@ static List<BenchmarkCase> BuildCases()
                 "-framerate", options.FrameRate.ToString(Culture.Invariant),
                 "-i", "-",
                 "-an",
-                "-c:v", "ffv1",
-                "-level", "3",
-                "-coder", "1",
-                "-context", "1",
-                "-g", "1",
-                "-slicecrc", "1",
-                "-pix_fmt", "gray",
-                "-cues_to_front", "1"
+                "-vf", "format=yuv420p",
+                "-c:v", "hevc_nvenc",
+                "-preset:v", "p3",
+                "-tune:v", "hq",
+                "-rc:v", "vbr",
+                "-cq:v", "19",
+                "-b:v", "0",
+                "-bf:v", "0",
+                "-g:v", Math.Max(1, (int)Math.Round(options.FrameRate)).ToString(Culture.Invariant),
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                "-movflags", "+faststart",
+                "-video_track_timescale", "120000"
             ]),
         BenchmarkCase.Ffmpeg(
-            "ffv1_bgra_mkv",
+            "hevc_bgra_mp4",
             "intermediate",
-            ".mkv",
+            ".mp4",
             RawInputKind.Bgra,
             static options =>
             [
@@ -189,14 +194,19 @@ static List<BenchmarkCase> BuildCases()
                 "-framerate", options.FrameRate.ToString(Culture.Invariant),
                 "-i", "-",
                 "-an",
-                "-c:v", "ffv1",
-                "-level", "3",
-                "-coder", "1",
-                "-context", "1",
-                "-g", "1",
-                "-slicecrc", "1",
-                "-pix_fmt", "bgra",
-                "-cues_to_front", "1"
+                "-vf", "format=yuv420p",
+                "-c:v", "hevc_nvenc",
+                "-preset:v", "p3",
+                "-tune:v", "hq",
+                "-rc:v", "vbr",
+                "-cq:v", "19",
+                "-b:v", "0",
+                "-bf:v", "0",
+                "-g:v", Math.Max(1, (int)Math.Round(options.FrameRate)).ToString(Culture.Invariant),
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                "-movflags", "+faststart",
+                "-video_track_timescale", "120000"
             ]),
         BenchmarkCase.Ffmpeg(
             "utvideo_gbrap_avi",
@@ -292,9 +302,9 @@ static List<BenchmarkCase> BuildCases()
                 "-pix_fmt", "gbrap12le"
             ]),
         BenchmarkCase.Ffmpeg(
-            "split_hevc420_nvenc_ffv1alpha_mkv",
+            "split_hevc420_nvenc_hevcalpha_mp4",
             "project-default-family",
-            ".mkv",
+            ".mp4",
             RawInputKind.Bgra,
             static options =>
             [
@@ -317,19 +327,23 @@ static List<BenchmarkCase> BuildCases()
                 "-pix_fmt:v:0", "yuv420p",
                 "-profile:v:0", "main",
                 "-map", "[aout]",
-                "-c:v:1", "ffv1",
-                "-level:v:1", "3",
-                "-coder:v:1", "1",
-                "-context:v:1", "1",
-                "-g:v:1", "1",
-                "-slicecrc:v:1", "1",
-                "-pix_fmt:v:1", "gray",
-                "-cues_to_front", "1"
+                "-c:v:1", "hevc_nvenc",
+                "-preset:v:1", "p3",
+                "-tune:v:1", "hq",
+                "-rc:v:1", "vbr",
+                "-cq:v:1", "19",
+                "-b:v:1", "0",
+                "-bf:v:1", "0",
+                "-g:v:1", Math.Max(1, (int)Math.Round(options.FrameRate)).ToString(Culture.Invariant),
+                "-pix_fmt:v:1", "yuv420p",
+                "-profile:v:1", "main",
+                "-movflags", "+faststart",
+                "-video_track_timescale", "120000"
             ]),
         BenchmarkCase.Ffmpeg(
-            "split_h264420_nvenc_ffv1alpha_mkv",
+            "split_h264420_nvenc_hevcalpha_mp4",
             "project-default-family",
-            ".mkv",
+            ".mp4",
             RawInputKind.Bgra,
             static options =>
             [
@@ -352,14 +366,18 @@ static List<BenchmarkCase> BuildCases()
                 "-pix_fmt:v:0", "yuv420p",
                 "-profile:v:0", "high",
                 "-map", "[aout]",
-                "-c:v:1", "ffv1",
-                "-level:v:1", "3",
-                "-coder:v:1", "1",
-                "-context:v:1", "1",
-                "-g:v:1", "1",
-                "-slicecrc:v:1", "1",
-                "-pix_fmt:v:1", "gray",
-                "-cues_to_front", "1"
+                "-c:v:1", "hevc_nvenc",
+                "-preset:v:1", "p3",
+                "-tune:v:1", "hq",
+                "-rc:v:1", "vbr",
+                "-cq:v:1", "19",
+                "-b:v:1", "0",
+                "-bf:v:1", "0",
+                "-g:v:1", Math.Max(1, (int)Math.Round(options.FrameRate)).ToString(Culture.Invariant),
+                "-pix_fmt:v:1", "yuv420p",
+                "-profile:v:1", "main",
+                "-movflags", "+faststart",
+                "-video_track_timescale", "120000"
             ])
     ];
 }

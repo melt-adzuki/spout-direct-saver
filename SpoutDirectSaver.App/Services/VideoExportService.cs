@@ -25,12 +25,13 @@ internal sealed class VideoExportService
     {
         await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var gop = Math.Max(1, (int)Math.Round(outputFrameRate));
 
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
             Arguments =
-                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -c:v ffv1 -level 3 -coder 1 -context 1 -g 1 -slicecrc 1 -pix_fmt gray -cues_to_front 1 \"{outputPath}\"",
+                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -vf format=yuv420p -c:v hevc_nvenc -preset:v p3 -tune:v hq -rc:v vbr -cq:v 19 -b:v 0 -bf:v 0 -g:v {gop} -pix_fmt:v yuv420p -profile:v main -movflags +faststart -video_track_timescale 120000 \"{outputPath}\"",
             WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -65,7 +66,7 @@ internal sealed class VideoExportService
         {
             FileName = "ffmpeg",
             Arguments =
-                $"-y -i \"{rgbVideoPath}\" -i \"{alphaVideoPath}\" -map 0:v:0 -map 1:v:0 -c copy -cues_to_front 1 \"{outputPath}\"",
+                $"-y -i \"{rgbVideoPath}\" -i \"{alphaVideoPath}\" -map 0:v:0 -map 1:v:0 -c copy -movflags +faststart \"{outputPath}\"",
             WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -88,7 +89,7 @@ internal sealed class VideoExportService
         {
             FileName = "ffmpeg",
             Arguments =
-                $"-y -i \"{inputPath}\" -map 0:v:0 -c copy -cues_to_front 1 \"{outputPath}\"",
+                $"-y -i \"{inputPath}\" -map 0:v:0 -c copy -movflags +faststart \"{outputPath}\"",
             WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardOutput = true,
             RedirectStandardError = true,

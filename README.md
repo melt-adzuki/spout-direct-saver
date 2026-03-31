@@ -51,8 +51,8 @@ For most users, the recommended mode is the default one exposed by the app.
 
 Depending on the selected mode, the recording may be saved as:
 
-- a main video file
-- a main video file plus an alpha sidecar file
+- a main MP4 video file
+- a main MP4 video file plus an alpha MP4 sidecar file
 - a single lossless file
 
 ## Validation Tools

@@ -77,7 +77,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _useRealtimeEncoding = encoderOption.RequiresRealtimeEncoding;
         _useRealtimeRgbIntermediate =
             !_useRealtimeEncoding &&
-            encoderOption.Kind == EncoderProfileKind.HevcNvencFfv1AlphaMkv;
+            encoderOption.Kind == EncoderProfileKind.HevcNvencMp4AlphaMp4;
         _disableHybridRgbIntermediate = IsEnabled("SPOUT_DIRECT_SAVER_DISABLE_HYBRID_RGB");
         _disableHybridAlphaSpool = IsEnabled("SPOUT_DIRECT_SAVER_DISABLE_HYBRID_ALPHA");
         _spoolCompressionLevel = ResolveSpoolCompressionLevel(encoderOption);
@@ -107,7 +107,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             ? Path.Combine(_temporaryDirectory, "rgb.mp4")
             : null;
         _alphaTrackPath = _useRealtimeRgbIntermediate
-            ? Path.Combine(_temporaryDirectory, "alpha.mkv")
+            ? Path.Combine(_temporaryDirectory, "alpha.mp4")
             : null;
 
         Directory.CreateDirectory(_temporaryDirectory);
@@ -1088,7 +1088,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         var directory = Path.GetDirectoryName(outputPath) ?? string.Empty;
         var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);
-        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mkv");
+        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mp4");
     }
 
     private static ulong ComputeFingerprint(ReadOnlySpan<byte> pixelData)
