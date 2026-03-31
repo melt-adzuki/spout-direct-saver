@@ -10,7 +10,7 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class D3D11Nv12TextureConverter : IDisposable
 {
-    private const int OutputTextureCount = 10;
+    private const int OutputTextureCount = 32;
     private readonly ID3D11Texture2D[] _outputTextures;
     private readonly ID3D11DeviceContext _deviceContext;
     private readonly ID3D11VideoDevice _videoDevice;
@@ -109,8 +109,18 @@ internal sealed class D3D11Nv12TextureConverter : IDisposable
             InputSurface = GetOrCreateInputView(inputTexture)
         };
 
-        _videoContext.VideoProcessorBlt(_videoProcessor, outputView, 0, 1, [stream]).CheckError();
-        _deviceContext.Flush();
+        try
+        {
+            _videoContext.VideoProcessorBlt(_videoProcessor, outputView, 0, 1, [stream]).CheckError();
+        }
+        catch (Exception ex)
+        {
+            DebugTrace.WriteLine(
+                "D3D11Nv12TextureConverter",
+                $"Convert failed outputIndex={outputIndex} inputPtr=0x{inputTexture.NativePointer.ToInt64():X} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
+
         return outputTexture;
     }
 

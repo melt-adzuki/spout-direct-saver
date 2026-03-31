@@ -15,6 +15,9 @@ namespace SpoutDirectSaver.App.Services;
 internal sealed class RecordingSession : IAsyncDisposable
 {
     private const double MinimumFrameDurationSeconds = 1.0 / 120.0;
+    private const ulong SharedSlotProducerAcquireKey = 0;
+    private const ulong SharedSlotConsumerFirstKey = 1;
+    private const ulong SharedSlotProducerReturnKey = 0;
     private readonly object _gate = new();
     private readonly EncoderOption _encoderOption;
     private readonly string _outputPath;
@@ -42,7 +45,6 @@ internal sealed class RecordingSession : IAsyncDisposable
     private RecordedFrame? _currentFrame;
     private PixelBufferLease? _lastUniqueFrame;
     private GpuTextureFrame? _lastGpuFrame;
-    private PixelBufferLease? _lastAlphaFrame;
     private ulong _lastUniqueFingerprint;
     private uint _recordedWidth;
     private uint _recordedHeight;
@@ -57,6 +59,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private int _remainingCompressionWorkers;
     private RealtimeHybridWriter? _realtimeWriter;
     private RealtimeRgbNvencWriter? _rgbIntermediateWriter;
+    private GpuAlphaPlaneExtractor? _gpuAlphaExtractor;
     private readonly string? _rgbIntermediatePath;
     private readonly string? _alphaTrackPath;
 
@@ -118,7 +121,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _compressionChannel = Channel.CreateBounded<FrameWriteRequest>(new BoundedChannelOptions(Math.Max(channelCapacity, 1))
         {
             SingleReader = false,
-            SingleWriter = true,
+            SingleWriter = false,
             FullMode = BoundedChannelFullMode.Wait
         });
         var preparedFrameCapacity = Math.Max(channelCapacity, 1);
@@ -145,7 +148,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                     {
                         var session = (RecordingSession)state!;
                         using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                        session.CompressFramesAsync().GetAwaiter().GetResult();
+                        session.CompressFrames();
                     },
                     this,
                     CancellationToken.None,
@@ -158,7 +161,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                 {
                     var session = (RecordingSession)state!;
                     using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                    session.WritePreparedFramesAsync().GetAwaiter().GetResult();
+                    session.WritePreparedFrames();
                 },
                 this,
                 CancellationToken.None,
@@ -226,6 +229,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         RecordedFrame[] framesToEncode = [];
         RealtimeHybridWriter? realtimeWriter = null;
         RealtimeRgbNvencWriter? rgbIntermediateWriter = null;
+        GpuAlphaPlaneExtractor? gpuAlphaExtractor = null;
 
         lock (_gate)
         {
@@ -249,11 +253,10 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
             else if (_useRealtimeRgbIntermediate)
             {
-                if (_currentFrame is not null && _lastGpuFrame is not null && _lastAlphaFrame is not null)
+                if (_currentFrame is not null && _lastGpuFrame is not null)
                 {
-                    QueueHybridFrame(_currentFrame, _lastGpuFrame, _lastAlphaFrame);
+                    QueueHybridFrame(_currentFrame, _lastGpuFrame);
                     _lastGpuFrame = null;
-                    _lastAlphaFrame = null;
                 }
                 else if (_currentFrame is not null && _lastUniqueFrame is not null)
                 {
@@ -261,9 +264,9 @@ internal sealed class RecordingSession : IAsyncDisposable
                     _lastUniqueFrame = null;
                 }
 
-                _compressionChannel.Writer.TryComplete();
                 framesToEncode = _frames.ToArray();
                 rgbIntermediateWriter = _rgbIntermediateWriter;
+                gpuAlphaExtractor = _gpuAlphaExtractor;
             }
             else
             {
@@ -297,6 +300,12 @@ internal sealed class RecordingSession : IAsyncDisposable
                     await rgbIntermediateWriter!.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 }
 
+                if (!_disableHybridAlphaSpool && gpuAlphaExtractor is not null)
+                {
+                    await gpuAlphaExtractor.CompleteAsync().ConfigureAwait(false);
+                }
+
+                _compressionChannel.Writer.TryComplete();
                 if (_compressionTasks.Length > 0)
                 {
                     await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
@@ -371,8 +380,19 @@ internal sealed class RecordingSession : IAsyncDisposable
             _lastUniqueFrame = null;
             _lastGpuFrame?.Dispose();
             _lastGpuFrame = null;
-            _lastAlphaFrame?.Dispose();
-            _lastAlphaFrame = null;
+            if (_gpuAlphaExtractor is not null)
+            {
+                try
+                {
+                    await _gpuAlphaExtractor.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Ignore cleanup-time worker failures.
+                }
+
+                _gpuAlphaExtractor = null;
+            }
             _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
@@ -411,6 +431,12 @@ internal sealed class RecordingSession : IAsyncDisposable
             }
             else if (_useRealtimeRgbIntermediate)
             {
+                if (_gpuAlphaExtractor is not null)
+                {
+                    await _gpuAlphaExtractor.DisposeAsync().ConfigureAwait(false);
+                    _gpuAlphaExtractor = null;
+                }
+
                 _compressionChannel.Writer.TryComplete();
 
                 if (_rgbIntermediateWriter is not null)
@@ -446,8 +472,6 @@ internal sealed class RecordingSession : IAsyncDisposable
             _lastUniqueFrame = null;
             _lastGpuFrame?.Dispose();
             _lastGpuFrame = null;
-            _lastAlphaFrame?.Dispose();
-            _lastAlphaFrame = null;
             _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
@@ -460,7 +484,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             throw new InvalidOperationException("GPU frame は HEVC hybrid 録画でのみ利用できます。");
         }
 
-        if (frame.GpuTexture is null || frame.AlphaBuffer is null)
+        if (frame.GpuTexture is null)
         {
             throw new InvalidOperationException("GPU frame payload が不足しています。");
         }
@@ -587,7 +611,6 @@ internal sealed class RecordingSession : IAsyncDisposable
         _lastUniqueFrame?.Dispose();
         _lastUniqueFrame = null;
         _lastGpuFrame = frame.GpuTexture!;
-        _lastAlphaFrame = frame.AlphaBuffer!;
     }
 
     private void FlushPendingHybridFrame()
@@ -597,11 +620,10 @@ internal sealed class RecordingSession : IAsyncDisposable
             return;
         }
 
-        if (_lastGpuFrame is not null && _lastAlphaFrame is not null)
+        if (_lastGpuFrame is not null)
         {
-            QueueHybridFrame(_currentFrame, _lastGpuFrame, _lastAlphaFrame);
+            QueueHybridFrame(_currentFrame, _lastGpuFrame);
             _lastGpuFrame = null;
-            _lastAlphaFrame = null;
             _lastUniqueFrame?.Dispose();
             _lastUniqueFrame = null;
             return;
@@ -628,82 +650,85 @@ internal sealed class RecordingSession : IAsyncDisposable
         _currentFrame.DurationSeconds = Math.Max(duration, MinimumFrameDurationSeconds);
     }
 
-    private async Task CompressFramesAsync()
+    private void CompressFrames()
     {
         try
         {
-            await foreach (var request in _compressionChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+            while (_compressionChannel.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
             {
-                if (_preparedFrameSlots is null)
+                while (_compressionChannel.Reader.TryRead(out var request))
                 {
-                    throw new InvalidOperationException("prepared frame slot limiter が初期化されていません。");
-                }
-
-                await _preparedFrameSlots.WaitAsync().ConfigureAwait(false);
-                var preparedFrameQueued = false;
-                byte[] payload;
-                try
-                {
-                    var payloadLength = request.PixelData.Length;
-                    switch (request.PayloadKind)
+                    if (_preparedFrameSlots is null)
                     {
-                        case FramePayloadKind.AlphaFromBgra:
-                        {
-                            var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
-                            payload = request.Frame.IsCompressed
-                                ? LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel)
-                                : alphaBuffer;
-                            payloadLength = request.Frame.IsCompressed ? payload.Length : alphaBuffer.Length;
-                            break;
-                        }
-                        case FramePayloadKind.AlphaPlane:
-                        {
-                            if (request.Frame.IsCompressed)
-                            {
-                                payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
-                                payloadLength = payload.Length;
-                            }
-                            else
-                            {
-                                payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
-                                request.PixelData.Span.CopyTo(payload);
-                                payloadLength = request.PixelData.Length;
-                            }
-
-                            break;
-                        }
-                        default:
-                        {
-                            if (request.Frame.IsCompressed)
-                            {
-                                payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
-                                payloadLength = payload.Length;
-                            }
-                            else
-                            {
-                                payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
-                                request.PixelData.Span.CopyTo(payload);
-                                payloadLength = request.PixelData.Length;
-                            }
-
-                            break;
-                        }
+                        throw new InvalidOperationException("prepared frame slot limiter が初期化されていません。");
                     }
 
-                    _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
-                        request.Sequence,
-                        request.Frame,
-                        payload,
-                        payloadLength);
-                    preparedFrameQueued = true;
-                    _preparedFrameSignal.Release();
-                }
-                finally
-                {
-                    request.PixelData.Dispose();
-                    if (!preparedFrameQueued)
+                    _preparedFrameSlots.Wait();
+                    var preparedFrameQueued = false;
+                    byte[] payload;
+                    try
                     {
-                        _preparedFrameSlots.Release();
+                        var payloadLength = request.PixelData.Length;
+                        switch (request.PayloadKind)
+                        {
+                            case FramePayloadKind.AlphaFromBgra:
+                            {
+                                var alphaBuffer = ExtractAlphaPlane(request.PixelData.Span);
+                                payload = request.Frame.IsCompressed
+                                    ? LZ4Pickler.Pickle(alphaBuffer, _spoolCompressionLevel)
+                                    : alphaBuffer;
+                                payloadLength = request.Frame.IsCompressed ? payload.Length : alphaBuffer.Length;
+                                break;
+                            }
+                            case FramePayloadKind.AlphaPlane:
+                            {
+                                if (request.Frame.IsCompressed)
+                                {
+                                    payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
+                                    payloadLength = payload.Length;
+                                }
+                                else
+                                {
+                                    payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
+                                    request.PixelData.Span.CopyTo(payload);
+                                    payloadLength = request.PixelData.Length;
+                                }
+
+                                break;
+                            }
+                            default:
+                            {
+                                if (request.Frame.IsCompressed)
+                                {
+                                    payload = LZ4Pickler.Pickle(request.PixelData.Span, _spoolCompressionLevel);
+                                    payloadLength = payload.Length;
+                                }
+                                else
+                                {
+                                    payload = GC.AllocateUninitializedArray<byte>(request.PixelData.Length);
+                                    request.PixelData.Span.CopyTo(payload);
+                                    payloadLength = request.PixelData.Length;
+                                }
+
+                                break;
+                            }
+                        }
+
+                        _preparedFrames[request.Sequence] = new PreparedFrameWriteRequest(
+                            request.Sequence,
+                            request.Frame,
+                            payload,
+                            payloadLength);
+                        preparedFrameQueued = true;
+                        _preparedFrameSignal.Release();
+                    }
+                    finally
+                    {
+                        request.PixelData.Dispose();
+                        if (!preparedFrameQueued)
+                        {
+                            _preparedFrameSlots.Release();
+                        }
                     }
                 }
             }
@@ -717,9 +742,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    private async Task WritePreparedFramesAsync()
+    private void WritePreparedFrames()
     {
-        await using var fileStream = CreateSpoolStream();
+        using var fileStream = CreateSpoolStream();
         var nextSequence = 1;
 
         while (true)
@@ -728,7 +753,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             {
                 try
                 {
-                    await WritePreparedFrameAsync(fileStream, prepared).ConfigureAwait(false);
+                    WritePreparedFrame(fileStream, prepared);
                     nextSequence++;
                     continue;
                 }
@@ -748,10 +773,10 @@ internal sealed class RecordingSession : IAsyncDisposable
                 throw new InvalidOperationException("一時フレームスプールの順序が壊れています。");
             }
 
-            await _preparedFrameSignal.WaitAsync().ConfigureAwait(false);
+            _preparedFrameSignal.Wait();
         }
 
-        await fileStream.FlushAsync().ConfigureAwait(false);
+        fileStream.Flush();
     }
 
     private void WriteFrameSynchronously(FrameWriteRequest request)
@@ -812,10 +837,10 @@ internal sealed class RecordingSession : IAsyncDisposable
         request.PixelData.Dispose();
     }
 
-    private async Task WritePreparedFrameAsync(FileStream fileStream, PreparedFrameWriteRequest preparedFrame)
+    private void WritePreparedFrame(FileStream fileStream, PreparedFrameWriteRequest preparedFrame)
     {
         var frameOffset = fileStream.Position;
-        await fileStream.WriteAsync(preparedFrame.Payload.AsMemory(0, preparedFrame.Length)).ConfigureAwait(false);
+        fileStream.Write(preparedFrame.Payload, 0, preparedFrame.Length);
         preparedFrame.Frame.SpoolOffset = frameOffset;
         preparedFrame.Frame.SpoolLength = checked((int)(fileStream.Position - frameOffset));
     }
@@ -835,7 +860,14 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         if (_blockOnBackpressure)
         {
+            var enqueueStarted = Stopwatch.GetTimestamp();
             _compressionChannel.Writer.WriteAsync(request).AsTask().GetAwaiter().GetResult();
+            DebugTrace.WriteTimingIfSlow(
+                "RecordingSession",
+                "Alpha/Spool enqueue",
+                enqueueStarted,
+                2.0,
+                $"session={_traceId} seq={request.Sequence} kind={request.PayloadKind}");
             return true;
         }
 
@@ -901,7 +933,7 @@ internal sealed class RecordingSession : IAsyncDisposable
         _outputFrameRate = GetOutputFrameRate();
         DebugTrace.WriteLine(
             "RecordingSession",
-            $"start rgb writer session={_traceId} path={_rgbIntermediatePath} mode=gpu");
+            $"start rgb writer session={_traceId} path={_rgbIntermediatePath} mode=gpu-shared-device");
         _rgbIntermediateWriter = new RealtimeRgbNvencWriter(
             _recordedWidth,
             _recordedHeight,
@@ -933,6 +965,22 @@ internal sealed class RecordingSession : IAsyncDisposable
             _rgbIntermediatePath);
     }
 
+    private void EnsureGpuAlphaExtractorStarted(GpuTextureFrame gpuFrame)
+    {
+        if (!_useRealtimeRgbIntermediate || _disableHybridAlphaSpool || _gpuAlphaExtractor is not null)
+        {
+            return;
+        }
+
+        DebugTrace.WriteLine(
+            "RecordingSession",
+            $"start gpu alpha extractor session={_traceId} size={_recordedWidth}x{_recordedHeight}");
+        _gpuAlphaExtractor = new GpuAlphaPlaneExtractor(
+            gpuFrame.Device,
+            _recordedWidth,
+            _recordedHeight);
+    }
+
     private void QueueFrameForRealtimeEncode(RecordedFrame frame, PixelBufferLease pixelData)
     {
         EnsureRealtimeWriterStarted();
@@ -945,11 +993,18 @@ internal sealed class RecordingSession : IAsyncDisposable
         var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
         var repeatCount = targetTotalFrames - _emittedTimelineFrames;
 
+        var queueStarted = Stopwatch.GetTimestamp();
         _realtimeWriter.QueueFrame(pixelData, repeatCount);
+        DebugTrace.WriteTimingIfSlow(
+            "RecordingSession",
+            "Realtime writer enqueue",
+            queueStarted,
+            2.0,
+            $"session={_traceId} frame={frame.FrameIndex} repeat={repeatCount}");
         _emittedTimelineFrames = targetTotalFrames;
     }
 
-    private void QueueFrameForRealtimeRgbIntermediate(RecordedFrame frame, GpuTextureFrame gpuFrame)
+    private void QueueFrameForRealtimeRgbIntermediate(RecordedFrame frame, GpuTextureFrame gpuFrame, ulong lockKey, ulong releaseKey)
     {
         EnsureRgbIntermediateWriterStarted(gpuFrame);
         if (_rgbIntermediateWriter is null)
@@ -961,7 +1016,14 @@ internal sealed class RecordingSession : IAsyncDisposable
         var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
         var repeatCount = targetTotalFrames - _emittedTimelineFrames;
 
-        _rgbIntermediateWriter.QueueFrame(gpuFrame, repeatCount);
+        var queueStarted = Stopwatch.GetTimestamp();
+        _rgbIntermediateWriter.QueueFrame(gpuFrame, repeatCount, lockKey, releaseKey);
+        DebugTrace.WriteTimingIfSlow(
+            "RecordingSession",
+            "RGB intermediate enqueue",
+            queueStarted,
+            2.0,
+            $"session={_traceId} frame={frame.FrameIndex} repeat={repeatCount} mode=gpu lockKey={lockKey} releaseKey={releaseKey}");
         _emittedTimelineFrames = targetTotalFrames;
     }
 
@@ -977,7 +1039,14 @@ internal sealed class RecordingSession : IAsyncDisposable
         var targetTotalFrames = Math.Max(_emittedTimelineFrames + 1, (int)Math.Round(_accumulatedTimelineFrames));
         var repeatCount = targetTotalFrames - _emittedTimelineFrames;
 
+        var queueStarted = Stopwatch.GetTimestamp();
         _rgbIntermediateWriter.QueueFrame(pixelData, repeatCount);
+        DebugTrace.WriteTimingIfSlow(
+            "RecordingSession",
+            "RGB intermediate enqueue",
+            queueStarted,
+            2.0,
+            $"session={_traceId} frame={frame.FrameIndex} repeat={repeatCount} mode=cpu");
         _emittedTimelineFrames = targetTotalFrames;
     }
 
@@ -1007,34 +1076,61 @@ internal sealed class RecordingSession : IAsyncDisposable
         pixelData.Dispose();
     }
 
-    private void QueueHybridFrame(RecordedFrame frame, GpuTextureFrame gpuFrame, PixelBufferLease alphaData)
+    private void QueueHybridFrame(RecordedFrame frame, GpuTextureFrame gpuFrame)
     {
+        var nextLockKey = SharedSlotConsumerFirstKey;
         if (!_disableHybridAlphaSpool)
         {
-            var request = new FrameWriteRequest(frame.FrameIndex, frame, alphaData, FramePayloadKind.AlphaPlane);
-            if (_writeSynchronously)
+            EnsureGpuAlphaExtractorStarted(gpuFrame);
+            if (_gpuAlphaExtractor is null)
             {
-                WriteFrameSynchronously(request);
-            }
-            else if (!TryQueueFrameWrite(request))
-            {
-                alphaData.Dispose();
                 gpuFrame.Dispose();
-                throw new InvalidOperationException("alpha スプールへのフレーム投入に失敗しました。");
+                throw new InvalidOperationException("GPU alpha extractor が初期化されていません。");
             }
-        }
-        else
-        {
-            alphaData.Dispose();
+
+            gpuFrame.Retain();
+            try
+            {
+                var alphaReleaseKey = _disableHybridRgbIntermediate
+                    ? SharedSlotProducerReturnKey
+                    : nextLockKey + 1;
+                _gpuAlphaExtractor.QueueFrame(
+                    gpuFrame,
+                    nextLockKey,
+                    alphaReleaseKey,
+                    alphaData => QueueHybridAlphaPlane(frame, alphaData));
+                nextLockKey = alphaReleaseKey;
+            }
+            catch
+            {
+                gpuFrame.Dispose();
+                throw;
+            }
         }
 
         if (!_disableHybridRgbIntermediate)
         {
-            QueueFrameForRealtimeRgbIntermediate(frame, gpuFrame);
+            QueueFrameForRealtimeRgbIntermediate(frame, gpuFrame, nextLockKey, SharedSlotProducerReturnKey);
             return;
         }
 
         gpuFrame.Dispose();
+    }
+
+    private void QueueHybridAlphaPlane(RecordedFrame frame, PixelBufferLease alphaData)
+    {
+        var request = new FrameWriteRequest(frame.FrameIndex, frame, alphaData, FramePayloadKind.AlphaPlane);
+        if (_writeSynchronously)
+        {
+            WriteFrameSynchronously(request);
+            return;
+        }
+
+        if (!TryQueueFrameWrite(request))
+        {
+            alphaData.Dispose();
+            throw new InvalidOperationException("alpha スプールへのフレーム投入に失敗しました。");
+        }
     }
 
     private void TryDeleteTemporaryDirectory()

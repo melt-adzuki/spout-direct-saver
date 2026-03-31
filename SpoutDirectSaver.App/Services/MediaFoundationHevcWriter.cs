@@ -147,7 +147,18 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
             throw new InvalidOperationException("NV12 converter が初期化されていません。");
         }
 
-        var nv12Texture = _nv12Converter.Convert(texture);
+        ID3D11Texture2D nv12Texture;
+        try
+        {
+            nv12Texture = _nv12Converter.Convert(texture);
+        }
+        catch (Exception ex)
+        {
+            DebugTrace.WriteLine(
+                "MediaFoundationHevcWriter",
+                $"Convert texture failed frame={_submittedFrameCount} repeatCount={repeatCount} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
 
         for (var index = 0; index < repeatCount; index++)
         {
@@ -178,7 +189,7 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
             {
                 DebugTrace.WriteLine(
                     "MediaFoundationHevcWriter",
-                    $"WriteTextureFrame failed frame={_submittedFrameCount} repeatIndex={index} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+                    $"WriteTextureFrame failed frame={_submittedFrameCount} repeatIndex={index} texturePtr=0x{nv12Texture.NativePointer.ToInt64():X} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
                 throw;
             }
         }

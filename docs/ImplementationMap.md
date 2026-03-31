@@ -43,8 +43,9 @@ Owns:
 - opening the shared handle as `ID3D11Texture2D`
 - CPU readback path
 - GPU capture path for recording
-- alpha extraction path
+- GPU RGB staging for recording
 - orientation-sensitive fullscreen blits
+- the recording-texture ring used to avoid blocking the polling thread under downstream backpressure
 
 This file is the first place to inspect for:
 
@@ -80,6 +81,7 @@ Owns:
 - bounded realtime RGB queue
 - GPU copy staging ring
 - dispatch to the HEVC writer
+- asynchronous shared-texture fan-in so capture does not wait for downstream copy work
 
 ### `SpoutDirectSaver.App/Services/MediaFoundationHevcWriter.cs`
 
@@ -105,7 +107,24 @@ Inspect these first for:
 - GPU encode contract failures
 - output-orientation issues after the shared-texture stage
 
+### `SpoutDirectSaver.App/Services/WindowsScheduling.cs`
+
+Owns:
+
+- process-priority promotion during active recording
+- MMCSS registration for capture and writer threads
+- Windows scheduler hints intended to reduce foreground-game starvation
+
 ## Alpha Path
+
+### `SpoutDirectSaver.App/Services/GpuAlphaPlaneExtractor.cs`
+
+Owns:
+
+- downstream GPU staging for alpha work
+- alpha extraction from captured GPU RGB frames
+- preserving frame-by-frame pairing with `RecordingSession`
+- asynchronous alpha copy/extract work after capture-thread handoff
 
 ### `SpoutDirectSaver.App/Services/RealtimeGrayFfv1Writer.cs`
 

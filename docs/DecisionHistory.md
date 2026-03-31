@@ -124,6 +124,32 @@ Reason:
 
 This is why "the output timeline looks wrong" should not automatically be treated as a final-writer-only problem.
 
+### Recording Workers Must Keep Their Scheduler Hints For The Whole Hot Path
+
+Foreground games can pull enough scheduler attention away from the recorder that NVENC utilization drops and output cadence collapses.
+
+Reason:
+
+- OBS-style mitigation depends on elevated process priority and MMCSS-tagged recording work
+- `TaskCreationOptions.LongRunning` alone is not enough if hot-path work later resumes on arbitrary thread-pool threads
+- dedicated recording workers are more reliable for maintaining scheduler intent under load
+
+### Capture Backpressure Should Prefer Frame Drops Over Polling-Thread Stalls
+
+Foreground-load failures were investigated against OBS source and did not look like a simple "secret priority flag" problem.
+
+Reason:
+
+- OBS-style resilience is driven more by in-process capture and texture-ring handoff than by process priority alone
+- when the receiver blocks waiting for downstream RGB/alpha consumers, the polling thread stops sampling the sender entirely
+- for this tool, preserving a running capture loop is preferable to stalling the capture ring and freezing encode completely
+
+Consequence:
+
+- downstream RGB/alpha GPU copy work was moved off the polling thread
+- the shared-texture recording ring now prefers to drop newly arrived frames under backpressure instead of waiting indefinitely for a slot
+- RGB and alpha pairing is preserved by keeping both consumers on the same captured slot lifetime rather than reopening the app's own intermediate textures across extra devices
+
 ## Benchmark and Validation Conclusions
 
 ### Synthetic Validation Is Necessary but Not Sufficient

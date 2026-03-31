@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using SharpGen.Runtime;
@@ -18,7 +17,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private const int KeyedMutexTimeoutMilliseconds = 67;
     private const int AccessMutexTimeoutMilliseconds = 67;
     private const int StagingTextureCount = 3;
-    private const int RecordingTextureCount = 10;
+    private const int RecordingTextureCount = 32;
     private readonly IDXGIFactory1 _dxgiFactory;
     private readonly object _recordingSlotGate = new();
     private readonly Queue<int> _availableRecordingSlotIndices = new();
@@ -26,6 +25,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     private Mutex? _accessMutex;
     private ID3D11Device? _device;
     private ID3D11DeviceContext? _deviceContext;
+    private ID3D11Multithread? _multithread;
     private ID3D11Texture2D? _sharedTexture;
     private ID3D11ShaderResourceView? _sharedTextureShaderView;
     private readonly ID3D11Texture2D?[] _stagingTextures = new ID3D11Texture2D?[StagingTextureCount];
@@ -185,35 +185,38 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
             sharedAccessAcquired = true;
             var copyTexture = _stagingTextures[_copyIndex]!;
-            _deviceContext!.CopyResource(copyTexture, _sharedTexture);
-            _copiedFrameCount++;
-
-            ID3D11Texture2D readTexture;
-            if (_copiedFrameCount < StagingTextureCount)
+            ExecuteWithContextLock(() =>
             {
-                readTexture = copyTexture;
-            }
-            else
-            {
-                var readIndex = (_copyIndex + 1) % StagingTextureCount;
-                readTexture = _stagingTextures[readIndex]!;
-            }
+                _deviceContext!.CopyResource(copyTexture, _sharedTexture);
+                _copiedFrameCount++;
 
-            var mapped = _deviceContext.Map(readTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
-
-            try
-            {
-                unsafe
+                ID3D11Texture2D readTexture;
+                if (_copiedFrameCount < StagingTextureCount)
                 {
-                    CopyMappedTextureToBgraBuffer(mapped, (byte*)destination);
+                    readTexture = copyTexture;
                 }
-            }
-            finally
-            {
-                _deviceContext.Unmap(readTexture, 0);
-            }
+                else
+                {
+                    var readIndex = (_copyIndex + 1) % StagingTextureCount;
+                    readTexture = _stagingTextures[readIndex]!;
+                }
 
-            _copyIndex = (_copyIndex + 1) % StagingTextureCount;
+                var mapped = _deviceContext.Map(readTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+
+                try
+                {
+                    unsafe
+                    {
+                        CopyMappedTextureToBgraBuffer(mapped, (byte*)destination);
+                    }
+                }
+                finally
+                {
+                    _deviceContext.Unmap(readTexture, 0);
+                }
+
+                _copyIndex = (_copyIndex + 1) % StagingTextureCount;
+            });
 
             errorMessage = null;
             return true;
@@ -232,57 +235,87 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         }
     }
 
-    public bool TryCaptureFrame(out GpuTextureFrame gpuFrame, out PixelBufferLease alphaBuffer, out string? errorMessage)
+    public bool TryCaptureFrame(out GpuTextureFrame gpuFrame, out string? errorMessage, out bool droppedForBackpressure)
     {
         gpuFrame = null!;
-        alphaBuffer = null!;
+        droppedForBackpressure = false;
 
         if (_sharedTexture is null ||
             _sharedTextureShaderView is null ||
             _blitVertexShader is null ||
             _copyPixelShader is null ||
-            _alphaPixelShader is null ||
-            _blitSampler is null ||
-            _alphaOptionsBuffer is null ||
-            _alphaRenderTexture is null ||
-            _alphaRenderTargetView is null ||
-            _alphaReadbackTexture is null)
+            _blitSampler is null)
         {
             errorMessage = "共有テクスチャ capture リソースが初期化されていません。";
             return false;
         }
 
         RecordingTextureSlot? slot = null;
-        PixelBufferLease? alphaLease = null;
         var sharedAccessAcquired = false;
 
         try
         {
-            slot = AcquireRecordingSlot();
-
-            if (!TryAcquireTextureAccess())
+            var slotStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!TryAcquireRecordingSlot(out slot))
             {
-                errorMessage = "共有テクスチャのアクセス待機がタイムアウトしました。";
-                ReleaseRecordingSlot(slot.Index);
+                droppedForBackpressure = true;
+                errorMessage = "recording texture ring is full";
+                DebugTrace.WriteTimingIfSlow(
+                    "D3D11SpoutSharedTextureReader",
+                    "TryAcquireRecordingSlot",
+                    slotStarted,
+                    2.0,
+                    $"sender={_senderName} dropped=true");
                 return false;
             }
 
+            DebugTrace.WriteTimingIfSlow(
+                "D3D11SpoutSharedTextureReader",
+                "TryAcquireRecordingSlot",
+                slotStarted,
+                2.0,
+                $"sender={_senderName} dropped=false");
+            var acquiredSlot = slot!;
+
+            var accessStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!TryAcquireTextureAccess())
+            {
+                errorMessage = "共有テクスチャのアクセス待機がタイムアウトしました。";
+                ReleaseRecordingSlot(acquiredSlot.Index);
+                return false;
+            }
+            DebugTrace.WriteTimingIfSlow(
+                "D3D11SpoutSharedTextureReader",
+                "TryAcquireTextureAccess",
+                accessStarted,
+                2.0,
+                $"sender={_senderName} keyedMutex={_keyedMutex is not null}");
+
             sharedAccessAcquired = true;
-            RenderSharedTextureToBgra(slot);
+            var renderStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            RenderSharedTextureToBgra(acquiredSlot);
+            DebugTrace.WriteTimingIfSlow(
+                "D3D11SpoutSharedTextureReader",
+                "RenderSharedTextureToBgra",
+                renderStarted,
+                2.0,
+                $"sender={_senderName} slot={acquiredSlot.Index}");
             ReleaseTextureAccess();
             sharedAccessAcquired = false;
 
-            alphaLease = PixelBufferLease.Rent(checked((int)(_width * _height)));
-            ExtractAlphaPlane(slot, alphaLease.Buffer);
-
-            gpuFrame = new GpuTextureFrame(_device!, slot.Texture, _width, _height, () => ReleaseRecordingSlot(slot.Index));
-            alphaBuffer = alphaLease;
+            gpuFrame = new GpuTextureFrame(
+                _device!,
+                acquiredSlot.Texture,
+                _width,
+                _height,
+                _deviceAdapterIndex,
+                IntPtr.Zero,
+                () => ReleaseRecordingSlot(acquiredSlot.Index));
             errorMessage = null;
             return true;
         }
         catch (Exception ex)
         {
-            alphaLease?.Dispose();
             if (slot is not null)
             {
                 ReleaseRecordingSlot(slot.Index);
@@ -303,6 +336,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
     public void Dispose()
     {
         ResetResources();
+        _multithread?.Dispose();
+        _multithread = null;
         _deviceContext?.Dispose();
         _device?.Dispose();
         _dxgiFactory.Dispose();
@@ -442,79 +477,33 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
 
     private void RenderSharedTextureToBgra(RecordingTextureSlot slot)
     {
-        _deviceContext!.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        _deviceContext.VSSetShader(_blitVertexShader);
-        _deviceContext.PSSetShader(_copyPixelShader);
-        _deviceContext.PSSetShaderResource(0, _sharedTextureShaderView!);
-        _deviceContext.PSSetSampler(0, _blitSampler);
-        SetViewport(_width, _height);
-        SetRenderTarget(slot.RenderTargetView);
-        _deviceContext.Draw(3, 0);
-        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
-        ClearRenderTargets();
-        _deviceContext.Flush();
+        ExecuteWithContextLock(() =>
+        {
+            _deviceContext!.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            _deviceContext.VSSetShader(_blitVertexShader);
+            _deviceContext.PSSetShader(_copyPixelShader);
+            _deviceContext.PSSetShaderResource(0, _sharedTextureShaderView!);
+            _deviceContext.PSSetSampler(0, _blitSampler);
+            SetViewport(_width, _height);
+            SetRenderTarget(slot.RenderTargetView);
+            _deviceContext.Draw(3, 0);
+            _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
+            ClearRenderTargets();
+        });
     }
 
-    private unsafe void ExtractAlphaPlane(RecordingTextureSlot slot, byte[] destination)
-    {
-        var alphaOptions = new AlphaShaderOptions
-        {
-            ForceOpaqueAlpha = HasOpaqueAlphaOnly(_format) ? 1u : 0u
-        };
-        var mappedOptions = _deviceContext!.Map(_alphaOptionsBuffer!, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
-        try
-        {
-            *(AlphaShaderOptions*)mappedOptions.DataPointer = alphaOptions;
-        }
-        finally
-        {
-            _deviceContext.Unmap(_alphaOptionsBuffer, 0);
-        }
-
-        _deviceContext.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        _deviceContext.VSSetShader(_blitVertexShader);
-        _deviceContext.PSSetShader(_alphaPixelShader);
-        _deviceContext.PSSetShaderResource(0, slot.ShaderResourceView);
-        _deviceContext.PSSetSampler(0, _blitSampler);
-        _deviceContext.PSSetConstantBuffer(0, _alphaOptionsBuffer);
-        SetViewport(_width, _height);
-        SetRenderTarget(_alphaRenderTargetView!);
-        _deviceContext.Draw(3, 0);
-        _deviceContext.PSSetShaderResource(0, (ID3D11ShaderResourceView)null!);
-        _deviceContext.PSSetConstantBuffer(0, (ID3D11Buffer)null!);
-        ClearRenderTargets();
-        _deviceContext.Flush();
-
-        _deviceContext.CopyResource(_alphaReadbackTexture!, _alphaRenderTexture!);
-        _deviceContext.Flush();
-        var mappedAlpha = _deviceContext.Map(_alphaReadbackTexture!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
-
-        try
-        {
-            var pixelWidth = checked((int)_width);
-            var pixelHeight = checked((int)_height);
-            for (var row = 0; row < pixelHeight; row++)
-            {
-                var sourceRow = (byte*)mappedAlpha.DataPointer + (row * mappedAlpha.RowPitch);
-                Marshal.Copy((IntPtr)sourceRow, destination, row * pixelWidth, pixelWidth);
-            }
-        }
-        finally
-        {
-            _deviceContext.Unmap(_alphaReadbackTexture, 0);
-        }
-    }
-
-    private RecordingTextureSlot AcquireRecordingSlot()
+    private bool TryAcquireRecordingSlot(out RecordingTextureSlot? slot)
     {
         lock (_recordingSlotGate)
         {
-            while (_availableRecordingSlotIndices.Count == 0)
+            if (_availableRecordingSlotIndices.Count == 0)
             {
-                Monitor.Wait(_recordingSlotGate);
+                slot = null;
+                return false;
             }
 
-            return _recordingTextures[_availableRecordingSlotIndices.Dequeue()]!;
+            slot = _recordingTextures[_availableRecordingSlotIndices.Dequeue()]!;
+            return true;
         }
     }
 
@@ -582,6 +571,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         }
 
         ResetResources();
+        _multithread?.Dispose();
+        _multithread = null;
         _deviceContext?.Dispose();
         _device?.Dispose();
         _deviceContext = null;
@@ -607,6 +598,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                     result.CheckError();
                     _device = device;
                     _deviceContext = context;
+                    _multithread = _deviceContext.QueryInterfaceOrNull<ID3D11Multithread>();
+                    _multithread?.SetMultithreadProtected(true);
                     _deviceAdapterIndex = adapterIndex;
                     return;
                 }
@@ -617,6 +610,8 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                 DeviceCreationFlags.BgraSupport,
                 Array.Empty<FeatureLevel>());
             _deviceContext = _device.ImmediateContext;
+            _multithread = _deviceContext.QueryInterfaceOrNull<ID3D11Multithread>();
+            _multithread?.SetMultithreadProtected(true);
             _deviceAdapterIndex = -1;
         }
         finally
@@ -676,6 +671,26 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
         _format = Format.Unknown;
         _copyIndex = 0;
         _copiedFrameCount = 0;
+    }
+
+    private void ExecuteWithContextLock(Action action)
+    {
+        if (_multithread is not null)
+        {
+            _multithread.Enter();
+            try
+            {
+                action();
+            }
+            finally
+            {
+                _multithread.Leave();
+            }
+
+            return;
+        }
+
+        action();
     }
 
     private bool TryAcquireTextureAccess()
@@ -791,15 +806,6 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
             destinationRow[offset + 2] = sourceRow[offset];
             destinationRow[offset + 3] = sourceRow[offset + 3];
         }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct AlphaShaderOptions
-    {
-        public uint ForceOpaqueAlpha;
-        public uint Reserved0;
-        public uint Reserved1;
-        public uint Reserved2;
     }
 
     private sealed class RecordingTextureSlot : IDisposable

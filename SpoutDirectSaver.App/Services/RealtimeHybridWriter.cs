@@ -57,8 +57,8 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
             static state =>
             {
                 var writer = (RealtimeHybridWriter)state!;
-                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                writer.WriteLoopAsync().GetAwaiter().GetResult();
+                using var schedulingScope = WindowsScheduling.EnterRealtimeWriterProfile();
+                writer.WriteLoop();
             },
             this,
             CancellationToken.None,
@@ -132,28 +132,31 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
         TryDeleteTemporaryDirectory();
     }
 
-    private async Task WriteLoopAsync()
+    private void WriteLoop()
     {
         var alphaBuffer = GC.AllocateUninitializedArray<byte>(_pixelCount);
 
-        await foreach (var pending in _channel.Reader.ReadAllAsync().ConfigureAwait(false))
+        while (_channel.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
         {
-            try
+            while (_channel.Reader.TryRead(out var pending))
             {
-                if (!_disableMainWriter)
+                try
                 {
-                    _mainWriter.WriteFrame(pending.BgraFrame.Buffer, pending.BgraFrame.Length, pending.RepeatCount);
-                }
+                    if (!_disableMainWriter)
+                    {
+                        _mainWriter.WriteFrame(pending.BgraFrame.Buffer, pending.BgraFrame.Length, pending.RepeatCount);
+                    }
 
-                if (!_disableAlphaWriter)
-                {
-                    ExtractAlphaPlane(pending.BgraFrame.Span, alphaBuffer);
-                    _alphaWriter.QueueFrame((byte[])alphaBuffer.Clone(), pending.RepeatCount);
+                    if (!_disableAlphaWriter)
+                    {
+                        ExtractAlphaPlane(pending.BgraFrame.Span, alphaBuffer);
+                        _alphaWriter.QueueFrame((byte[])alphaBuffer.Clone(), pending.RepeatCount);
+                    }
                 }
-            }
-            finally
-            {
-                pending.BgraFrame.Dispose();
+                finally
+                {
+                    pending.BgraFrame.Dispose();
+                }
             }
         }
     }

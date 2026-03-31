@@ -72,6 +72,7 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
             };
 
             _process.Start();
+            WindowsScheduling.TryPromoteProcess(_process);
         }
         catch (Win32Exception ex)
         {
@@ -86,8 +87,8 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
             static state =>
             {
                 var writer = (RealtimeGrayFfv1Writer)state!;
-                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                writer.WriteLoopAsync().GetAwaiter().GetResult();
+                using var schedulingScope = WindowsScheduling.EnterRealtimeWriterProfile();
+                writer.WriteLoop();
             },
             this,
             CancellationToken.None,
@@ -108,7 +109,14 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
             throw new InvalidOperationException("Realtime alpha writer は既に完了しています。");
         }
 
+        var enqueueStarted = Stopwatch.GetTimestamp();
         _channel.Writer.WriteAsync(new PendingFrame(pixelData, repeatCount)).AsTask().GetAwaiter().GetResult();
+        DebugTrace.WriteTimingIfSlow(
+            "RealtimeGrayFfv1Writer",
+            "QueueFrame enqueue",
+            enqueueStarted,
+            2.0,
+            $"repeat={repeatCount}");
     }
 
     public async Task CompleteAsync(CancellationToken cancellationToken)
@@ -178,18 +186,29 @@ internal sealed class RealtimeGrayFfv1Writer : IAsyncDisposable
         _process.Dispose();
     }
 
-    private async Task WriteLoopAsync()
+    private void WriteLoop()
     {
-        await _pipeConnectionTask.ConfigureAwait(false);
-        await foreach (var pending in _channel.Reader.ReadAllAsync().ConfigureAwait(false))
+        _pipeConnectionTask.GetAwaiter().GetResult();
+        while (_channel.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
         {
-            for (var index = 0; index < pending.RepeatCount; index++)
+            while (_channel.Reader.TryRead(out var pending))
             {
-                await _pipeServer.WriteAsync(pending.PixelData.AsMemory(0, pending.PixelData.Length)).ConfigureAwait(false);
+                var writeStarted = Stopwatch.GetTimestamp();
+                for (var index = 0; index < pending.RepeatCount; index++)
+                {
+                    _pipeServer.Write(pending.PixelData, 0, pending.PixelData.Length);
+                }
+
+                DebugTrace.WriteTimingIfSlow(
+                    "RealtimeGrayFfv1Writer",
+                    "Pipe write",
+                    writeStarted,
+                    3.0,
+                    $"repeat={pending.RepeatCount} bytes={pending.PixelData.Length}");
             }
         }
 
-        await _pipeServer.FlushAsync().ConfigureAwait(false);
+        _pipeServer.Flush();
     }
 
     private async Task ClosePipeAsync(CancellationToken cancellationToken)

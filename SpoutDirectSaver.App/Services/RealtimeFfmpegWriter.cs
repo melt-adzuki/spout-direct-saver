@@ -76,6 +76,7 @@ internal sealed class RealtimeFfmpegWriter : IAsyncDisposable
             };
 
             _process.Start();
+            WindowsScheduling.TryPromoteProcess(_process);
         }
         catch (Win32Exception ex)
         {
@@ -90,8 +91,8 @@ internal sealed class RealtimeFfmpegWriter : IAsyncDisposable
             static state =>
             {
                 var writer = (RealtimeFfmpegWriter)state!;
-                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                writer.WriteLoopAsync().GetAwaiter().GetResult();
+                using var schedulingScope = WindowsScheduling.EnterRealtimeWriterProfile();
+                writer.WriteLoop();
             },
             this,
             CancellationToken.None,
@@ -112,7 +113,14 @@ internal sealed class RealtimeFfmpegWriter : IAsyncDisposable
             throw new InvalidOperationException("Realtime ffmpeg writer は既に完了しています。");
         }
 
+        var enqueueStarted = Stopwatch.GetTimestamp();
         _channel.Writer.WriteAsync(new PendingFrame(pixelData, repeatCount)).AsTask().GetAwaiter().GetResult();
+        DebugTrace.WriteTimingIfSlow(
+            "RealtimeFfmpegWriter",
+            "QueueFrame enqueue",
+            enqueueStarted,
+            2.0,
+            $"repeat={repeatCount}");
     }
 
     public async Task CompleteAsync(CancellationToken cancellationToken)
@@ -182,20 +190,31 @@ internal sealed class RealtimeFfmpegWriter : IAsyncDisposable
         _process.Dispose();
     }
 
-    private async Task WriteLoopAsync()
+    private void WriteLoop()
     {
-        await _pipeConnectionTask.ConfigureAwait(false);
+        _pipeConnectionTask.GetAwaiter().GetResult();
         var destination = _pipeServer;
 
-        await foreach (var pending in _channel.Reader.ReadAllAsync().ConfigureAwait(false))
+        while (_channel.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
         {
-            for (var index = 0; index < pending.RepeatCount; index++)
+            while (_channel.Reader.TryRead(out var pending))
             {
-                await destination.WriteAsync(pending.PixelData.AsMemory(0, pending.PixelData.Length)).ConfigureAwait(false);
+                var writeStarted = Stopwatch.GetTimestamp();
+                for (var index = 0; index < pending.RepeatCount; index++)
+                {
+                    destination.Write(pending.PixelData, 0, pending.PixelData.Length);
+                }
+
+                DebugTrace.WriteTimingIfSlow(
+                    "RealtimeFfmpegWriter",
+                    "Pipe write",
+                    writeStarted,
+                    3.0,
+                    $"repeat={pending.RepeatCount} bytes={pending.PixelData.Length}");
             }
         }
 
-        await destination.FlushAsync().ConfigureAwait(false);
+        destination.Flush();
     }
 
     private async Task CloseStandardInputAsync(CancellationToken cancellationToken)

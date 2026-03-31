@@ -92,6 +92,7 @@ Primary concerns:
 -> `FramePacket`
 -> `RecordingSession`
 -> RGB writer
+-> `GpuAlphaPlaneExtractor`
 -> alpha writer / spool
 
 ### CPU Recording Path
@@ -118,11 +119,31 @@ For suitable senders, the preferred direction is:
 - avoid per-frame parent-process full BGRA readback as the main recording route
 - read back only what must exist on the CPU side
 
+### Foreground-load resilience depends on avoiding capture-thread waits
+
+The recorder cannot rely on process priority alone to behave like OBS game capture.
+
+Current direction:
+
+- keep the polling/capture thread from doing downstream RGB/alpha copy work synchronously
+- hand off captured textures to downstream workers without reopening the app's own intermediate textures across extra D3D devices
+- prefer dropping a newly arrived GPU frame over blocking the capture ring when all recording slots are busy
+
+This mirrors the practical OBS lesson more closely than simply raising thread priority.
+- keep GPU readback work off the capture thread when alpha can be extracted downstream
+
 ### RGB and alpha are intentionally allowed to diverge
 
 They do not need to share the same representation or storage strategy.
 
 This separation is one of the main design characteristics of the project.
+
+For the shared-texture hybrid path specifically:
+
+- the capture thread returns a GPU RGB frame only
+- alpha extraction runs on a downstream GPU worker
+- RGB and alpha are still dispatched from the same `RecordedFrame`
+- changes here must preserve exact frame correspondence, not just approximate timing
 
 ### Orientation and color are path-sensitive
 
@@ -149,6 +170,16 @@ If realtime encode falls behind:
 - sparse sampling can later look like temporal disorder in the output
 
 Do not assume the final writer is the first cause just because the symptom is visible in the final file.
+
+### Windows scheduler behavior matters during recording
+
+When a game is foregrounded, recording throughput can drop if capture and encode work lose scheduler priority.
+
+The current intent is:
+
+- raise process priority while recording is active
+- keep capture and realtime write work on dedicated MMCSS-tagged threads
+- avoid relying on async continuations for recording hot-path workers
 
 ## Build and Run
 
@@ -259,6 +290,7 @@ dotnet run --project .\SpoutDirectSaver.App\SpoutDirectSaver.App.csproj
 - `RealtimeRgbNvencWriter.cs`
 - `MediaFoundationHevcWriter.cs`
 - `D3D11Nv12TextureConverter.cs`
+- `WindowsScheduling.cs`
 
 ### Export and finalization issues
 

@@ -4,7 +4,9 @@ using System.IO;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using SharpGen.Runtime;
 using SpoutDirectSaver.App.Models;
+using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 
@@ -12,7 +14,7 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
 {
-    private const int GpuCopyTextureCount = 10;
+    private const int GpuCopyTextureCount = 32;
     private const int OutputReadyRetryCount = 50;
     private readonly MediaFoundationHevcWriter _writer;
     private readonly Channel<PendingFrame> _channel;
@@ -20,9 +22,11 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
     private readonly object _gpuCopyGate = new();
     private readonly Queue<int> _availableGpuCopySlotIndices = new();
     private readonly GpuCopySlot?[] _gpuCopySlots = new GpuCopySlot?[GpuCopyTextureCount];
+    private readonly ID3D11Device? _device;
     private readonly ID3D11DeviceContext? _deviceContext;
     private readonly ID3D11Multithread? _multithread;
     private readonly string _outputPath;
+    private readonly bool _ownsDevice;
     private bool _writerDisposed;
     private bool _completed;
     private bool _disposed;
@@ -32,40 +36,51 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
         uint height,
         double frameRate,
         string outputPath,
-        ID3D11Device? device = null,
-        int queueCapacity = 4)
+        int? adapterIndex = null,
+        int queueCapacity = GpuCopyTextureCount)
     {
         _outputPath = outputPath;
+
+        if (adapterIndex.HasValue)
+        {
+            _device = CreateDevice(adapterIndex.Value);
+            _deviceContext = _device.ImmediateContext;
+            _multithread = _deviceContext.QueryInterfaceOrNull<ID3D11Multithread>();
+            _multithread?.SetMultithreadProtected(true);
+            InitializeGpuCopySlots(_device, width, height);
+            _ownsDevice = true;
+        }
+
+        _writer = new MediaFoundationHevcWriter(width, height, frameRate, outputPath, _device);
+        DebugTrace.WriteLine(
+            "RealtimeRgbNvencWriter",
+            $"create path={_outputPath} device={(_device is not null ? "gpu" : "cpu")} adapter={(adapterIndex.HasValue ? adapterIndex.Value : -1)}");
+
+        _channel = CreateChannel(queueCapacity);
+        _writeTask = StartWriteTask();
+    }
+
+    public RealtimeRgbNvencWriter(
+        uint width,
+        uint height,
+        double frameRate,
+        string outputPath,
+        ID3D11Device device,
+        int queueCapacity = GpuCopyTextureCount)
+    {
+        _outputPath = outputPath;
+        _device = device;
+        _deviceContext = device.ImmediateContext;
+        _multithread = _deviceContext.QueryInterfaceOrNull<ID3D11Multithread>();
+        _multithread?.SetMultithreadProtected(true);
+        InitializeGpuCopySlots(device, width, height);
         _writer = new MediaFoundationHevcWriter(width, height, frameRate, outputPath, device);
         DebugTrace.WriteLine(
             "RealtimeRgbNvencWriter",
-            $"create path={_outputPath} device={(device is not null ? "gpu" : "cpu")}");
-        if (device is not null)
-        {
-            _deviceContext = device.ImmediateContext;
-            _multithread = _deviceContext.QueryInterfaceOrNull<ID3D11Multithread>();
-            _multithread?.SetMultithreadProtected(true);
-            InitializeGpuCopySlots(device, width, height);
-        }
+            $"create path={_outputPath} device=gpu-shared");
 
-        _channel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(Math.Max(queueCapacity, 1))
-        {
-            SingleReader = true,
-            SingleWriter = true,
-            FullMode = BoundedChannelFullMode.Wait
-        });
-
-        _writeTask = Task.Factory.StartNew(
-            static state =>
-            {
-                var writer = (RealtimeRgbNvencWriter)state!;
-                using var schedulingScope = WindowsScheduling.EnterWriterProfile();
-                writer.WriteLoopAsync().GetAwaiter().GetResult();
-            },
-            this,
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
+        _channel = CreateChannel(queueCapacity);
+        _writeTask = StartWriteTask();
     }
 
     public void QueueFrame(PixelBufferLease pixelData, int repeatCount)
@@ -84,11 +99,21 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
         }
 
         ThrowIfWriteFailed();
+        var enqueueStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         _channel.Writer.WriteAsync(PendingFrame.ForCpu(pixelData, repeatCount)).AsTask().GetAwaiter().GetResult();
+        DebugTrace.WriteTimingIfSlow(
+            "RealtimeRgbNvencWriter",
+            "QueueFrameCpu enqueue",
+            enqueueStarted,
+            2.0,
+            $"repeat={repeatCount}");
     }
 
-    public void QueueFrame(GpuTextureFrame gpuFrame, int repeatCount)
+    public void QueueFrame(GpuTextureFrame gpuFrame, int repeatCount, ulong lockKey, ulong releaseKey)
     {
+        _ = lockKey;
+        _ = releaseKey;
+
         if (repeatCount <= 0)
         {
             gpuFrame.Dispose();
@@ -102,21 +127,21 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
             throw new InvalidOperationException("Realtime RGB writer は既に完了しています。");
         }
 
-        ThrowIfWriteFailed();
-        var copySlot = AcquireGpuCopySlot();
-        try
+        if (_deviceContext is null)
         {
-            CopyGpuFrame(gpuFrame.Texture, copySlot.Texture);
-        }
-        catch
-        {
-            ReleaseGpuCopySlot(copySlot.Index);
             gpuFrame.Dispose();
-            throw;
+            throw new InvalidOperationException("GPU texture 書き込み用の D3D manager が初期化されていません。");
         }
 
-        gpuFrame.Dispose();
-        _channel.Writer.WriteAsync(PendingFrame.ForGpu(copySlot, repeatCount, ReleaseGpuCopySlot)).AsTask().GetAwaiter().GetResult();
+        ThrowIfWriteFailed();
+        var enqueueStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        _channel.Writer.WriteAsync(PendingFrame.ForGpu(gpuFrame, repeatCount)).AsTask().GetAwaiter().GetResult();
+        DebugTrace.WriteTimingIfSlow(
+            "RealtimeRgbNvencWriter",
+            "QueueFrameGpu enqueue",
+            enqueueStarted,
+            2.0,
+            $"repeat={repeatCount} texture=0x{gpuFrame.Texture.NativePointer.ToInt64():X}");
     }
 
     public async Task CompleteAsync(CancellationToken cancellationToken)
@@ -145,8 +170,6 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
         DebugTrace.WriteLine(
             "RealtimeRgbNvencWriter",
             $"complete success path={_outputPath} size={(File.Exists(_outputPath) ? new FileInfo(_outputPath).Length : -1)}");
-
-        _ = cancellationToken;
     }
 
     public async ValueTask DisposeAsync()
@@ -175,37 +198,115 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
         }
 
         _multithread?.Dispose();
+        if (_ownsDevice)
+        {
+            _deviceContext?.Dispose();
+            _device?.Dispose();
+        }
     }
 
-    private async Task WriteLoopAsync()
+    private Channel<PendingFrame> CreateChannel(int queueCapacity)
     {
-        await foreach (var pending in _channel.Reader.ReadAllAsync().ConfigureAwait(false))
+        return Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(Math.Max(queueCapacity, 1))
         {
-            try
+            SingleReader = true,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+    }
+
+    private Task StartWriteTask()
+    {
+        return Task.Factory.StartNew(
+            static state =>
             {
-                if (pending.GpuFrame is not null)
-                {
-                    _writer.WriteTextureFrame(pending.GpuFrame.Texture, pending.RepeatCount);
-                }
-                else if (pending.PixelData is not null)
-                {
-                    _writer.WriteFrame(pending.PixelData.Buffer, pending.PixelData.Length, pending.RepeatCount);
-                }
-                else
-                {
-                    throw new InvalidOperationException("RGB writer pending frame payload が存在しません。");
-                }
-            }
-            catch (Exception ex)
+                var writer = (RealtimeRgbNvencWriter)state!;
+                using var schedulingScope = WindowsScheduling.EnterRealtimeWriterProfile();
+                writer.WriteLoop();
+            },
+            this,
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+    }
+
+    private void WriteLoop()
+    {
+        while (_channel.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+        {
+            while (_channel.Reader.TryRead(out var pending))
             {
-                DebugTrace.WriteLine(
-                    "RealtimeRgbNvencWriter",
-                    $"write failed path={_outputPath} gpu={pending.GpuFrame is not null} cpu={pending.PixelData is not null} repeat={pending.RepeatCount} error={ex.GetType().Name}: {ex.Message}");
-                throw;
-            }
-            finally
-            {
-                pending.Dispose();
+                try
+                {
+                    var submitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (pending.SharedGpuFrame is not null)
+                    {
+                        var gpuCopySlot = AcquireGpuCopySlot();
+                        try
+                        {
+                            try
+                            {
+                                var gpuCopyStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                                CopyGpuFrame(pending.SharedGpuFrame.Texture, gpuCopySlot.Texture);
+                                DebugTrace.WriteTimingIfSlow(
+                                    "RealtimeRgbNvencWriter",
+                                    "CopyGpuFrame",
+                                    gpuCopyStarted,
+                                    2.0,
+                                    $"repeat={pending.RepeatCount} slot={gpuCopySlot.Index}");
+                            }
+                            catch (Exception ex)
+                            {
+                                DebugTrace.WriteLine(
+                                    "RealtimeRgbNvencWriter",
+                                    $"CopyGpuFrame failed repeat={pending.RepeatCount} slot={gpuCopySlot.Index} texture=0x{pending.SharedGpuFrame.Texture.NativePointer.ToInt64():X} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+                                throw;
+                            }
+
+                            try
+                            {
+                                _writer.WriteTextureFrame(gpuCopySlot.Texture, pending.RepeatCount);
+                            }
+                            catch (Exception ex)
+                            {
+                                DebugTrace.WriteLine(
+                                    "RealtimeRgbNvencWriter",
+                                    $"WriteTextureFrame failed repeat={pending.RepeatCount} slot={gpuCopySlot.Index} texture=0x{gpuCopySlot.Texture.NativePointer.ToInt64():X} hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+                                throw;
+                            }
+                        }
+                        finally
+                        {
+                            ReleaseGpuCopySlot(gpuCopySlot.Index);
+                        }
+                    }
+                    else if (pending.PixelData is not null)
+                    {
+                        _writer.WriteFrame(pending.PixelData.Buffer, pending.PixelData.Length, pending.RepeatCount);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("RGB writer pending frame payload が存在しません。");
+                    }
+
+                    DebugTrace.WriteTimingIfSlow(
+                        "RealtimeRgbNvencWriter",
+                        "Writer submit",
+                        submitStarted,
+                        3.0,
+                        $"gpu={pending.SharedGpuFrame is not null} cpu={pending.PixelData is not null} repeat={pending.RepeatCount}");
+                }
+                catch (Exception ex)
+                {
+                    DebugTrace.WriteLine(
+                        "RealtimeRgbNvencWriter",
+                        $"write failed path={_outputPath} gpu={pending.SharedGpuFrame is not null} cpu={pending.PixelData is not null} repeat={pending.RepeatCount} error={ex.GetType().Name}: {ex.Message}");
+                    throw;
+                }
+                finally
+                {
+                    pending.Dispose();
+                }
             }
         }
     }
@@ -311,13 +412,20 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
             throw new InvalidOperationException("GPU texture 書き込み用の D3D manager が初期化されていません。");
         }
 
+        ExecuteWithContextLock(() =>
+        {
+            _deviceContext.CopyResource(destinationTexture, sourceTexture);
+        });
+    }
+
+    private void ExecuteWithContextLock(Action action)
+    {
         if (_multithread is not null)
         {
             _multithread.Enter();
             try
             {
-                _deviceContext.CopyResource(destinationTexture, sourceTexture);
-                _deviceContext.Flush();
+                action();
             }
             finally
             {
@@ -327,41 +435,71 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
             return;
         }
 
-        _deviceContext.CopyResource(destinationTexture, sourceTexture);
-        _deviceContext.Flush();
+        action();
+    }
+
+    private static ID3D11Device CreateDevice(int adapterIndex)
+    {
+        using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
+        IDXGIAdapter1? adapter = null;
+        try
+        {
+            if (adapterIndex >= 0)
+            {
+                var adapterResult = factory.EnumAdapters1((uint)adapterIndex, out adapter);
+                if (adapterResult.Success && adapter is not null)
+                {
+                    ID3D11Device? device;
+                    ID3D11DeviceContext? context;
+                    var result = D3D11.D3D11CreateDevice(
+                        adapter,
+                        DriverType.Unknown,
+                        DeviceCreationFlags.BgraSupport,
+                        Array.Empty<FeatureLevel>(),
+                        out device,
+                        out context);
+                    result.CheckError();
+                    context.Dispose();
+                    return device;
+                }
+            }
+
+            return D3D11.D3D11CreateDevice(
+                DriverType.Hardware,
+                DeviceCreationFlags.BgraSupport,
+                Array.Empty<FeatureLevel>());
+        }
+        finally
+        {
+            adapter?.Dispose();
+        }
     }
 
     private sealed class PendingFrame : IDisposable
     {
-        private readonly Action<int>? _releaseGpuSlot;
-
-        private PendingFrame(PixelBufferLease? pixelData, GpuCopySlot? gpuFrame, int repeatCount, Action<int>? releaseGpuSlot)
+        private PendingFrame(PixelBufferLease? pixelData, GpuTextureFrame? sharedGpuFrame, int repeatCount)
         {
             PixelData = pixelData;
-            GpuFrame = gpuFrame;
+            SharedGpuFrame = sharedGpuFrame;
             RepeatCount = repeatCount;
-            _releaseGpuSlot = releaseGpuSlot;
         }
 
         public PixelBufferLease? PixelData { get; }
 
-        public GpuCopySlot? GpuFrame { get; }
+        public GpuTextureFrame? SharedGpuFrame { get; }
 
         public int RepeatCount { get; }
 
         public static PendingFrame ForCpu(PixelBufferLease pixelData, int repeatCount)
-            => new(pixelData, null, repeatCount, null);
+            => new(pixelData, null, repeatCount);
 
-        public static PendingFrame ForGpu(GpuCopySlot gpuFrame, int repeatCount, Action<int> releaseGpuSlot)
-            => new(null, gpuFrame, repeatCount, releaseGpuSlot);
+        public static PendingFrame ForGpu(GpuTextureFrame gpuFrame, int repeatCount)
+            => new(null, gpuFrame, repeatCount);
 
         public void Dispose()
         {
             PixelData?.Dispose();
-            if (GpuFrame is not null)
-            {
-                _releaseGpuSlot?.Invoke(GpuFrame.Index);
-            }
+            SharedGpuFrame?.Dispose();
         }
     }
 

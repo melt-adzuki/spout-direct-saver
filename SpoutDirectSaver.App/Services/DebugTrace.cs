@@ -23,4 +23,24 @@ internal static class DebugTrace
             File.AppendAllText(path, line);
         }
     }
+
+    public static void WriteTimingIfSlow(
+        string category,
+        string operation,
+        long startTimestamp,
+        double thresholdMilliseconds,
+        string? details = null)
+    {
+        var elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        if (elapsed < thresholdMilliseconds)
+        {
+            return;
+        }
+
+        WriteLine(
+            category,
+            string.IsNullOrWhiteSpace(details)
+                ? $"{operation} slow elapsedMs={elapsed:0.000}"
+                : $"{operation} slow elapsedMs={elapsed:0.000} {details}");
+    }
 }

@@ -123,6 +123,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         using var schedulingScope = WindowsScheduling.EnterCaptureProfile();
         using var receiver = new SpoutReceiver();
         using var sharedTextureReader = new D3D11SpoutSharedTextureReader();
+        using var frameCounter = new SpoutFrameCount();
         if (!receiver.CreateOpenGL())
         {
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout OpenGL コンテキストの初期化に失敗しました。"));
@@ -140,12 +141,16 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         var lastRecordingDiagnostic = string.Empty;
         var previousRecordingMode = false;
         var gpuRecordingRequestedTicks = 0L;
+        var frameCountSenderName = string.Empty;
+        var frameCountSupportProbed = false;
+        var frameCountSupported = false;
 
         try
         {
             ApplyReceiveConfiguration(receiver, ReceiveConfiguration.ImageFallback);
             receiver.Buffers = ReceiveBufferCount;
             receiver.SetFrameCount(true);
+            frameCounter.SetFrameCount(true);
 
             RaiseStatus(new CaptureStatus(false, string.Empty, 0, 0, 0, "Spout sender を待っています。"));
 
@@ -210,6 +215,8 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     lastAcceptedSenderFrame = -1;
                     gpuCaptureFallbackWarned = false;
                     _nextPreviewCaptureTicks = 0;
+                    frameCountSupportProbed = false;
+                    frameCountSupported = false;
 
                     RaiseStatus(new CaptureStatus(
                         true,
@@ -272,6 +279,19 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     }
                 }
 
+                if (useSharedTextureCapture &&
+                    !TryAwaitSharedFrame(frameCounter, connectedSenderName, ref frameCountSenderName, ref frameCountSupportProbed, ref frameCountSupported, receiver.SenderFps))
+                {
+                    if (recordingMode)
+                    {
+                        EmitRecordingDiagnostic(
+                            ref lastRecordingDiagnostic,
+                            $"WaitNewFrame timeout frameCountSupported={frameCountSupported} sender={connectedSenderName}");
+                    }
+
+                    continue;
+                }
+
                 if (!receiver.ReceiveTexture())
                 {
                     if (recordingMode)
@@ -306,7 +326,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     continue;
                 }
 
-                if (!receiver.IsFrameNew)
+                if (!useSharedTextureCapture && !receiver.IsFrameNew)
                 {
                     if (recordingMode)
                     {
@@ -319,7 +339,9 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     continue;
                 }
 
-                var senderFrame = receiver.SenderFrame;
+                var senderFrame = useSharedTextureCapture && frameCountSupported
+                    ? frameCounter.SenderFrame
+                    : receiver.SenderFrame;
                 if (senderFrame > 0 && senderFrame == lastAcceptedSenderFrame)
                 {
                     if (recordingMode)
@@ -373,15 +395,22 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                     {
                         if (gpuRecordingMode && useSharedTextureCapture)
                         {
-                            if (sharedTextureReader.TryCaptureFrame(out var gpuFrame, out var alphaBuffer, out var errorMessage))
+                            var gpuCaptureStarted = Stopwatch.GetTimestamp();
+                            if (sharedTextureReader.TryCaptureFrame(out var gpuFrame, out var errorMessage, out var droppedForBackpressure))
                             {
+                                DebugTrace.WriteTimingIfSlow(
+                                    "SpoutPollingService",
+                                    "TryCaptureFrame",
+                                    gpuCaptureStarted,
+                                    3.0,
+                                    $"sender={connectedSenderName} size={connectedWidth}x{connectedHeight}");
                                 DebugTrace.WriteLine(
                                     "SpoutPollingService",
                                     $"deliver gpu frame sender={connectedSenderName} size={connectedWidth}x{connectedHeight}");
                                 framePacket = new FramePacket(
                                     null,
                                     gpuFrame,
-                                    alphaBuffer,
+                                    null,
                                     connectedWidth,
                                     connectedHeight,
                                     connectedSenderName,
@@ -391,6 +420,15 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                             }
                             else
                             {
+                                if (droppedForBackpressure)
+                                {
+                                    EmitRecordingDiagnostic(
+                                        ref lastRecordingDiagnostic,
+                                        $"drop gpu frame due to capture backpressure sender={connectedSenderName}");
+                                    WaitUntilNextPoll(ref nextPollTicks, receiver.SenderFps, cancellationToken);
+                                    continue;
+                                }
+
                                 Interlocked.Exchange(ref _gpuRecordingModeEnabled, 0);
                                 gpuRecordingMode = false;
                                 if (!gpuCaptureFallbackWarned)
@@ -414,6 +452,7 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                                 $"deliver cpu frame sender={connectedSenderName} size={connectedWidth}x{connectedHeight} gpuRecordingMode={gpuRecordingMode}");
                             var requiredLength = checked((int)(connectedWidth * connectedHeight * 4));
                             var frameCopy = PixelBufferLease.Rent(requiredLength);
+                            var cpuCaptureStarted = Stopwatch.GetTimestamp();
                             CaptureCpuFrame(
                                 receiver,
                                 sharedTextureReader,
@@ -422,6 +461,12 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                                 connectedWidth,
                                 connectedHeight,
                                 frameCopy);
+                            DebugTrace.WriteTimingIfSlow(
+                                "SpoutPollingService",
+                                "CaptureCpuFrame",
+                                cpuCaptureStarted,
+                                4.0,
+                                $"sender={connectedSenderName} size={connectedWidth}x{connectedHeight} sharedPreferred={useSharedTextureCapture}");
                             framePacket = new FramePacket(
                                 frameCopy,
                                 null,
@@ -434,7 +479,14 @@ internal sealed class SpoutPollingService : IAsyncDisposable
                                 DateTimeOffset.UtcNow);
                         }
 
+                        var deliveryStarted = Stopwatch.GetTimestamp();
                         frameHandler.Invoke(this, framePacket);
+                        DebugTrace.WriteTimingIfSlow(
+                            "SpoutPollingService",
+                            "FrameArrived handler",
+                            deliveryStarted,
+                            4.0,
+                            $"sender={connectedSenderName} gpu={framePacket.GpuTexture is not null} cpu={framePacket.PixelBuffer is not null}");
                         framePacket = null;
                     }
                     finally
@@ -652,6 +704,49 @@ internal sealed class SpoutPollingService : IAsyncDisposable
         }
 
         return true;
+    }
+
+    private static bool TryAwaitSharedFrame(
+        SpoutFrameCount frameCounter,
+        string senderName,
+        ref string frameCountSenderName,
+        ref bool frameCountSupportProbed,
+        ref bool frameCountSupported,
+        double senderFps)
+    {
+        if (!string.Equals(frameCountSenderName, senderName, StringComparison.Ordinal))
+        {
+            frameCounter.CleanupFrameCount();
+            frameCounter.EnableFrameCount(senderName);
+            frameCountSenderName = senderName;
+            frameCountSupportProbed = false;
+            frameCountSupported = false;
+        }
+
+        if (!frameCountSupportProbed)
+        {
+            frameCountSupportProbed = true;
+            frameCountSupported =
+                !string.IsNullOrWhiteSpace(senderName) &&
+                frameCounter.WaitNewFrame(0) &&
+                frameCounter.SenderFrame > 0;
+            return true;
+        }
+
+        if (!frameCountSupported)
+        {
+            return true;
+        }
+
+        return WaitForNextFrame(frameCounter, senderFps);
+    }
+
+    private static bool WaitForNextFrame(SpoutFrameCount frameCounter, double senderFps)
+    {
+        var timeoutMilliseconds = senderFps > 1.0
+            ? (uint)Math.Clamp((int)Math.Ceiling((1000.0 / Math.Min(senderFps, 120.0)) * 2.0), 4, 67)
+            : 20u;
+        return frameCounter.WaitNewFrame(timeoutMilliseconds);
     }
 
     private static bool IsSharedTextureCapable(SpoutReceiver receiver)

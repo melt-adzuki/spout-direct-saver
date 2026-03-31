@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime;
 using System.Threading;
@@ -28,6 +29,7 @@ public partial class MainWindow : Window
     private WriteableBitmap? _liveBitmap;
 
     private RecordingSession? _recordingSession;
+    private IDisposable? _recordingSchedulingScope;
     private CaptureStatus? _latestStatus;
     private string? _outputPath;
     private string? _lastRecordedFilePath;
@@ -138,6 +140,7 @@ public partial class MainWindow : Window
         ResetPreviewArea();
 
         _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _recordingSchedulingScope ??= WindowsScheduling.EnterRecordingPriorityScope(ProcessPriorityClass.High);
         _lastRecordingFaultMessage = null;
         _recordingCpuFallbackActive = false;
         _recordingFrameAcceptanceEnabled = false;
@@ -229,6 +232,8 @@ public partial class MainWindow : Window
             {
                 _recordingFrameAcceptanceEnabled = false;
                 _spoutPollingService.SetRecordingMode(false, false);
+                _recordingSchedulingScope?.Dispose();
+                _recordingSchedulingScope = null;
             }
             UpdateRecordingElapsed();
             UpdateUiState();
@@ -361,7 +366,14 @@ public partial class MainWindow : Window
             if (!_isStopping && _recordingSession is not null && _recordingFrameAcceptanceEnabled)
             {
                 DebugTrace.WriteLine("MainWindow", "append frame");
+                var appendStarted = Stopwatch.GetTimestamp();
                 _recordingSession.AppendFrame(frame);
+                DebugTrace.WriteTimingIfSlow(
+                    "MainWindow",
+                    "AppendFrame",
+                    appendStarted,
+                    4.0,
+                    $"sender={frame.SenderName} gpu={frame.GpuTexture is not null} cpu={frame.PixelBuffer is not null}");
                 return;
             }
 
