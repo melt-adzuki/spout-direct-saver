@@ -34,6 +34,25 @@ When debugging:
 - missing frames during recording often start here
 - unexpected fallback behavior often starts here
 
+### `SpoutDirectSaver.App/Services/WindowsScheduling.cs`
+
+Owns:
+
+- process-priority promotion
+- MMCSS enrollment for capture / writer threads
+- process-lifetime timer-resolution hints
+- privilege enablement needed for optional GPU scheduling requests
+
+### `SpoutDirectSaver.App/Services/WindowsGraphicsScheduling.cs`
+
+Owns:
+
+- D3D11 `SetMaximumFrameLatency(16)` requests
+- DXGI GPU thread priority requests
+- D3DKMT process GPU scheduling-class requests
+
+These hints are best-effort and should be treated as support code around the hot path, not the hot path itself.
+
 ## Shared-Texture Bridge
 
 ### `SpoutDirectSaver.App/Services/D3D11SpoutSharedTextureReader.cs`

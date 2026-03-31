@@ -608,6 +608,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                     _device = device;
                     _deviceContext = context;
                     _deviceAdapterIndex = adapterIndex;
+                    WindowsGraphicsScheduling.TryApplyGraphicsDeviceHints(_device, $"D3D11SpoutSharedTextureReader adapter={adapterIndex}");
                     return;
                 }
             }
@@ -618,6 +619,7 @@ internal sealed class D3D11SpoutSharedTextureReader : IDisposable
                 Array.Empty<FeatureLevel>());
             _deviceContext = _device.ImmediateContext;
             _deviceAdapterIndex = -1;
+            WindowsGraphicsScheduling.TryApplyGraphicsDeviceHints(_device, "D3D11SpoutSharedTextureReader adapter=fallback");
         }
         finally
         {

@@ -42,6 +42,7 @@
     <Compile Include="..\SpoutDirectSaver.App\Services\DebugTrace.cs" Link="Services\DebugTrace.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\MediaFoundationHevcWriter.cs" Link="Services\MediaFoundationHevcWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\PixelConversion.cs" Link="Services\PixelConversion.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\WindowsGraphicsScheduling.cs" Link="Services\WindowsGraphicsScheduling.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeGrayFfv1Writer.cs" Link="Services\RealtimeGrayFfv1Writer.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeFfmpegWriter.cs" Link="Services\RealtimeFfmpegWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\RealtimeHybridWriter.cs" Link="Services\RealtimeHybridWriter.cs" />

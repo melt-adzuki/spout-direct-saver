@@ -65,6 +65,7 @@ Primary concerns:
 - preferring the shared-texture GPU path for suitable senders
 - avoiding preview-only work in the recording hot path
 - keeping RGB and alpha handling separated where that reduces cost
+- applying Windows-specific scheduling and D3D11 latency hints on a best-effort basis
 
 ### Post-Record Review
 
@@ -149,6 +150,20 @@ If realtime encode falls behind:
 - sparse sampling can later look like temporal disorder in the output
 
 Do not assume the final writer is the first cause just because the symptom is visible in the final file.
+
+### Windows scheduling hints are supportive, not the media pipeline itself
+
+The app now applies best-effort Windows hints such as:
+
+- process and thread priority promotion
+- MMCSS task enrollment
+- `timeBeginPeriod(1)`
+- D3D11 `SetMaximumFrameLatency(16)`
+- DXGI / D3DKMT GPU-priority requests
+
+These are intended to reduce avoidable stalls around the hot path.
+
+They do not replace pipeline-level fixes when capture cadence or GPU handoff design is the true bottleneck.
 
 ## Build and Run
 
