@@ -12,6 +12,13 @@ It is designed for workflows where you want to:
 This tool is not trying to replace OBS as a full production studio.  
 It is focused on direct asset capture from Spout senders, especially when transparent output matters.
 
+> [!IMPORTANT]
+> If the sender is a game or game-like application, recording can stutter when the game window stays in the foreground on systems where HAGS (Hardware-Accelerated GPU Scheduling) is enabled.
+> If you hit this symptom, try one of these workarounds:
+>
+> - take focus away from the game window while recording
+> - disable HAGS in Windows graphics settings before recording
+
 ## Requirements
 
 - Windows
