@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
+using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
 
@@ -29,7 +30,8 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         double frameRate,
         string outputPath,
         ID3D11Device? device = null,
-        uint averageBitrate = 40_000_000)
+        uint averageBitrate = 40_000_000,
+        RgbMediaFoundationEncoderSettings? settings = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
@@ -38,7 +40,10 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         using var sinkWriterAttributes = MediaFactory.MFCreateAttributes(6);
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1u);
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.DisableThrottling, 1u);
-        sinkWriterAttributes.Set(SinkWriterAttributeKeys.LowLatency, 1u);
+        if (settings?.LowLatency != false)
+        {
+            sinkWriterAttributes.Set(SinkWriterAttributeKeys.LowLatency, 1u);
+        }
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssClass, "Capture");
         sinkWriterAttributes.Set(SinkWriterAttributeKeys.ReadwriteMmcssPriority, 2u);
         if (device is not null)
@@ -52,9 +57,12 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         _sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, sinkWriterAttributes);
 
         using var outputMediaType = MediaFactory.MFCreateMediaType();
+        var effectiveAverageBitrate = settings is not null && settings.TargetBitrateMbps > 0
+            ? checked((uint)(settings.TargetBitrateMbps * 1_000_000))
+            : averageBitrate;
         outputMediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
         outputMediaType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.Hevc);
-        outputMediaType.Set(MediaTypeAttributeKeys.AvgBitrate, averageBitrate);
+        outputMediaType.Set(MediaTypeAttributeKeys.AvgBitrate, effectiveAverageBitrate);
         outputMediaType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive);
         MediaFactory.MFSetAttributeSize(outputMediaType, MediaTypeAttributeKeys.FrameSize, width, height).CheckError();
         SetFrameRate(outputMediaType, frameRate);
@@ -77,6 +85,25 @@ internal sealed class MediaFoundationHevcWriter : IDisposable
         ApplyInputVideoColorAttributes(inputMediaType, device is not null);
 
         _sinkWriter.SetInputMediaType(_streamIndex, inputMediaType, null);
+        if (settings is not null)
+        {
+            using var encoderParameters = MediaFactory.MFCreateAttributes(12);
+            settings.ApplyTo(encoderParameters);
+            if (_sinkWriter.QueryInterfaceOrNull<IMFSinkWriterEncoderConfig>() is { } encoderConfig)
+            {
+                try
+                {
+                    encoderConfig.PlaceEncodingParameters(_streamIndex, encoderParameters);
+                }
+                catch (Exception ex)
+                {
+                    DebugTrace.WriteLine(
+                        "MediaFoundationHevcWriter",
+                        $"PlaceEncodingParameters failed hresult=0x{ex.HResult:X8} error={ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
         _sinkWriter.BeginWriting();
         _frameDurationHns = Math.Max(1, (long)Math.Round(HundredNanosecondsPerSecond / frameRate));
         _gpuFrameLength = checked((int)(width * height * 3 / 2));

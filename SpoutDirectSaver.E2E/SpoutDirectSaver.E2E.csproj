@@ -32,6 +32,7 @@
   <ItemGroup>
     <Compile Include="..\SpoutDirectSaver.App\Models\CaptureStatus.cs" Link="Models\CaptureStatus.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\EncoderOption.cs" Link="Models\EncoderOption.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Models\EncoderSettings.cs" Link="Models\EncoderSettings.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\FramePacket.cs" Link="Models\FramePacket.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\GpuTextureFrame.cs" Link="Models\GpuTextureFrame.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Models\LivePreviewFrame.cs" Link="Models\LivePreviewFrame.cs" />
@@ -40,6 +41,7 @@
     <Compile Include="..\SpoutDirectSaver.App\Services\D3D11Nv12TextureConverter.cs" Link="Services\D3D11Nv12TextureConverter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\D3D11SpoutSharedTextureReader.cs" Link="Services\D3D11SpoutSharedTextureReader.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\DebugTrace.cs" Link="Services\DebugTrace.cs" />
+    <Compile Include="..\SpoutDirectSaver.App\Services\EncoderSettingsStore.cs" Link="Services\EncoderSettingsStore.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\MediaFoundationHevcWriter.cs" Link="Services\MediaFoundationHevcWriter.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\PixelConversion.cs" Link="Services\PixelConversion.cs" />
     <Compile Include="..\SpoutDirectSaver.App\Services\WindowsGraphicsScheduling.cs" Link="Services\WindowsGraphicsScheduling.cs" />

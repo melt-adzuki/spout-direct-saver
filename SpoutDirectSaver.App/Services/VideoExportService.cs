@@ -21,17 +21,22 @@ internal sealed class VideoExportService
         uint height,
         double outputFrameRate,
         string outputPath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        AlphaNvencEncoderSettings? settings = null)
     {
         await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-        var gop = Math.Max(1, (int)Math.Round(outputFrameRate));
+        var effectiveSettings = settings ?? EncoderSettingsRoot.CreateDefaults().Alpha;
 
         var startInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments =
-                $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {outputFrameRate:0.###} -i - -an -vf format=yuv420p -c:v hevc_nvenc -preset:v p3 -tune:v hq -rc:v vbr -cq:v 19 -b:v 0 -bf:v 0 -g:v {gop} -pix_fmt:v yuv420p -profile:v main -movflags +faststart -video_track_timescale 120000 \"{outputPath}\"",
+            Arguments = effectiveSettings.BuildArguments(
+                width,
+                height,
+                outputFrameRate,
+                "-i -",
+                outputPath),
             WorkingDirectory = Path.GetDirectoryName(outputPath)!,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,

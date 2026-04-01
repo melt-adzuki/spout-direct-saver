@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Runtime;
 using System.Threading;
@@ -19,6 +20,7 @@ public partial class MainWindow : Window
 {
     private readonly SpoutPollingService _spoutPollingService = new();
     private readonly VideoExportService _videoExportService = new();
+    private readonly EncoderSettingsStore _encoderSettingsStore = new();
     private readonly DispatcherTimer _recordingTimer;
     private readonly EncoderOption[] _encoderOptions = EncoderOption.CreateDefaults();
 
@@ -39,6 +41,8 @@ public partial class MainWindow : Window
     private string? _lastRecordingFaultMessage;
     private bool _recordingCpuFallbackActive;
     private volatile bool _recordingFrameAcceptanceEnabled;
+    private EncoderSettingsRoot _encoderSettings = EncoderSettingsRoot.CreateDefaults();
+    private EncoderSettingsRoot? _sessionEncoderSettings;
 
     public MainWindow()
     {
@@ -55,6 +59,16 @@ public partial class MainWindow : Window
 
         FormatComboBox.ItemsSource = _encoderOptions;
         FormatComboBox.SelectedIndex = 0;
+        RgbRateControlComboBox.ItemsSource = Enum.GetValues<RgbMediaFoundationRateControlMode>();
+        RgbContentTypeComboBox.ItemsSource = Enum.GetValues<RgbMediaFoundationContentTypeHint>();
+        AlphaPresetComboBox.ItemsSource = Enum.GetValues<AlphaNvencPreset>();
+        AlphaTuneComboBox.ItemsSource = Enum.GetValues<AlphaNvencTune>();
+        AlphaRateControlComboBox.ItemsSource = Enum.GetValues<AlphaNvencRateControlMode>();
+        AlphaProfileComboBox.ItemsSource = Enum.GetValues<AlphaNvencProfile>();
+        AlphaLevelComboBox.ItemsSource = Enum.GetValues<AlphaNvencLevel>();
+
+        _encoderSettings = _encoderSettingsStore.Load();
+        LoadEncoderSettingsIntoUi();
 
         _recordingTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(100),
@@ -83,6 +97,8 @@ public partial class MainWindow : Window
 
         _recordingTimer.Stop();
         StopPreviewPlayback();
+        _encoderSettings = CaptureEncoderSettingsFromUi();
+        _encoderSettingsStore.Save(_encoderSettings);
 
         if (_recordingSession is not null)
         {
@@ -114,6 +130,7 @@ public partial class MainWindow : Window
     {
         var option = SelectedEncoderOption;
         FormatDescriptionTextBlock.Text = option.Description;
+        ApplyEncoderSettingsVisibility();
 
         if (!string.IsNullOrWhiteSpace(_outputPath) &&
             !string.Equals(Path.GetExtension(_outputPath), option.Extension, StringComparison.OrdinalIgnoreCase))
@@ -135,9 +152,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        var encoderSettings = CaptureEncoderSettingsFromUi();
+        _encoderSettings = encoderSettings.Clone();
+        _encoderSettingsStore.Save(_encoderSettings);
+        _sessionEncoderSettings = encoderSettings.Clone();
         ResetPreviewArea();
 
-        _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!, encoderSettings);
         _lastRecordingFaultMessage = null;
         _recordingCpuFallbackActive = false;
         _recordingFrameAcceptanceEnabled = false;
@@ -520,7 +541,10 @@ public partial class MainWindow : Window
         }
 
         var failedSession = _recordingSession;
-        _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!);
+        _recordingSession = new RecordingSession(
+            SelectedEncoderOption,
+            _outputPath!,
+            _sessionEncoderSettings ?? _encoderSettings);
         _recordingCpuFallbackActive = true;
         _lastRecordingFaultMessage = $"GPU 録画経路が利用できなかったため CPU 受信へフォールバックしました: {exception.Message}";
         _spoutPollingService.SetRecordingMode(true, false);
@@ -549,6 +573,8 @@ public partial class MainWindow : Window
         PlayPreviewButton.IsEnabled = !recording && !_isStopping && hasPreview;
         PausePreviewButton.IsEnabled = !recording && !_isStopping && hasPreview;
         SeekSlider.IsEnabled = !recording && !_isStopping && hasPreview;
+        EncoderSettingsRootPanel.IsEnabled = !recording && !_isStopping;
+        ApplyEncoderSettingsVisibility();
     }
 
     private void UpdateRecordingElapsed()
@@ -591,6 +617,102 @@ public partial class MainWindow : Window
     {
         var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
         return $"spout_capture_{stamp}{option.Extension}";
+    }
+
+    private void LoadEncoderSettingsIntoUi()
+    {
+        RgbRateControlComboBox.SelectedItem = _encoderSettings.Rgb.RateControlMode;
+        RgbTargetBitrateTextBox.Text = _encoderSettings.Rgb.TargetBitrateMbps.ToString(CultureInfo.InvariantCulture);
+        RgbBufferSizeTextBox.Text = _encoderSettings.Rgb.BufferSizeMb.ToString(CultureInfo.InvariantCulture);
+        RgbQualityVsSpeedTextBox.Text = _encoderSettings.Rgb.QualityVsSpeed.ToString(CultureInfo.InvariantCulture);
+        RgbLowLatencyCheckBox.IsChecked = _encoderSettings.Rgb.LowLatency;
+        RgbUseConstantQpCheckBox.IsChecked = _encoderSettings.Rgb.UseConstantQp;
+        RgbConstantQpTextBox.Text = _encoderSettings.Rgb.ConstantQp.ToString(CultureInfo.InvariantCulture);
+        RgbMinQpTextBox.Text = _encoderSettings.Rgb.MinQp.ToString(CultureInfo.InvariantCulture);
+        RgbMaxQpTextBox.Text = _encoderSettings.Rgb.MaxQp.ToString(CultureInfo.InvariantCulture);
+        RgbGopSizeTextBox.Text = _encoderSettings.Rgb.GopSize.ToString(CultureInfo.InvariantCulture);
+        RgbContentTypeComboBox.SelectedItem = _encoderSettings.Rgb.ContentTypeHint;
+        RgbWorkerThreadsTextBox.Text = _encoderSettings.Rgb.WorkerThreads.ToString(CultureInfo.InvariantCulture);
+
+        AlphaPresetComboBox.SelectedItem = _encoderSettings.Alpha.Preset;
+        AlphaTuneComboBox.SelectedItem = _encoderSettings.Alpha.Tune;
+        AlphaRateControlComboBox.SelectedItem = _encoderSettings.Alpha.RateControlMode;
+        AlphaTargetBitrateTextBox.Text = _encoderSettings.Alpha.TargetBitrateMbps.ToString(CultureInfo.InvariantCulture);
+        AlphaConstantQualityTextBox.Text = _encoderSettings.Alpha.ConstantQuality.ToString(CultureInfo.InvariantCulture);
+        AlphaConstantQpTextBox.Text = _encoderSettings.Alpha.ConstantQp.ToString(CultureInfo.InvariantCulture);
+        AlphaMinQpTextBox.Text = _encoderSettings.Alpha.MinQp.ToString(CultureInfo.InvariantCulture);
+        AlphaMaxQpTextBox.Text = _encoderSettings.Alpha.MaxQp.ToString(CultureInfo.InvariantCulture);
+        AlphaLookaheadTextBox.Text = _encoderSettings.Alpha.LookaheadFrames.ToString(CultureInfo.InvariantCulture);
+        AlphaSpatialAqCheckBox.IsChecked = _encoderSettings.Alpha.SpatialAq;
+        AlphaTemporalAqCheckBox.IsChecked = _encoderSettings.Alpha.TemporalAq;
+        AlphaAqStrengthTextBox.Text = _encoderSettings.Alpha.AqStrength.ToString(CultureInfo.InvariantCulture);
+        AlphaZeroLatencyCheckBox.IsChecked = _encoderSettings.Alpha.ZeroLatency;
+        AlphaBFramesTextBox.Text = _encoderSettings.Alpha.BFrames.ToString(CultureInfo.InvariantCulture);
+        AlphaGopSizeTextBox.Text = _encoderSettings.Alpha.GopSize.ToString(CultureInfo.InvariantCulture);
+        AlphaProfileComboBox.SelectedItem = _encoderSettings.Alpha.Profile;
+        AlphaLevelComboBox.SelectedItem = _encoderSettings.Alpha.Level;
+
+        ApplyEncoderSettingsVisibility();
+    }
+
+    private EncoderSettingsRoot CaptureEncoderSettingsFromUi()
+    {
+        var settings = _encoderSettings.Clone();
+
+        settings.Rgb.RateControlMode = SelectedEnum(RgbRateControlComboBox, settings.Rgb.RateControlMode);
+        settings.Rgb.TargetBitrateMbps = ReadInt(RgbTargetBitrateTextBox, settings.Rgb.TargetBitrateMbps);
+        settings.Rgb.BufferSizeMb = ReadInt(RgbBufferSizeTextBox, settings.Rgb.BufferSizeMb);
+        settings.Rgb.QualityVsSpeed = ReadInt(RgbQualityVsSpeedTextBox, settings.Rgb.QualityVsSpeed);
+        settings.Rgb.LowLatency = RgbLowLatencyCheckBox.IsChecked ?? settings.Rgb.LowLatency;
+        settings.Rgb.UseConstantQp = RgbUseConstantQpCheckBox.IsChecked ?? settings.Rgb.UseConstantQp;
+        settings.Rgb.ConstantQp = ReadInt(RgbConstantQpTextBox, settings.Rgb.ConstantQp);
+        settings.Rgb.MinQp = ReadInt(RgbMinQpTextBox, settings.Rgb.MinQp);
+        settings.Rgb.MaxQp = ReadInt(RgbMaxQpTextBox, settings.Rgb.MaxQp);
+        settings.Rgb.GopSize = ReadInt(RgbGopSizeTextBox, settings.Rgb.GopSize);
+        settings.Rgb.ContentTypeHint = SelectedEnum(RgbContentTypeComboBox, settings.Rgb.ContentTypeHint);
+        settings.Rgb.WorkerThreads = ReadInt(RgbWorkerThreadsTextBox, settings.Rgb.WorkerThreads);
+
+        settings.Alpha.Preset = SelectedEnum(AlphaPresetComboBox, settings.Alpha.Preset);
+        settings.Alpha.Tune = SelectedEnum(AlphaTuneComboBox, settings.Alpha.Tune);
+        settings.Alpha.RateControlMode = SelectedEnum(AlphaRateControlComboBox, settings.Alpha.RateControlMode);
+        settings.Alpha.TargetBitrateMbps = ReadInt(AlphaTargetBitrateTextBox, settings.Alpha.TargetBitrateMbps);
+        settings.Alpha.ConstantQuality = ReadInt(AlphaConstantQualityTextBox, settings.Alpha.ConstantQuality);
+        settings.Alpha.ConstantQp = ReadInt(AlphaConstantQpTextBox, settings.Alpha.ConstantQp);
+        settings.Alpha.MinQp = ReadInt(AlphaMinQpTextBox, settings.Alpha.MinQp);
+        settings.Alpha.MaxQp = ReadInt(AlphaMaxQpTextBox, settings.Alpha.MaxQp);
+        settings.Alpha.LookaheadFrames = ReadInt(AlphaLookaheadTextBox, settings.Alpha.LookaheadFrames);
+        settings.Alpha.SpatialAq = AlphaSpatialAqCheckBox.IsChecked ?? settings.Alpha.SpatialAq;
+        settings.Alpha.TemporalAq = AlphaTemporalAqCheckBox.IsChecked ?? settings.Alpha.TemporalAq;
+        settings.Alpha.AqStrength = ReadInt(AlphaAqStrengthTextBox, settings.Alpha.AqStrength);
+        settings.Alpha.ZeroLatency = AlphaZeroLatencyCheckBox.IsChecked ?? settings.Alpha.ZeroLatency;
+        settings.Alpha.BFrames = ReadInt(AlphaBFramesTextBox, settings.Alpha.BFrames);
+        settings.Alpha.GopSize = ReadInt(AlphaGopSizeTextBox, settings.Alpha.GopSize);
+        settings.Alpha.Profile = SelectedEnum(AlphaProfileComboBox, settings.Alpha.Profile);
+        settings.Alpha.Level = SelectedEnum(AlphaLevelComboBox, settings.Alpha.Level);
+
+        settings.Normalize();
+        return settings;
+    }
+
+    private void ApplyEncoderSettingsVisibility()
+    {
+        EncoderSettingsSectionBorder.Visibility = SelectedEncoderOption.Kind == EncoderProfileKind.HevcNvencMp4AlphaMp4
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private static int ReadInt(System.Windows.Controls.TextBox textBox, int fallback)
+    {
+        var text = textBox.Text?.Trim();
+        return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : fallback;
+    }
+
+    private static TEnum SelectedEnum<TEnum>(System.Windows.Controls.ComboBox comboBox, TEnum fallback)
+        where TEnum : struct, Enum
+    {
+        return comboBox.SelectedItem is TEnum selected ? selected : fallback;
     }
 
     private static string FormatTime(long milliseconds)

@@ -66,6 +66,10 @@ Primary concerns:
 - avoiding preview-only work in the recording hot path
 - keeping RGB and alpha handling separated where that reduces cost
 - applying Windows-specific scheduling and D3D11 latency hints on a best-effort basis
+- allowing encoder tuning from the GUI while keeping RGB/MF and alpha/NVENC settings separate
+
+The app persists encoder tuning in `%LocalAppData%\SpoutDirectSaver\encoder-settings.json`.
+Media Foundation options that are not shown in the UI are intentionally omitted rather than disabled.
 
 ### Post-Record Review
 

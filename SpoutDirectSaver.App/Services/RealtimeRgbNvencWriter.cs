@@ -33,10 +33,11 @@ internal sealed class RealtimeRgbNvencWriter : IAsyncDisposable
         double frameRate,
         string outputPath,
         ID3D11Device? device = null,
-        int queueCapacity = 4)
+        int queueCapacity = 4,
+        RgbMediaFoundationEncoderSettings? settings = null)
     {
         _outputPath = outputPath;
-        _writer = new MediaFoundationHevcWriter(width, height, frameRate, outputPath, device);
+        _writer = new MediaFoundationHevcWriter(width, height, frameRate, outputPath, device, settings: settings);
         DebugTrace.WriteLine(
             "RealtimeRgbNvencWriter",
             $"create path={_outputPath} device={(device is not null ? "gpu" : "cpu")}");

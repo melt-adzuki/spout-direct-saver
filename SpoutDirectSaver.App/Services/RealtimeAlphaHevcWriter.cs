@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using SpoutDirectSaver.App.Models;
 
 namespace SpoutDirectSaver.App.Services;
 
@@ -27,7 +28,8 @@ internal sealed class RealtimeAlphaHevcWriter : IAsyncDisposable
         uint height,
         double frameRate,
         string outputPath,
-        int queueCapacity = 8)
+        int queueCapacity = 8,
+        AlphaNvencEncoderSettings? settings = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         var pipeName = $"SpoutDirectSaverAlpha_{Guid.NewGuid():N}";
@@ -49,10 +51,13 @@ internal sealed class RealtimeAlphaHevcWriter : IAsyncDisposable
             0,
             8 * 1024 * 1024);
         _pipeConnectionTask = _pipeServer.WaitForConnectionAsync();
-        var gop = Math.Max(1, (int)Math.Round(frameRate));
-
-        var arguments =
-            $"-y -f rawvideo -pixel_format gray -video_size {width}x{height} -framerate {frameRate:0.###} -blocksize 16777216 -i \"{pipePath}\" -an -vf format=yuv420p -c:v hevc_nvenc -preset:v p3 -tune:v hq -rc:v vbr -cq:v 19 -b:v 0 -bf:v 0 -g:v {gop} -pix_fmt:v yuv420p -profile:v main -movflags +faststart -video_track_timescale 120000 \"{outputPath}\"";
+        var effectiveSettings = settings ?? EncoderSettingsRoot.CreateDefaults().Alpha;
+        var arguments = effectiveSettings.BuildArguments(
+            width,
+            height,
+            frameRate,
+            $"-blocksize 16777216 -i \"{pipePath}\"",
+            outputPath);
 
         var startInfo = new ProcessStartInfo
         {

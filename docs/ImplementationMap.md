@@ -11,6 +11,7 @@ Owns:
 - preview display
 - record / stop / re-record flow
 - wiring `SpoutPollingService` to `RecordingSession`
+- user-facing encoder settings for RGB Media Foundation and alpha ffmpeg/NVENC paths
 
 Important notes:
 
@@ -83,6 +84,17 @@ Owns:
 - dispatch to RGB and alpha writers
 - spool bookkeeping
 - finalization and export coordination
+- snapshotting encoder settings into the active session
+
+### `SpoutDirectSaver.App/Models/EncoderSettings.cs`
+
+- versioned RGB / alpha encoder settings models
+- Media Foundation property mapping
+- ffmpeg/NVENC argument mapping
+
+### `SpoutDirectSaver.App/Services/EncoderSettingsStore.cs`
+
+- persistence for encoder settings under LocalAppData
 
 This is the main place where:
 

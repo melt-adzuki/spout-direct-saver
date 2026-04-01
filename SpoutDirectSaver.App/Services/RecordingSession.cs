@@ -17,6 +17,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     private const double MinimumFrameDurationSeconds = 1.0 / 120.0;
     private readonly object _gate = new();
     private readonly EncoderOption _encoderOption;
+    private readonly EncoderSettingsRoot _encoderSettings;
     private readonly string _outputPath;
     private readonly string _temporaryDirectory;
     private readonly string _spoolPath;
@@ -63,6 +64,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     public RecordingSession(
         EncoderOption encoderOption,
         string outputPath,
+        EncoderSettingsRoot? encoderSettings = null,
         int channelCapacity = 32,
         bool blockOnBackpressure = true,
         bool? compressSpoolFrames = null,
@@ -71,6 +73,7 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         _encoderOption = encoderOption;
         _outputPath = outputPath;
+        _encoderSettings = encoderSettings?.Clone() ?? EncoderSettingsRoot.CreateDefaults();
         _blockOnBackpressure = blockOnBackpressure;
         _compressSpoolFrames = compressSpoolFrames;
         _writeSynchronously = writeSynchronously;
@@ -319,7 +322,8 @@ internal sealed class RecordingSession : IAsyncDisposable
                         _recordedHeight,
                         GetOutputFrameRate(),
                         _alphaTrackPath,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken,
+                        _encoderSettings.Alpha).ConfigureAwait(false);
                 }
 
                 if (_disableHybridRgbIntermediate)
@@ -883,7 +887,8 @@ internal sealed class RecordingSession : IAsyncDisposable
             _recordedHeight,
             _outputFrameRate,
             _outputPath,
-            ResolveCacheRoot(_outputPath));
+            ResolveCacheRoot(_outputPath),
+            settings: _encoderSettings);
     }
 
     private void EnsureRgbIntermediateWriterStarted(GpuTextureFrame gpuFrame)
@@ -907,7 +912,8 @@ internal sealed class RecordingSession : IAsyncDisposable
             _recordedHeight,
             _outputFrameRate,
             _rgbIntermediatePath,
-            gpuFrame.Device);
+            gpuFrame.Device,
+            settings: _encoderSettings.Rgb);
     }
 
     private void EnsureRgbIntermediateWriterStarted()
@@ -930,7 +936,8 @@ internal sealed class RecordingSession : IAsyncDisposable
             _recordedWidth,
             _recordedHeight,
             _outputFrameRate,
-            _rgbIntermediatePath);
+            _rgbIntermediatePath,
+            settings: _encoderSettings.Rgb);
     }
 
     private void QueueFrameForRealtimeEncode(RecordedFrame frame, PixelBufferLease pixelData)

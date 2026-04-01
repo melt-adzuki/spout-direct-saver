@@ -31,7 +31,8 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
         double frameRate,
         string outputPath,
         string cacheRoot,
-        int queueCapacity = 8)
+        int queueCapacity = 8,
+        EncoderSettingsRoot? settings = null)
     {
         _finalOutputPath = outputPath;
         _pixelCount = checked((int)(width * height));
@@ -43,8 +44,18 @@ internal sealed class RealtimeHybridWriter : IAsyncDisposable
         _mainVideoPath = Path.Combine(_temporaryDirectory, "rgb.mp4");
         _alphaVideoPath = Path.Combine(_temporaryDirectory, "alpha.mp4");
 
-        _mainWriter = new MediaFoundationHevcWriter(width, height, frameRate, _mainVideoPath);
-        _alphaWriter = new RealtimeAlphaHevcWriter(width, height, frameRate, _alphaVideoPath);
+        _mainWriter = new MediaFoundationHevcWriter(
+            width,
+            height,
+            frameRate,
+            _mainVideoPath,
+            settings: settings?.Rgb);
+        _alphaWriter = new RealtimeAlphaHevcWriter(
+            width,
+            height,
+            frameRate,
+            _alphaVideoPath,
+            settings: settings?.Alpha);
 
         _channel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(Math.Max(queueCapacity, 1))
         {
