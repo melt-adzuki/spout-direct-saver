@@ -129,6 +129,13 @@ public partial class MainWindow : Window
         await SelectOutputPathAsync(forcePrompt: true);
     }
 
+    private void ResetEncoderSettingsButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        _encoderSettings = EncoderSettingsRoot.CreateDefaults();
+        LoadEncoderSettingsIntoUi();
+        _encoderSettingsStore.Save(_encoderSettings);
+    }
+
     private void FormatComboBox_OnSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         var option = SelectedEncoderOption;

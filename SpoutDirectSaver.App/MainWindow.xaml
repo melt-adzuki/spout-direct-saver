@@ -300,13 +300,24 @@
                     <ScrollViewer VerticalScrollBarVisibility="Auto"
                                   MaxHeight="390">
                         <StackPanel x:Name="EncoderSettingsRootPanel" Orientation="Vertical">
-                            <TextBlock FontSize="16"
-                                       FontWeight="SemiBold"
-                                       Text="Encoder Tuning" />
-                            <TextBlock Margin="0,4,0,14"
-                                       Foreground="#96AABD"
-                                       TextWrapping="Wrap"
-                                       Text="普段は preset / tune / rate control あたりだけで十分です。細かい調整は必要なときだけ開けるようにしてあります。" />
+                            <DockPanel LastChildFill="False">
+                                <StackPanel DockPanel.Dock="Left">
+                                    <TextBlock FontSize="16"
+                                               FontWeight="SemiBold"
+                                               Text="Encoder Tuning" />
+                                    <TextBlock Margin="0,4,0,14"
+                                               Foreground="#96AABD"
+                                               TextWrapping="Wrap"
+                                               Text="普段は preset / tune / rate control あたりだけで十分です。細かい調整は必要なときだけ開けるようにしてあります。" />
+                                </StackPanel>
+                                <Button DockPanel.Dock="Right"
+                                        Margin="12,0,0,0"
+                                        Padding="12,8"
+                                        Background="#30414D"
+                                        BorderBrush="#4E6678"
+                                        Click="ResetEncoderSettingsButton_OnClick"
+                                        Content="設定をリセット" />
+                            </DockPanel>
 
                             <Border Style="{StaticResource EncoderCardStyle}"
                                     Margin="0,0,0,14"
