@@ -619,6 +619,16 @@ public partial class MainWindow : Window
         return $"spout_capture_{stamp}{option.Extension}";
     }
 
+    private void EncoderSettingsSelection_OnChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        ApplyEncoderSettingsVisibility();
+    }
+
+    private void EncoderSettingsToggle_OnChanged(object sender, RoutedEventArgs e)
+    {
+        ApplyEncoderSettingsVisibility();
+    }
+
     private void LoadEncoderSettingsIntoUi()
     {
         RgbRateControlComboBox.SelectedItem = _encoderSettings.Rgb.RateControlMode;
@@ -696,7 +706,34 @@ public partial class MainWindow : Window
 
     private void ApplyEncoderSettingsVisibility()
     {
-        EncoderSettingsSectionBorder.Visibility = SelectedEncoderOption.Kind == EncoderProfileKind.HevcNvencMp4AlphaMp4
+        var showEncoderSettings = SelectedEncoderOption.Kind == EncoderProfileKind.HevcNvencMp4AlphaMp4;
+        EncoderSettingsSectionBorder.Visibility = showEncoderSettings
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        if (!showEncoderSettings)
+        {
+            return;
+        }
+
+        RgbConstantQpPanel.Visibility = RgbUseConstantQpCheckBox.IsChecked == true
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        var alphaRateControl = SelectedEnum(AlphaRateControlComboBox, AlphaNvencRateControlMode.Vbr);
+        AlphaTargetBitratePanel.Visibility =
+            alphaRateControl is AlphaNvencRateControlMode.Vbr or AlphaNvencRateControlMode.Cbr
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        AlphaConstantQualityPanel.Visibility = alphaRateControl == AlphaNvencRateControlMode.Vbr
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        AlphaConstantQpPanel.Visibility = alphaRateControl == AlphaNvencRateControlMode.ConstQp
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        var useAq = AlphaSpatialAqCheckBox.IsChecked == true || AlphaTemporalAqCheckBox.IsChecked == true;
+        AlphaAqStrengthPanel.Visibility = useAq
             ? Visibility.Visible
             : Visibility.Collapsed;
     }
