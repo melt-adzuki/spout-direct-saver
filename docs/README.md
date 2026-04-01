@@ -68,7 +68,8 @@ Primary concerns:
 - applying Windows-specific scheduling and D3D11 latency hints on a best-effort basis
 - allowing encoder tuning from the GUI while keeping RGB/MF and alpha/NVENC settings separate
 
-The app persists encoder tuning in `%LocalAppData%\SpoutDirectSaver\encoder-settings.json`.
+The app persists encoder tuning in `%AppData%\SpoutDirectSaver\encoder-settings.json`.
+Temporary cache files live under `%LocalAppData%\Temp\SpoutDirectSaverCaches\` and are cleared on startup.
 Media Foundation options that are not shown in the UI are intentionally omitted rather than disabled.
 
 ### Post-Record Review

@@ -10,6 +10,7 @@ public partial class App : Application
     {
         WindowsScheduling.InitializeProcessSchedulingHints();
         WindowsScheduling.TryPromoteCurrentProcess(ProcessPriorityClass.High);
+        AppDataPaths.ClearCacheRoot();
         base.OnStartup(e);
     }
 

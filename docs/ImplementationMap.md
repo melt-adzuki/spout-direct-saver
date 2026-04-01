@@ -94,7 +94,7 @@ Owns:
 
 ### `SpoutDirectSaver.App/Services/EncoderSettingsStore.cs`
 
-- persistence for encoder settings under LocalAppData
+- persistence for encoder settings under Roaming AppData
 
 This is the main place where:
 

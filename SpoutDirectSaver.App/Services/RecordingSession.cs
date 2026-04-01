@@ -1076,19 +1076,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             return Path.Combine(overrideRoot, "SpoutDirectSaverCache");
         }
 
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (!string.IsNullOrWhiteSpace(localAppData))
-        {
-            return Path.Combine(localAppData, "SpoutDirectSaver", "Cache");
-        }
-
-        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        if (!string.IsNullOrWhiteSpace(desktop))
-        {
-            return Path.Combine(desktop, "SpoutDirectSaverCache");
-        }
-
-        return Path.Combine(Path.GetTempPath(), "SpoutDirectSaver");
+        return AppDataPaths.CacheRootDirectory;
     }
 
     private static string BuildAlphaSidecarPath(string outputPath)

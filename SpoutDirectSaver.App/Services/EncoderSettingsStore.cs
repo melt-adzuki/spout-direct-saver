@@ -22,7 +22,7 @@ internal sealed class EncoderSettingsStore
 
     public EncoderSettingsStore()
     {
-        FilePath = BuildFilePath();
+        FilePath = AppDataPaths.EncoderSettingsFilePath;
     }
 
     public EncoderSettingsRoot Load()
@@ -56,13 +56,4 @@ internal sealed class EncoderSettingsStore
         File.WriteAllText(FilePath, json);
     }
 
-    private static string BuildFilePath()
-    {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var baseDirectory = string.IsNullOrWhiteSpace(localAppData)
-            ? Path.Combine(Path.GetTempPath(), "SpoutDirectSaver")
-            : Path.Combine(localAppData, "SpoutDirectSaver");
-
-        return Path.Combine(baseDirectory, "encoder-settings.json");
-    }
 }
