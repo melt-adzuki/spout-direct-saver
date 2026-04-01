@@ -9,7 +9,7 @@ namespace SpoutDirectSaver.App.Models;
 
 internal sealed class EncoderSettingsRoot
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 3;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
 
@@ -31,21 +31,26 @@ internal sealed class EncoderSettingsRoot
 
     public void Normalize()
     {
+        var schemaVersion = SchemaVersion;
         SchemaVersion = CurrentSchemaVersion;
-        Rgb.Normalize();
+        Rgb.Normalize(schemaVersion);
         Alpha.Normalize();
     }
 }
 
 internal sealed class RgbMediaFoundationEncoderSettings
 {
-    public RgbMediaFoundationRateControlMode RateControlMode { get; set; } = RgbMediaFoundationRateControlMode.Auto;
+    public RgbMediaFoundationRateControlMode RateControlMode { get; set; } = RgbMediaFoundationRateControlMode.Quality;
 
-    public int TargetBitrateMbps { get; set; } = 40;
+    public int TargetBitrateMbps { get; set; } = 0;
+
+    public int PresetLevel { get; set; } = 2;
+
+    public int Quality { get; set; } = 70;
 
     public int BufferSizeMb { get; set; } = 0;
 
-    public int QualityVsSpeed { get; set; } = 0;
+    public int QualityVsSpeed { get; set; } = 16;
 
     public bool LowLatency { get; set; } = true;
 
@@ -68,9 +73,11 @@ internal sealed class RgbMediaFoundationEncoderSettings
         return (RgbMediaFoundationEncoderSettings)MemberwiseClone();
     }
 
-    public void Normalize()
+    public void Normalize(int schemaVersion)
     {
         TargetBitrateMbps = Clamp(TargetBitrateMbps, 0, 1_000_000);
+        PresetLevel = Clamp(PresetLevel, 1, 7);
+        Quality = Clamp(Quality, 1, 100);
         BufferSizeMb = Clamp(BufferSizeMb, 0, 1_000_000);
         QualityVsSpeed = Clamp(QualityVsSpeed, 0, 100);
         ConstantQp = Clamp(ConstantQp, 0, 51);
@@ -78,6 +85,11 @@ internal sealed class RgbMediaFoundationEncoderSettings
         MaxQp = Clamp(MaxQp, -1, 51);
         GopSize = Clamp(GopSize, 0, 1_000_000);
         WorkerThreads = Clamp(WorkerThreads, 0, 256);
+
+        if (schemaVersion < 3 && QualityVsSpeed == 0)
+        {
+            QualityVsSpeed = PresetLevelToQualityVsSpeed(PresetLevel);
+        }
     }
 
     public void ApplyTo(IMFAttributes encodingParameters)
@@ -99,10 +111,12 @@ internal sealed class RgbMediaFoundationEncoderSettings
             encodingParameters.Set(CodecApiGuids.AvEncCommonBufferSize, checked((uint)(BufferSizeMb * 1_000_000)));
         }
 
-        if (QualityVsSpeed > 0)
+        if (RateControlMode == RgbMediaFoundationRateControlMode.Quality && Quality > 0)
         {
-            encodingParameters.Set(CodecApiGuids.AvEncCommonQualityVsSpeed, checked((uint)QualityVsSpeed));
+            encodingParameters.Set(CodecApiGuids.AvEncCommonQuality, checked((uint)Quality));
         }
+
+        encodingParameters.Set(CodecApiGuids.AvEncCommonQualityVsSpeed, checked((uint)QualityVsSpeed));
 
         encodingParameters.Set(CodecApiGuids.AvLowLatencyMode, LowLatency ? 1u : 0u);
 
@@ -137,6 +151,21 @@ internal sealed class RgbMediaFoundationEncoderSettings
         {
             encodingParameters.Set(CodecApiGuids.AvEncNumWorkerThreads, checked((uint)WorkerThreads));
         }
+    }
+
+    public static int PresetLevelToQualityVsSpeed(int presetLevel)
+    {
+        var clamped = Clamp(presetLevel, 1, 7);
+        return clamped switch
+        {
+            1 => 0,
+            2 => 16,
+            3 => 32,
+            4 => 50,
+            5 => 68,
+            6 => 84,
+            _ => 100
+        };
     }
 
     private static int Clamp(int value, int min, int max)
@@ -414,6 +443,35 @@ internal static class RgbMediaFoundationContentTypeHintExtensions
 
 internal static class AlphaNvencValueExtensions
 {
+    public static AlphaNvencPreset FromUiPresetLevel(int level)
+    {
+        return level switch
+        {
+            1 => AlphaNvencPreset.P1,
+            2 => AlphaNvencPreset.P2,
+            3 => AlphaNvencPreset.P3,
+            4 => AlphaNvencPreset.P4,
+            5 => AlphaNvencPreset.P5,
+            6 => AlphaNvencPreset.P6,
+            _ => AlphaNvencPreset.P7
+        };
+    }
+
+    public static int ToUiPresetLevel(this AlphaNvencPreset preset)
+    {
+        return preset switch
+        {
+            AlphaNvencPreset.P1 => 1,
+            AlphaNvencPreset.P2 => 2,
+            AlphaNvencPreset.P3 => 3,
+            AlphaNvencPreset.P4 => 4,
+            AlphaNvencPreset.P5 => 5,
+            AlphaNvencPreset.P6 => 6,
+            AlphaNvencPreset.P7 => 7,
+            _ => 3
+        };
+    }
+
     public static string ToFfmpegValue(this AlphaNvencRateControlMode mode)
     {
         return mode switch
@@ -504,6 +562,7 @@ internal static class AlphaNvencValueExtensions
 internal static class CodecApiGuids
 {
     public static readonly Guid AvEncCommonRateControlMode = new("1c0608e9-370c-4710-8a58-cb6181c42423");
+    public static readonly Guid AvEncCommonQuality = new("fcbf57a3-7ea5-4b0c-9644-69b40c39c391");
     public static readonly Guid AvEncCommonMeanBitRate = new("f7222374-2144-4815-b550-a37f8e12ee52");
     public static readonly Guid AvEncCommonBufferSize = new("0db96574-b6a4-4c8b-8106-3773de0310cd");
     public static readonly Guid AvEncCommonQualityVsSpeed = new("98332df8-03cd-476b-89fa-3f9e442dec9f");
