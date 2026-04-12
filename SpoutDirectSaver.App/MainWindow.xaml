@@ -6,839 +6,327 @@
         xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
         mc:Ignorable="d"
         Title="Spout Direct Saver"
-        Width="1360"
-        Height="900"
-        MinWidth="1120"
-        MinHeight="760"
-        Background="#10151C">
+        Width="1024"
+        Height="768"
+        MinWidth="1024"
+        MinHeight="768"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        Background="#434343"
+        FontFamily="Segoe UI"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True">
     <Window.Resources>
-        <DrawingBrush x:Key="CheckerBrush"
-                      TileMode="Tile"
-                      Stretch="None"
-                      Viewport="0,0,24,24"
-                      ViewportUnits="Absolute">
-            <DrawingBrush.Drawing>
-                <DrawingGroup>
-                    <GeometryDrawing Brush="#1B2530" Geometry="M0,0 H24 V24 H0 Z" />
-                    <GeometryDrawing Brush="#243140" Geometry="M0,0 H12 V12 H0 Z" />
-                    <GeometryDrawing Brush="#243140" Geometry="M12,12 H24 V24 H12 Z" />
-                </DrawingGroup>
-            </DrawingBrush.Drawing>
-        </DrawingBrush>
-
-        <Style TargetType="Button">
-            <Setter Property="Foreground" Value="#F2F6FB" />
-            <Setter Property="Background" Value="#1D5C58" />
-            <Setter Property="BorderBrush" Value="#2C7B76" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Padding" Value="14,10" />
-            <Setter Property="Margin" Value="0,0,10,0" />
-            <Setter Property="FontSize" Value="14" />
+        <Style x:Key="ActionButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="112" />
+            <Setter Property="Height" Value="112" />
+            <Setter Property="Margin" Value="0,0,14,0" />
+            <Setter Property="Padding" Value="8" />
+            <Setter Property="Foreground" Value="#F4F4F4" />
+            <Setter Property="FontFamily" Value="Segoe UI" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="BorderThickness" Value="2" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="14">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              RecognizesAccessKey="True" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#5D5D5D" />
+                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#7A7A7A" />
+                                <Setter Property="Foreground" Value="#B8B8B8" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Opacity" Value="0.96" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="RenderTransformOrigin" Value="0.5,0.5" />
+                                <Setter TargetName="ButtonBorder" Property="RenderTransform">
+                                    <Setter.Value>
+                                        <ScaleTransform ScaleX="0.98" ScaleY="0.98" />
+                                    </Setter.Value>
+                                </Setter>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
-        <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="#E9F0F7" />
+        <Style x:Key="MetricLabelStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#D0D0D0" />
+            <Setter Property="FontSize" Value="24" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Margin" Value="0,0,0,2" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
         </Style>
 
-        <Style TargetType="TextBox">
-            <Setter Property="Foreground" Value="#EEF6FF" />
-            <Setter Property="Background" Value="#0F1821" />
-            <Setter Property="BorderBrush" Value="#355165" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Padding" Value="10,6" />
-            <Setter Property="CaretBrush" Value="#EEF6FF" />
+        <Style x:Key="MetricValueStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#F4F4F4" />
+            <Setter Property="FontSize" Value="38" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
         </Style>
 
-        <Style TargetType="ComboBox">
-            <Setter Property="Foreground" Value="#EEF6FF" />
-            <Setter Property="Background" Value="#0F1821" />
-            <Setter Property="BorderBrush" Value="#355165" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Padding" Value="8,4" />
-        </Style>
-
-        <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="#EAF2FB" />
-            <Setter Property="Margin" Value="0,0,16,0" />
-        </Style>
-
-        <Style x:Key="FieldLabelStyle" TargetType="TextBlock">
-            <Setter Property="Foreground" Value="#96AABD" />
-            <Setter Property="FontSize" Value="12" />
-            <Setter Property="Margin" Value="0,0,0,6" />
-        </Style>
-
-        <Style x:Key="EncoderCardStyle" TargetType="Border">
-            <Setter Property="Background" Value="#101820" />
-            <Setter Property="BorderBrush" Value="#294051" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="14" />
-            <Setter Property="Padding" Value="14" />
+        <Style x:Key="MetricSeparatorStyle" TargetType="Border">
+            <Setter Property="Background" Value="#8F8F8F" />
+            <Setter Property="Width" Value="4" />
+            <Setter Property="Height" Value="58" />
+            <Setter Property="CornerRadius" Value="2" />
+            <Setter Property="Margin" Value="0,8,0,0" />
+            <Setter Property="Opacity" Value="0.95" />
         </Style>
     </Window.Resources>
 
-    <Grid Margin="18">
+    <Grid Background="#434343" ClipToBounds="True">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="1.05*" />
         </Grid.RowDefinitions>
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="2.1*" />
-            <ColumnDefinition Width="1*" />
-        </Grid.ColumnDefinitions>
 
-        <Border Grid.Row="0"
-                Grid.ColumnSpan="2"
-                Background="#18212B"
-                BorderBrush="#263445"
-                BorderThickness="1"
-                CornerRadius="14"
-                Padding="18"
-                Margin="0,0,0,16">
-            <DockPanel LastChildFill="True">
-                <StackPanel Orientation="Vertical" DockPanel.Dock="Left">
-                    <TextBlock FontSize="26" FontWeight="SemiBold" Text="Spout Direct Saver" />
-                    <TextBlock Margin="0,6,0,0"
-                               Foreground="#9DB1C6"
-                               Text="Spout2 のフレームを受信し、変化フレームのみを可変fpsで動画化します。" />
-                </StackPanel>
-                <Border DockPanel.Dock="Right"
-                        Background="#121820"
-                        BorderBrush="#324558"
-                        BorderThickness="1"
-                        CornerRadius="999"
-                        Padding="14,8">
-                    <TextBlock x:Name="HeaderStatusTextBlock"
-                               FontSize="13"
-                               FontWeight="SemiBold"
-                               Text="初期化中..." />
-                </Border>
-            </DockPanel>
-        </Border>
+        <Grid x:Name="InitialMetricsPanel"
+              Margin="92,42,92,0"
+              HorizontalAlignment="Left"
+              VerticalAlignment="Top">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="34" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="34" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
 
-        <Border Grid.Row="1"
-                Grid.Column="0"
-                Background="#18212B"
-                BorderBrush="#263445"
-                BorderThickness="1"
-                CornerRadius="18"
-                Padding="16"
-                Margin="0,0,16,16">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
+            <StackPanel MinWidth="160">
+                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Resolution" />
+                <TextBlock x:Name="ResolutionValueTextBlock"
+                           Style="{StaticResource MetricValueStyle}"
+                           Text="---" />
+            </StackPanel>
 
-                <DockPanel Margin="0,0,0,12">
-                    <StackPanel Orientation="Vertical" DockPanel.Dock="Left">
-                        <TextBlock FontSize="18" FontWeight="SemiBold" Text="ライブ入力" />
-                        <TextBlock Margin="0,4,0,0"
-                                   Foreground="#8FA4B9"
-                                   Text="RGBA 8bit で受信し、ここではチェック柄の上にプレビュー表示します。" />
-                    </StackPanel>
-                    <Border DockPanel.Dock="Right"
-                            Background="#121820"
-                            BorderBrush="#324558"
-                            BorderThickness="1"
-                            CornerRadius="999"
-                            Padding="12,6">
-                        <TextBlock x:Name="LivePreviewBadgeTextBlock"
-                                   FontSize="12"
-                                   FontWeight="SemiBold"
-                                   Text="入力待ち" />
-                    </Border>
-                </DockPanel>
+            <Border Grid.Column="1" Style="{StaticResource MetricSeparatorStyle}" />
 
-                <Border Grid.Row="1"
-                        Background="{StaticResource CheckerBrush}"
-                        BorderBrush="#33475C"
-                        BorderThickness="1"
-                        CornerRadius="14"
+            <StackPanel Grid.Column="2" MinWidth="160">
+                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Frame Rate" />
+                <TextBlock x:Name="FrameRateValueTextBlock"
+                           Style="{StaticResource MetricValueStyle}"
+                           Text="---" />
+            </StackPanel>
+
+            <Border Grid.Column="3" Style="{StaticResource MetricSeparatorStyle}" />
+
+            <StackPanel Grid.Column="4" MinWidth="220">
+                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Sender" />
+                <TextBlock x:Name="SenderValueTextBlock"
+                           Style="{StaticResource MetricValueStyle}"
+                           Text="---" />
+            </StackPanel>
+        </Grid>
+
+        <Grid x:Name="StateMetricsPanel"
+              Margin="92,42,92,0"
+              HorizontalAlignment="Left"
+              VerticalAlignment="Top"
+              Visibility="Collapsed">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="34" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel MinWidth="190">
+                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Status" />
+                <TextBlock x:Name="StateValueTextBlock"
+                           Style="{StaticResource MetricValueStyle}"
+                           Text="---" />
+            </StackPanel>
+
+            <Border Grid.Column="1" Style="{StaticResource MetricSeparatorStyle}" />
+
+            <StackPanel Grid.Column="2" MinWidth="230">
+                <TextBlock x:Name="SecondaryLabelTextBlock"
+                           Style="{StaticResource MetricLabelStyle}"
+                           Text="Duration" />
+                <TextBlock x:Name="SecondaryValueTextBlock"
+                           Style="{StaticResource MetricValueStyle}"
+                           Text="00:00:00" />
+            </StackPanel>
+        </Grid>
+
+        <Grid Grid.Row="1"
+              Margin="128,18,128,0"
+              VerticalAlignment="Top">
+            <Border Background="#252525"
+                    CornerRadius="34"
+                    Padding="12"
+                    Height="430">
+                <Border Background="#666666"
+                        CornerRadius="24"
                         ClipToBounds="True">
                     <Grid>
-                        <Image x:Name="LivePreviewImage" Stretch="Uniform" />
-                        <Border x:Name="LivePreviewPlaceholderBorder"
-                                VerticalAlignment="Center"
-                                HorizontalAlignment="Center"
-                                Background="#A010151C"
-                                CornerRadius="12"
-                                Padding="18,14">
-                            <TextBlock x:Name="LivePreviewPlaceholderTextBlock"
-                                       FontSize="16"
+                        <Image x:Name="LivePreviewImage"
+                               Stretch="Uniform"
+                               Visibility="Collapsed"
+                               SnapsToDevicePixels="True" />
+
+                        <vlc:VideoView x:Name="PlaybackVideoView"
+                                       Visibility="Collapsed" />
+
+                        <Grid x:Name="OverlayHost"
+                              IsHitTestVisible="False"
+                              Panel.ZIndex="5">
+                            <TextBlock x:Name="NoSignalOverlayTextBlock"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontSize="58"
+                                       FontWeight="Bold"
+                                       Foreground="#F4F4F4"
+                                       Text="NO SIGNAL"
+                                       TextOptions.TextFormattingMode="Display" />
+
+                            <StackPanel x:Name="EncodingOverlayPanel"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        Visibility="Collapsed">
+                                <TextBlock Text="Encoding..."
+                                           HorizontalAlignment="Center"
+                                           FontSize="52"
+                                           FontWeight="SemiBold"
+                                           Foreground="#F4F4F4"
+                                           TextOptions.TextFormattingMode="Display" />
+                                <Grid Width="360"
+                                      Height="8"
+                                      Margin="0,18,0,0">
+                                    <Border Background="#949494"
+                                            CornerRadius="4" />
+                                    <Border x:Name="EncodingProgressFill"
+                                            HorizontalAlignment="Left"
+                                            Width="0"
+                                            Background="#F4F4F4"
+                                            CornerRadius="4" />
+                                </Grid>
+                            </StackPanel>
+
+                            <TextBlock x:Name="DoneOverlayTextBlock"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontSize="54"
                                        FontWeight="SemiBold"
-                                       Text="Spout sender を待っています" />
-                        </Border>
+                                       Foreground="#F4F4F4"
+                                       Text="Done!"
+                                       Visibility="Collapsed"
+                                       TextOptions.TextFormattingMode="Display" />
+                        </Grid>
                     </Grid>
                 </Border>
-            </Grid>
-        </Border>
+            </Border>
+        </Grid>
 
-        <Border Grid.Row="1"
-                Grid.Column="1"
-                Background="#18212B"
-                BorderBrush="#263445"
-                BorderThickness="1"
-                CornerRadius="18"
-                Padding="16"
-                Margin="0,0,0,16">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
+        <Grid Grid.Row="2"
+              Margin="92,18,92,36">
+            <StackPanel x:Name="InitialActionsPanel"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Left">
+                <Button x:Name="RecordButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Background="#A73438"
+                        BorderBrush="#C05055"
+                        Click="RecordButton_OnClick" />
+                <Button x:Name="SettingsButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Background="#113D39"
+                        BorderBrush="#2E5D57"
+                        Click="SettingsButton_OnClick" />
+            </StackPanel>
 
-                <TextBlock FontSize="18" FontWeight="SemiBold" Text="受信状況" />
+            <StackPanel x:Name="RecordingActionsPanel"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Left"
+                        Visibility="Collapsed">
+                <Button x:Name="DoneButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Background="#7AA300"
+                        BorderBrush="#96BD1A"
+                        Click="DoneButton_OnClick" />
+                <Button x:Name="PauseResumeButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Background="#113D39"
+                        BorderBrush="#2E5D57"
+                        Click="PauseResumeButton_OnClick" />
+            </StackPanel>
 
-                <TextBlock Grid.Row="1" Margin="0,18,0,4" Foreground="#8FA4B9" Text="Sender" />
-                <TextBlock Grid.Row="2" x:Name="SenderNameTextBlock" FontSize="16" FontWeight="SemiBold" Text="-" />
-
-                <TextBlock Grid.Row="3" Margin="0,16,0,4" Foreground="#8FA4B9" Text="解像度 / sender fps" />
-                <TextBlock Grid.Row="4" x:Name="SenderMetricsTextBlock" FontSize="16" FontWeight="SemiBold" Text="- / -" />
-
-                <TextBlock Grid.Row="5" Margin="0,16,0,4" Foreground="#8FA4B9" Text="録画経過" />
-                <TextBlock Grid.Row="6" x:Name="RecordingElapsedTextBlock" FontSize="16" FontWeight="SemiBold" Text="00:00:00.000" />
-
-                <TextBlock Grid.Row="7" Margin="0,16,0,4" Foreground="#8FA4B9" Text="状態" />
-                <Border Grid.Row="8"
-                        Background="#121820"
-                        BorderBrush="#324558"
-                        BorderThickness="1"
-                        CornerRadius="14"
-                        Padding="12">
-                    <TextBlock x:Name="RecorderStatusTextBlock"
-                               TextWrapping="Wrap"
-                               Foreground="#DCE8F5"
-                               Text="録画前です。" />
-                </Border>
-            </Grid>
-        </Border>
-
-        <Border Grid.Row="2"
-                Grid.ColumnSpan="2"
-                Background="#18212B"
-                BorderBrush="#263445"
-                BorderThickness="1"
-                CornerRadius="18"
-                Padding="16"
-                Margin="0,0,0,16">
-            <Grid>
+            <Grid x:Name="PlaybackActionsPanel"
+                  Visibility="Collapsed">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="1.02*" />
-                    <ColumnDefinition Width="0.98*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <Grid Grid.Column="0">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                    <StackPanel Orientation="Vertical">
-                        <TextBlock FontSize="18"
-                                   FontWeight="SemiBold"
-                                   Text="保存形式" />
-                        <ComboBox Grid.Row="0"
-                                  x:Name="FormatComboBox"
-                                  Margin="0,10,0,0"
-                                  Height="34"
-                                  VerticalContentAlignment="Center"
-                                  SelectionChanged="FormatComboBox_OnSelectionChanged" />
-                        <TextBlock Grid.Row="0"
-                                   x:Name="FormatDescriptionTextBlock"
-                                   Margin="0,10,0,0"
-                                   Foreground="#96AABD"
-                                   TextWrapping="Wrap"
-                                   Text="RGBA をそのまま保存できる形式を選びます。" />
-                    </StackPanel>
-
-                    <Grid Grid.Row="1" Margin="0,16,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-
-                        <TextBlock VerticalAlignment="Center"
-                                   Margin="0,0,10,0"
-                                   FontWeight="SemiBold"
-                                   Text="保存先" />
-                        <TextBox Grid.Column="1"
-                                 x:Name="OutputPathTextBox"
-                                 Height="34"
-                                 IsReadOnly="True"
-                                 VerticalContentAlignment="Center" />
-                        <Button Grid.Column="2"
-                                x:Name="BrowseOutputButton"
-                                Margin="10,0,0,0"
-                                Click="BrowseOutputButton_OnClick"
-                                Content="保存先を選択" />
-                    </Grid>
-                </Grid>
-
-                <Border x:Name="EncoderSettingsSectionBorder"
-                        Grid.Column="1"
-                        BorderBrush="#365163"
-                        BorderThickness="1"
-                        CornerRadius="14"
-                        Padding="14">
-                    <Border.Background>
-                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                            <GradientStop Color="#152330" Offset="0" />
-                            <GradientStop Color="#0E171F" Offset="1" />
-                        </LinearGradientBrush>
-                    </Border.Background>
-                    <ScrollViewer VerticalScrollBarVisibility="Auto"
-                                  MaxHeight="390">
-                        <StackPanel x:Name="EncoderSettingsRootPanel" Orientation="Vertical">
-                            <DockPanel LastChildFill="False">
-                                <StackPanel DockPanel.Dock="Left">
-                                    <TextBlock FontSize="16"
-                                               FontWeight="SemiBold"
-                                               Text="Encoder Tuning" />
-                                    <TextBlock Margin="0,4,0,14"
-                                               Foreground="#96AABD"
-                                               TextWrapping="Wrap"
-                                               Text="普段は preset / tune / rate control あたりだけで十分です。細かい調整は必要なときだけ開けるようにしてあります。" />
-                                </StackPanel>
-                                <Button DockPanel.Dock="Right"
-                                        Margin="12,0,0,0"
-                                        Padding="12,8"
-                                        Background="#30414D"
-                                        BorderBrush="#4E6678"
-                                        Click="ResetEncoderSettingsButton_OnClick"
-                                        Content="設定をリセット" />
-                            </DockPanel>
-
-                            <Border Style="{StaticResource EncoderCardStyle}"
-                                    Margin="0,0,0,14"
-                                    Background="#143038"
-                                    BorderBrush="#2C666C">
-                                <StackPanel>
-                                    <TextBlock FontSize="13"
-                                               FontWeight="SemiBold"
-                                               Text="Quick Guide" />
-                                    <TextBlock Margin="0,6,0,0"
-                                               Foreground="#C4E1E5"
-                                               TextWrapping="Wrap"
-                                               Text="RGB は raw の quality vs speed と low latency、alpha は preset / tune / CQ を主に触れば十分です。" />
-                                </StackPanel>
-                            </Border>
-
-                            <Border Style="{StaticResource EncoderCardStyle}">
-                                <StackPanel>
-                                    <DockPanel LastChildFill="False">
-                                        <StackPanel DockPanel.Dock="Left">
-                                            <TextBlock FontSize="15"
-                                                       FontWeight="SemiBold"
-                                                       Text="RGB (Media Foundation)" />
-                                            <TextBlock Margin="0,4,0,0"
-                                                       Foreground="#8FA4B9"
-                                                       Text="本体の RGB 動画。主に raw の quality vs speed と low latency を調整します。" />
-                                        </StackPanel>
-                                        <Border DockPanel.Dock="Right"
-                                                Background="#16303D"
-                                                BorderBrush="#325468"
-                                                BorderThickness="1"
-                                                CornerRadius="999"
-                                                Padding="10,5">
-                                            <TextBlock FontSize="11"
-                                                       FontWeight="SemiBold"
-                                                       Text="Main Video" />
-                                        </Border>
-                                    </DockPanel>
-
-                                    <Grid Margin="0,14,0,0">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="16" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel Grid.Column="0">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Quality vs speed (raw)" />
-                                            <Slider x:Name="RgbQualityVsSpeedSlider"
-                                                    Minimum="0"
-                                                    Maximum="100"
-                                                    SmallChange="1"
-                                                    LargeChange="10"
-                                                    TickFrequency="10"
-                                                    AutoToolTipPlacement="BottomRight"
-                                                    ValueChanged="EncoderSettingsSlider_OnChanged" />
-                                            <TextBlock x:Name="RgbQualityVsSpeedValueTextBlock"
-                                                       Margin="0,6,0,0"
-                                                       Foreground="#D8E7F2"
-                                                       Text="16" />
-                                        </StackPanel>
-                                        <StackPanel x:Name="RgbQualityPanel"
-                                                    Grid.Column="2">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Target quality" />
-                                            <Slider x:Name="RgbQualitySlider"
-                                                    Minimum="1"
-                                                    Maximum="100"
-                                                    SmallChange="1"
-                                                    LargeChange="5"
-                                                    TickFrequency="5"
-                                                    AutoToolTipPlacement="BottomRight"
-                                                    ValueChanged="EncoderSettingsSlider_OnChanged" />
-                                            <TextBlock x:Name="RgbQualityValueTextBlock"
-                                                       Margin="0,6,0,0"
-                                                       Foreground="#D8E7F2"
-                                                       Text="70" />
-                                        </StackPanel>
-                                    </Grid>
-
-                                    <WrapPanel Margin="0,14,0,0">
-                                        <CheckBox x:Name="RgbLowLatencyCheckBox"
-                                                  Content="Low latency" />
-                                    </WrapPanel>
-
-                                    <Expander Header="RGB advanced"
-                                              Margin="0,16,0,0"
-                                              Foreground="#E9F0F7"
-                                              IsExpanded="False">
-                                        <StackPanel Margin="0,12,0,0">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Rate control" />
-                                                    <ComboBox x:Name="RgbRateControlComboBox"
-                                                              Height="32"
-                                                              VerticalContentAlignment="Center"
-                                                              SelectionChanged="EncoderSettingsSelection_OnChanged" />
-                                                </StackPanel>
-                                                <StackPanel x:Name="RgbTargetBitratePanel"
-                                                            Grid.Column="2">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Target bitrate (Mbps)" />
-                                                    <TextBox x:Name="RgbTargetBitrateTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <StackPanel Margin="0,14,0,0">
-                                                <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Buffer size (MB)" />
-                                                <TextBox x:Name="RgbBufferSizeTextBox"
-                                                         Height="32"
-                                                         VerticalContentAlignment="Center" />
-                                            </StackPanel>
-
-                                            <WrapPanel Margin="0,14,0,0">
-                                                <CheckBox x:Name="RgbUseConstantQpCheckBox"
-                                                          Content="Use constant QP"
-                                                          Checked="EncoderSettingsToggle_OnChanged"
-                                                          Unchecked="EncoderSettingsToggle_OnChanged" />
-                                            </WrapPanel>
-
-                                            <StackPanel x:Name="RgbConstantQpPanel"
-                                                        Margin="0,14,0,0">
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="*" />
-                                                        <ColumnDefinition Width="16" />
-                                                        <ColumnDefinition Width="*" />
-                                                    </Grid.ColumnDefinitions>
-                                                    <StackPanel Grid.Column="0">
-                                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Constant QP" />
-                                                        <TextBox x:Name="RgbConstantQpTextBox"
-                                                                 Height="32"
-                                                                 VerticalContentAlignment="Center" />
-                                                    </StackPanel>
-                                                    <StackPanel Grid.Column="2">
-                                                        <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Min / Max QP" />
-                                                        <Grid>
-                                                            <Grid.ColumnDefinitions>
-                                                                <ColumnDefinition Width="*" />
-                                                                <ColumnDefinition Width="22" />
-                                                                <ColumnDefinition Width="*" />
-                                                            </Grid.ColumnDefinitions>
-                                                            <TextBox x:Name="RgbMinQpTextBox"
-                                                                     Grid.Column="0"
-                                                                     Height="32"
-                                                                     VerticalContentAlignment="Center" />
-                                                            <TextBlock Grid.Column="1"
-                                                                       VerticalAlignment="Center"
-                                                                       HorizontalAlignment="Center"
-                                                                       Text="/" />
-                                                            <TextBox x:Name="RgbMaxQpTextBox"
-                                                                     Grid.Column="2"
-                                                                     Height="32"
-                                                                     VerticalContentAlignment="Center" />
-                                                        </Grid>
-                                                    </StackPanel>
-                                                </Grid>
-                                            </StackPanel>
-
-                                            <Grid Margin="0,14,0,0">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="GOP size" />
-                                                    <TextBox x:Name="RgbGopSizeTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                                <StackPanel Grid.Column="2">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Content type" />
-                                                    <ComboBox x:Name="RgbContentTypeComboBox"
-                                                              Height="32"
-                                                              VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <StackPanel Margin="0,14,0,0">
-                                                <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Worker threads" />
-                                                <TextBox x:Name="RgbWorkerThreadsTextBox"
-                                                         Height="32"
-                                                         VerticalContentAlignment="Center" />
-                                            </StackPanel>
-                                        </StackPanel>
-                                    </Expander>
-                                </StackPanel>
-                            </Border>
-
-                            <Border Style="{StaticResource EncoderCardStyle}"
-                                    Margin="0,14,0,0">
-                                <StackPanel>
-                                    <DockPanel LastChildFill="False">
-                                        <StackPanel DockPanel.Dock="Left">
-                                            <TextBlock FontSize="15"
-                                                       FontWeight="SemiBold"
-                                                       Text="Alpha (ffmpeg / NVENC)" />
-                                            <TextBlock Margin="0,4,0,0"
-                                                       Foreground="#8FA4B9"
-                                                       Text="sidecar alpha 動画。通常は preset / tune / rate control と CQ だけで十分です。" />
-                                        </StackPanel>
-                                        <Border DockPanel.Dock="Right"
-                                                Background="#2A2038"
-                                                BorderBrush="#56406F"
-                                                BorderThickness="1"
-                                                CornerRadius="999"
-                                                Padding="10,5">
-                                            <TextBlock FontSize="11"
-                                                       FontWeight="SemiBold"
-                                                       Text="Alpha Sidecar" />
-                                        </Border>
-                                    </DockPanel>
-
-                                    <Grid Margin="0,14,0,0">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="16" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel Grid.Column="0">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Preset" />
-                                            <Slider x:Name="AlphaPresetSlider"
-                                                    Minimum="1"
-                                                    Maximum="7"
-                                                    SmallChange="1"
-                                                    LargeChange="1"
-                                                    TickFrequency="1"
-                                                    IsSnapToTickEnabled="True"
-                                                    AutoToolTipPlacement="BottomRight"
-                                                    ValueChanged="EncoderSettingsSlider_OnChanged" />
-                                            <TextBlock x:Name="AlphaPresetValueTextBlock"
-                                                       Margin="0,6,0,0"
-                                                       Foreground="#D8E7F2"
-                                                       Text="P3 / Fast" />
-                                        </StackPanel>
-                                        <StackPanel Grid.Column="2">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Tune" />
-                                            <ComboBox x:Name="AlphaTuneComboBox"
-                                                      Height="32"
-                                                      VerticalContentAlignment="Center" />
-                                        </StackPanel>
-                                    </Grid>
-
-                                    <Grid Margin="0,14,0,0">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="16" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel x:Name="AlphaConstantQualityPanel"
-                                                    Grid.Column="0">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Constant quality (CQ)" />
-                                            <Slider x:Name="AlphaConstantQualitySlider"
-                                                    Minimum="0"
-                                                    Maximum="51"
-                                                    SmallChange="1"
-                                                    LargeChange="2"
-                                                    TickFrequency="2"
-                                                    AutoToolTipPlacement="BottomRight"
-                                                    ValueChanged="EncoderSettingsSlider_OnChanged" />
-                                            <TextBlock x:Name="AlphaConstantQualityValueTextBlock"
-                                                       Margin="0,6,0,0"
-                                                       Foreground="#D8E7F2"
-                                                       Text="19" />
-                                        </StackPanel>
-                                        <StackPanel x:Name="AlphaConstantQpPanel"
-                                                    Grid.Column="2">
-                                            <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Constant QP" />
-                                            <Slider x:Name="AlphaConstantQpSlider"
-                                                    Minimum="0"
-                                                    Maximum="51"
-                                                    SmallChange="1"
-                                                    LargeChange="2"
-                                                    TickFrequency="2"
-                                                    AutoToolTipPlacement="BottomRight"
-                                                    ValueChanged="EncoderSettingsSlider_OnChanged" />
-                                            <TextBlock x:Name="AlphaConstantQpValueTextBlock"
-                                                       Margin="0,6,0,0"
-                                                       Foreground="#D8E7F2"
-                                                       Text="23" />
-                                        </StackPanel>
-                                    </Grid>
-
-                                    <Expander Header="Alpha advanced"
-                                              Margin="0,16,0,0"
-                                              Foreground="#E9F0F7"
-                                              IsExpanded="False">
-                                        <StackPanel Margin="0,12,0,0">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Rate control" />
-                                                    <ComboBox x:Name="AlphaRateControlComboBox"
-                                                              Height="32"
-                                                              VerticalContentAlignment="Center"
-                                                              SelectionChanged="EncoderSettingsSelection_OnChanged" />
-                                                </StackPanel>
-                                                <StackPanel x:Name="AlphaTargetBitratePanel"
-                                                            Grid.Column="2">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Target bitrate (Mbps)" />
-                                                    <TextBox x:Name="AlphaTargetBitrateTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0"
-                                                            Margin="0,14,0,0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Lookahead" />
-                                                    <TextBox x:Name="AlphaLookaheadTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                                <StackPanel Grid.Column="2"
-                                                            Margin="0,14,0,0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Min / Max QP" />
-                                                    <Grid>
-                                                        <Grid.ColumnDefinitions>
-                                                            <ColumnDefinition Width="*" />
-                                                            <ColumnDefinition Width="22" />
-                                                            <ColumnDefinition Width="*" />
-                                                        </Grid.ColumnDefinitions>
-                                                        <TextBox x:Name="AlphaMinQpTextBox"
-                                                                 Grid.Column="0"
-                                                                 Height="32"
-                                                                 VerticalContentAlignment="Center" />
-                                                        <TextBlock Grid.Column="1"
-                                                                   VerticalAlignment="Center"
-                                                                   HorizontalAlignment="Center"
-                                                                   Text="/" />
-                                                        <TextBox x:Name="AlphaMaxQpTextBox"
-                                                                 Grid.Column="2"
-                                                                 Height="32"
-                                                                 VerticalContentAlignment="Center" />
-                                                    </Grid>
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <WrapPanel Margin="0,14,0,0">
-                                                <CheckBox x:Name="AlphaSpatialAqCheckBox"
-                                                          Content="Spatial AQ"
-                                                          Checked="EncoderSettingsToggle_OnChanged"
-                                                          Unchecked="EncoderSettingsToggle_OnChanged" />
-                                                <CheckBox x:Name="AlphaTemporalAqCheckBox"
-                                                          Content="Temporal AQ"
-                                                          Checked="EncoderSettingsToggle_OnChanged"
-                                                          Unchecked="EncoderSettingsToggle_OnChanged" />
-                                                <CheckBox x:Name="AlphaZeroLatencyCheckBox"
-                                                          Content="Zero latency" />
-                                            </WrapPanel>
-
-                                            <StackPanel x:Name="AlphaAqStrengthPanel"
-                                                        Margin="0,14,0,0">
-                                                <TextBlock Style="{StaticResource FieldLabelStyle}" Text="AQ strength" />
-                                                <TextBox x:Name="AlphaAqStrengthTextBox"
-                                                         Height="32"
-                                                         VerticalContentAlignment="Center" />
-                                            </StackPanel>
-
-                                            <Grid Margin="0,14,0,0">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="B-frames" />
-                                                    <TextBox x:Name="AlphaBFramesTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                                <StackPanel Grid.Column="2">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="GOP size" />
-                                                    <TextBox x:Name="AlphaGopSizeTextBox"
-                                                             Height="32"
-                                                             VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <Grid Margin="0,14,0,0">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="16" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Profile" />
-                                                    <ComboBox x:Name="AlphaProfileComboBox"
-                                                              Height="32"
-                                                              VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                                <StackPanel Grid.Column="2">
-                                                    <TextBlock Style="{StaticResource FieldLabelStyle}" Text="Level" />
-                                                    <ComboBox x:Name="AlphaLevelComboBox"
-                                                              Height="32"
-                                                              VerticalContentAlignment="Center" />
-                                                </StackPanel>
-                                            </Grid>
-                                        </StackPanel>
-                                    </Expander>
-                                </StackPanel>
-                            </Border>
-                        </StackPanel>
-                    </ScrollViewer>
-                </Border>
-            </Grid>
-        </Border>
-
-        <Border Grid.Row="3"
-                Grid.ColumnSpan="2"
-                Background="#18212B"
-                BorderBrush="#263445"
-                BorderThickness="1"
-                CornerRadius="18"
-                Padding="16">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-
-                <DockPanel Margin="0,0,0,12">
-                    <StackPanel Orientation="Vertical" DockPanel.Dock="Left">
-                        <TextBlock FontSize="18" FontWeight="SemiBold" Text="録画プレビュー" />
-                        <TextBlock Margin="0,4,0,0"
-                                   Foreground="#8FA4B9"
-                                   Text="停止後に保存した動画をそのまま再生します。" />
-                    </StackPanel>
-                    <TextBlock x:Name="PreviewFileTextBlock"
-                               DockPanel.Dock="Right"
-                               VerticalAlignment="Center"
-                               Foreground="#96AABD"
-                               Text="まだ録画されていません" />
-                </DockPanel>
-
-                <StackPanel Grid.Row="1" Orientation="Horizontal">
-                    <Button x:Name="StartRecordingButton" Click="StartRecordingButton_OnClick" Content="録画開始" />
-                    <Button x:Name="StopRecordingButton"
-                            Background="#7A2F36"
-                            BorderBrush="#A84A53"
-                            Click="StopRecordingButton_OnClick"
-                            Content="録画停止" />
-                    <Button x:Name="RerecordButton"
-                            Background="#344756"
-                            BorderBrush="#476175"
-                            Click="RerecordButton_OnClick"
-                            Content="再録画" />
-                    <Button x:Name="PlayPreviewButton"
-                            Background="#395C41"
-                            BorderBrush="#4B7C56"
-                            Click="PlayPreviewButton_OnClick"
-                            Content="再生" />
-                    <Button x:Name="PausePreviewButton"
-                            Background="#344756"
-                            BorderBrush="#476175"
-                            Click="PausePreviewButton_OnClick"
-                            Content="一時停止" />
+                <StackPanel Orientation="Horizontal"
+                            HorizontalAlignment="Left">
+                    <Button x:Name="RemoveButton"
+                            Style="{StaticResource ActionButtonStyle}"
+                            Background="#A73438"
+                            BorderBrush="#C05055"
+                            Click="RemoveButton_OnClick" />
+                    <Button x:Name="BackwardButton"
+                            Style="{StaticResource ActionButtonStyle}"
+                            Background="#113D39"
+                            BorderBrush="#2E5D57"
+                            Click="BackwardButton_OnClick" />
+                    <Button x:Name="PlayPauseButton"
+                            Style="{StaticResource ActionButtonStyle}"
+                            Background="#113D39"
+                            BorderBrush="#2E5D57"
+                            Click="PlayPauseButton_OnClick" />
+                    <Button x:Name="ForwardButton"
+                            Style="{StaticResource ActionButtonStyle}"
+                            Background="#113D39"
+                            BorderBrush="#2E5D57"
+                            Click="ForwardButton_OnClick" />
                 </StackPanel>
 
-                <Border Grid.Row="2"
-                        Margin="0,14,0,0"
-                        Background="#121820"
-                        BorderBrush="#33475C"
-                        BorderThickness="1"
-                        CornerRadius="14"
-                        ClipToBounds="True">
-                    <Grid>
-                        <vlc:VideoView x:Name="PreviewVideoView" />
-                        <Border x:Name="PreviewPlaceholderBorder"
-                                VerticalAlignment="Center"
-                                HorizontalAlignment="Center"
-                                Background="#A010151C"
-                                CornerRadius="12"
-                                Padding="18,14">
-                            <TextBlock x:Name="PreviewPlaceholderTextBlock"
-                                       FontSize="16"
-                                       FontWeight="SemiBold"
-                                       Text="録画停止後にここでプレビュー再生できます" />
-                        </Border>
-                    </Grid>
-                </Border>
-
-                <Slider Grid.Row="3"
-                        x:Name="SeekSlider"
-                        Margin="0,14,0,0"
-                        Height="28"
-                        Minimum="0"
-                        Maximum="1"
-                        IsSnapToTickEnabled="False"
-                        PreviewMouseLeftButtonDown="SeekSlider_OnPreviewMouseLeftButtonDown"
-                        PreviewMouseLeftButtonUp="SeekSlider_OnPreviewMouseLeftButtonUp" />
-
-                <DockPanel Grid.Row="4" Margin="0,10,0,0">
-                    <TextBlock x:Name="PreviewStatusTextBlock"
-                               DockPanel.Dock="Left"
-                               Foreground="#DCE8F5"
-                               Text="プレビュー待機中です。" />
-                    <TextBlock x:Name="PreviewTimeTextBlock"
-                               DockPanel.Dock="Right"
-                               Foreground="#9DB1C6"
-                               Text="00:00:00.000 / 00:00:00.000" />
-                </DockPanel>
+                <Button x:Name="EncodeButton"
+                        Grid.Column="1"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Margin="0"
+                        HorizontalAlignment="Right"
+                        Background="#7AA300"
+                        BorderBrush="#96BD1A"
+                        Click="EncodeButton_OnClick" />
             </Grid>
-        </Border>
+
+            <Grid x:Name="EncodingActionsPanel"
+                  Visibility="Collapsed">
+                <Button x:Name="CancelButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Margin="0"
+                        HorizontalAlignment="Right"
+                        Background="#113D39"
+                        BorderBrush="#2E5D57"
+                        Click="CancelButton_OnClick" />
+            </Grid>
+
+            <Grid x:Name="EncodedActionsPanel"
+                  Visibility="Collapsed">
+                <Button x:Name="ContinueButton"
+                        Style="{StaticResource ActionButtonStyle}"
+                        Margin="0"
+                        HorizontalAlignment="Right"
+                        Background="#113D39"
+                        BorderBrush="#2E5D57"
+                        Click="ContinueButton_OnClick" />
+            </Grid>
+        </Grid>
     </Grid>
 </Window>

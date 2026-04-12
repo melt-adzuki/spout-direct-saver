@@ -9,9 +9,11 @@ namespace SpoutDirectSaver.App.Models;
 
 internal sealed class EncoderSettingsRoot
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+
+    public EncoderProfileKind SelectedEncoderKind { get; set; } = EncoderProfileKind.HevcNvencMp4AlphaMp4;
 
     public RgbMediaFoundationEncoderSettings Rgb { get; set; } = new();
 
@@ -24,6 +26,7 @@ internal sealed class EncoderSettingsRoot
         return new EncoderSettingsRoot
         {
             SchemaVersion = SchemaVersion,
+            SelectedEncoderKind = SelectedEncoderKind,
             Rgb = Rgb.Clone(),
             Alpha = Alpha.Clone()
         };
@@ -33,6 +36,11 @@ internal sealed class EncoderSettingsRoot
     {
         var schemaVersion = SchemaVersion;
         SchemaVersion = CurrentSchemaVersion;
+        if (!Enum.IsDefined(SelectedEncoderKind))
+        {
+            SelectedEncoderKind = EncoderProfileKind.HevcNvencMp4AlphaMp4;
+        }
+
         Rgb.Normalize(schemaVersion);
         Alpha.Normalize();
     }

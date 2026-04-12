@@ -14,6 +14,74 @@ namespace SpoutDirectSaver.App.Services;
 
 internal sealed class VideoExportService
 {
+    internal async Task ExportCapturedTakeAsync(
+        CapturedTake take,
+        string outputPath,
+        IProgress<EncodeProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(take);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var hasSidecar = take.HasSidecar;
+        var sidecarOutputPath = hasSidecar ? BuildAlphaSidecarPath(outputPath) : null;
+        var mainPartialPath = outputPath + ".partial";
+        var sidecarPartialPath = sidecarOutputPath is null ? null : sidecarOutputPath + ".partial";
+        var mainLength = new FileInfo(take.PreviewVideoPath).Length;
+        var sidecarLength = hasSidecar ? new FileInfo(take.PreviewSidecarPath!).Length : 0;
+        var totalBytes = Math.Max(mainLength + sidecarLength, 1);
+
+        try
+        {
+            progress?.Report(new EncodeProgress(0, "preparing", "Encoding..."));
+
+            await CopyFileAsync(
+                take.PreviewVideoPath,
+                mainPartialPath,
+                bytesCompletedBeforeThisFile: 0,
+                totalBytes,
+                progress,
+                "copying video",
+                cancellationToken).ConfigureAwait(false);
+
+            if (hasSidecar && sidecarOutputPath is not null && sidecarPartialPath is not null)
+            {
+                await CopyFileAsync(
+                    take.PreviewSidecarPath!,
+                    sidecarPartialPath,
+                    bytesCompletedBeforeThisFile: mainLength,
+                    totalBytes,
+                    progress,
+                    "copying alpha",
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            MoveFile(mainPartialPath, outputPath);
+            if (hasSidecar && sidecarOutputPath is not null && sidecarPartialPath is not null)
+            {
+                MoveFile(sidecarPartialPath, sidecarOutputPath);
+            }
+
+            progress?.Report(new EncodeProgress(100, "done", "Done!"));
+        }
+        catch
+        {
+            TryDeleteFile(outputPath);
+            if (sidecarOutputPath is not null)
+            {
+                TryDeleteFile(sidecarOutputPath);
+            }
+
+            TryDeleteFile(mainPartialPath);
+            if (sidecarPartialPath is not null)
+            {
+                TryDeleteFile(sidecarPartialPath);
+            }
+
+            throw;
+        }
+    }
+
     public async Task ExportAlphaTrackAsync(
         string spoolPath,
         IReadOnlyList<RecordedFrame> frames,
@@ -248,6 +316,88 @@ internal sealed class VideoExportService
                 ArrayPool<byte>.Shared.Return(compressedBuffer);
             }
         }
+    }
+
+    private static async Task CopyFileAsync(
+        string sourcePath,
+        string destinationPath,
+        long bytesCompletedBeforeThisFile,
+        long totalBytes,
+        IProgress<EncodeProgress>? progress,
+        string phase,
+        CancellationToken cancellationToken)
+    {
+        const int bufferSize = 1024 * 1024;
+        var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+
+        try
+        {
+            await using var source = new FileStream(
+                sourcePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize,
+                FileOptions.SequentialScan);
+
+            await using var destination = new FileStream(
+                destinationPath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize,
+                FileOptions.SequentialScan);
+
+            long copiedInFile = 0;
+            int read;
+            while ((read = await source.ReadAsync(buffer.AsMemory(0, bufferSize), cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                copiedInFile += read;
+                var percent = (int)Math.Round((bytesCompletedBeforeThisFile + copiedInFile) * 100.0 / totalBytes);
+                progress?.Report(new EncodeProgress(Math.Clamp(percent, 0, 100), phase, "Encoding..."));
+            }
+
+            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static void MoveFile(string sourcePath, string destinationPath)
+    {
+        if (File.Exists(destinationPath))
+        {
+            File.Delete(destinationPath);
+        }
+
+        File.Move(sourcePath, destinationPath);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(path);
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
+    }
+
+    private static string BuildAlphaSidecarPath(string outputPath)
+    {
+        var directory = Path.GetDirectoryName(outputPath) ?? string.Empty;
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);
+        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mp4");
     }
 
     private static async Task WaitForStableFileAsync(string path, CancellationToken cancellationToken)

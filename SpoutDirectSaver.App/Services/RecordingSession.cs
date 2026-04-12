@@ -52,7 +52,10 @@ internal sealed class RecordingSession : IAsyncDisposable
     private double _accumulatedTimelineFrames;
     private int _emittedTimelineFrames;
     private int _frameCounter;
+    private long _timelineStopwatchOffsetTicks;
+    private long _pauseStartedStopwatchTicks;
     private bool _isCompleted;
+    private bool _isPaused;
     private bool _disposed;
     private bool? _compressSpoolFrames;
     private int _remainingCompressionWorkers;
@@ -176,6 +179,12 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             lock (_gate)
             {
+                if (_isPaused)
+                {
+                    frame.Dispose();
+                    return;
+                }
+
                 ThrowIfCompleted();
 
                 if (frame.GpuTexture is not null)
@@ -223,6 +232,40 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
+    public void Pause()
+    {
+        lock (_gate)
+        {
+            ThrowIfCompleted();
+            if (_isPaused || _currentFrame is null)
+            {
+                return;
+            }
+
+            var pausedAt = Stopwatch.GetTimestamp();
+            SealCurrentFrameForTransition(pausedAt);
+            _pauseStartedStopwatchTicks = pausedAt;
+            _isPaused = true;
+        }
+    }
+
+    public void Resume()
+    {
+        lock (_gate)
+        {
+            ThrowIfCompleted();
+            if (!_isPaused)
+            {
+                return;
+            }
+
+            var resumedAt = Stopwatch.GetTimestamp();
+            _timelineStopwatchOffsetTicks += resumedAt - _pauseStartedStopwatchTicks;
+            _pauseStartedStopwatchTicks = 0;
+            _isPaused = false;
+        }
+    }
+
     public async Task<string> FinalizeAsync(VideoExportService exportService, CancellationToken cancellationToken)
     {
         DebugTrace.WriteLine("RecordingSession", $"finalize start session={_traceId} temp={_temporaryDirectory}");
@@ -235,35 +278,23 @@ internal sealed class RecordingSession : IAsyncDisposable
             ThrowIfCompleted();
             _isCompleted = true;
 
-            if (_currentFrame is null)
+            if (_currentFrame is not null)
+            {
+                SealCurrentFrameForTransition(Stopwatch.GetTimestamp());
+            }
+
+            if (_frames.Count == 0)
             {
                 throw new InvalidOperationException("録画中にフレームを受信できませんでした。");
             }
 
-            FinalizeCurrentFrame(Stopwatch.GetTimestamp());
+            _isPaused = false;
             if (_useRealtimeEncoding)
             {
-                if (_currentFrame is not null && _lastUniqueFrame is not null)
-                {
-                    QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
-                }
-
                 realtimeWriter = _realtimeWriter;
             }
             else if (_useRealtimeRgbIntermediate)
             {
-                if (_currentFrame is not null && _lastGpuFrame is not null && _lastAlphaFrame is not null)
-                {
-                    QueueHybridFrame(_currentFrame, _lastGpuFrame, _lastAlphaFrame);
-                    _lastGpuFrame = null;
-                    _lastAlphaFrame = null;
-                }
-                else if (_currentFrame is not null && _lastUniqueFrame is not null)
-                {
-                    QueueHybridFrame(_currentFrame, _lastUniqueFrame);
-                    _lastUniqueFrame = null;
-                }
-
                 _compressionChannel.Writer.TryComplete();
                 framesToEncode = _frames.ToArray();
                 rgbIntermediateWriter = _rgbIntermediateWriter;
@@ -490,31 +521,13 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         if (_currentFrame is not null)
         {
-            FinalizeCurrentFrame(frame.StopwatchTicks);
-            if (_useRealtimeEncoding)
-            {
-                if (_lastUniqueFrame is null)
-                {
-                    throw new InvalidOperationException("realtime エンコード用の前フレームが見つかりません。");
-                }
-
-                QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
-            }
-            else if (_useRealtimeRgbIntermediate)
-            {
-                FlushPendingHybridFrame();
-            }
-            else
-            {
-                _lastUniqueFrame?.Dispose();
-                _lastUniqueFrame = null;
-            }
+            SealCurrentFrameForTransition(frame.StopwatchTicks);
         }
 
         var recordedFrame = new RecordedFrame
         {
             FrameIndex = _frameCounter + 1,
-            StopwatchTicks = frame.StopwatchTicks,
+            StopwatchTicks = AdjustStopwatchTicks(frame.StopwatchTicks),
             TimestampUtc = frame.TimestampUtc,
             IsCompressed = false
         };
@@ -572,15 +585,14 @@ internal sealed class RecordingSession : IAsyncDisposable
     {
         if (_currentFrame is not null)
         {
-            FinalizeCurrentFrame(frame.StopwatchTicks);
-            FlushPendingHybridFrame();
+            SealCurrentFrameForTransition(frame.StopwatchTicks);
         }
 
         _compressSpoolFrames ??= true;
         var recordedFrame = new RecordedFrame
         {
             FrameIndex = _frameCounter + 1,
-            StopwatchTicks = frame.StopwatchTicks,
+            StopwatchTicks = AdjustStopwatchTicks(frame.StopwatchTicks),
             TimestampUtc = frame.TimestampUtc,
             IsCompressed = _compressSpoolFrames.Value
         };
@@ -630,6 +642,32 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         var duration = (completedStopwatchTicks - _currentFrame.StopwatchTicks) / (double)Stopwatch.Frequency;
         _currentFrame.DurationSeconds = Math.Max(duration, MinimumFrameDurationSeconds);
+    }
+
+    private void SealCurrentFrameForTransition(long completedStopwatchTicks)
+    {
+        if (_currentFrame is null)
+        {
+            return;
+        }
+
+        FinalizeCurrentFrame(AdjustStopwatchTicks(completedStopwatchTicks));
+
+        if (_useRealtimeEncoding)
+        {
+            if (_lastUniqueFrame is null)
+            {
+                throw new InvalidOperationException("realtime エンコード用の前フレームが見つかりません。");
+            }
+
+            QueueFrameForRealtimeEncode(_currentFrame, _lastUniqueFrame);
+        }
+        else if (_useRealtimeRgbIntermediate)
+        {
+            FlushPendingHybridFrame();
+        }
+
+        _currentFrame = null;
     }
 
     private async Task CompressFramesAsync()
@@ -1169,6 +1207,11 @@ internal sealed class RecordingSession : IAsyncDisposable
         return value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
                value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
                value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private long AdjustStopwatchTicks(long stopwatchTicks)
+    {
+        return stopwatchTicks - _timelineStopwatchOffsetTicks;
     }
 
     private enum FramePayloadKind

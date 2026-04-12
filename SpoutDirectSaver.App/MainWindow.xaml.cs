@@ -6,11 +6,13 @@ using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using LibVLCSharp.Shared;
 using Microsoft.Win32;
+using VLCMediaPlayer = LibVLCSharp.Shared.MediaPlayer;
 using SpoutDirectSaver.App.Models;
 using SpoutDirectSaver.App.Services;
 
@@ -18,6 +20,18 @@ namespace SpoutDirectSaver.App;
 
 public partial class MainWindow : Window
 {
+    private enum UiMode
+    {
+        NoSignal,
+        Receiving,
+        Recording,
+        RecordingPaused,
+        PlaybackPlaying,
+        PlaybackPaused,
+        Encoding,
+        Encoded
+    }
+
     private readonly SpoutPollingService _spoutPollingService = new();
     private readonly VideoExportService _videoExportService = new();
     private readonly EncoderSettingsStore _encoderSettingsStore = new();
@@ -25,25 +39,27 @@ public partial class MainWindow : Window
     private readonly EncoderOption[] _encoderOptions = EncoderOption.CreateDefaults();
 
     private LibVLC? _libVlc;
-    private LibVLCSharp.Shared.MediaPlayer? _mediaPlayer;
+    private VLCMediaPlayer? _mediaPlayer;
     private Media? _previewMedia;
     private WriteableBitmap? _liveBitmap;
-
     private RecordingSession? _recordingSession;
-    private CaptureStatus? _latestStatus;
-    private string? _outputPath;
-    private string? _lastRecordedFilePath;
-    private DateTimeOffset? _recordingStartedAt;
-    private bool _isStopping;
-    private bool _isSeekingPreview;
-    private long _lastRenderedPreviewTicks;
-    private GCLatencyMode? _recordingLatencyModeRestore;
-    private string? _lastRecordingFaultMessage;
-    private bool _recordingCpuFallbackActive;
-    private volatile bool _recordingFrameAcceptanceEnabled;
+    private CapturedTake? _capturedTake;
+    private string? _pendingTakeDirectory;
+    private string? _pendingPreviewPath;
     private EncoderSettingsRoot _encoderSettings = EncoderSettingsRoot.CreateDefaults();
-    private EncoderSettingsRoot? _sessionEncoderSettings;
-    private bool _isUiInitialized;
+    private EncoderOption _selectedEncoderOption = null!;
+    private CaptureStatus? _latestStatus;
+    private UiMode _uiMode = UiMode.NoSignal;
+    private DateTimeOffset? _recordingStartedAt;
+    private DateTimeOffset? _recordingPausedAt;
+    private TimeSpan _recordingPausedAccumulated = TimeSpan.Zero;
+    private long _lastRenderedPreviewTicks;
+    private int _encodingProgressPercent;
+    private CancellationTokenSource? _encodeCancellationSource;
+    private Task? _encodeTask;
+    private GCLatencyMode? _recordingLatencyModeRestore;
+    private bool _isClosing;
+    private string? _lastExportPath;
 
     public MainWindow()
     {
@@ -51,24 +67,17 @@ public partial class MainWindow : Window
 
         Core.Initialize();
 
+        _encoderSettings = _encoderSettingsStore.Load();
+        _selectedEncoderOption = ResolveEncoderOption(_encoderSettings.SelectedEncoderKind);
+
         _libVlc = new LibVLC("--no-video-title-show");
-        _mediaPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVlc);
+        _mediaPlayer = new VLCMediaPlayer(_libVlc);
         _mediaPlayer.TimeChanged += MediaPlayer_OnTimeChanged;
         _mediaPlayer.LengthChanged += MediaPlayer_OnLengthChanged;
         _mediaPlayer.EndReached += MediaPlayer_OnEndReached;
-        PreviewVideoView.MediaPlayer = _mediaPlayer;
+        PlaybackVideoView.MediaPlayer = _mediaPlayer;
 
-        FormatComboBox.ItemsSource = _encoderOptions;
-        FormatComboBox.SelectedIndex = 0;
-        RgbRateControlComboBox.ItemsSource = Enum.GetValues<RgbMediaFoundationRateControlMode>();
-        RgbContentTypeComboBox.ItemsSource = Enum.GetValues<RgbMediaFoundationContentTypeHint>();
-        AlphaTuneComboBox.ItemsSource = Enum.GetValues<AlphaNvencTune>();
-        AlphaRateControlComboBox.ItemsSource = Enum.GetValues<AlphaNvencRateControlMode>();
-        AlphaProfileComboBox.ItemsSource = Enum.GetValues<AlphaNvencProfile>();
-        AlphaLevelComboBox.ItemsSource = Enum.GetValues<AlphaNvencLevel>();
-
-        _encoderSettings = _encoderSettingsStore.Load();
-        LoadEncoderSettingsIntoUi();
+        BuildButtonContent();
 
         _recordingTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(100),
@@ -82,9 +91,6 @@ public partial class MainWindow : Window
         _spoutPollingService.StatusChanged += SpoutPollingService_OnStatusChanged;
         CompositionTarget.Rendering += CompositionTarget_OnRendering;
 
-        _isUiInitialized = true;
-        UpdateEncoderSettingsReadouts();
-        ApplyEncoderSettingsVisibility();
         Loaded += MainWindow_OnLoaded;
         UpdateUiState();
     }
@@ -96,259 +102,121 @@ public partial class MainWindow : Window
 
     protected override async void OnClosing(CancelEventArgs e)
     {
-        base.OnClosing(e);
-
-        _recordingTimer.Stop();
-        StopPreviewPlayback();
-        _encoderSettings = CaptureEncoderSettingsFromUi();
-        _encoderSettingsStore.Save(_encoderSettings);
-
-        if (_recordingSession is not null)
+        if (_isClosing)
         {
-            await _recordingSession.DisposeAsync();
-            EndRecordingLatencyScope();
-        }
-
-        CompositionTarget.Rendering -= CompositionTarget_OnRendering;
-        await _spoutPollingService.DisposeAsync();
-
-        if (_mediaPlayer is not null)
-        {
-            _mediaPlayer.TimeChanged -= MediaPlayer_OnTimeChanged;
-            _mediaPlayer.LengthChanged -= MediaPlayer_OnLengthChanged;
-            _mediaPlayer.EndReached -= MediaPlayer_OnEndReached;
-            _mediaPlayer.Dispose();
-        }
-
-        _previewMedia?.Dispose();
-        _libVlc?.Dispose();
-    }
-
-    private async void BrowseOutputButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        await SelectOutputPathAsync(forcePrompt: true);
-    }
-
-    private void ResetEncoderSettingsButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        _encoderSettings = EncoderSettingsRoot.CreateDefaults();
-        LoadEncoderSettingsIntoUi();
-        _encoderSettingsStore.Save(_encoderSettings);
-    }
-
-    private void FormatComboBox_OnSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-    {
-        var option = SelectedEncoderOption;
-        FormatDescriptionTextBlock.Text = option.Description;
-        ApplyEncoderSettingsVisibility();
-
-        if (!string.IsNullOrWhiteSpace(_outputPath) &&
-            !string.Equals(Path.GetExtension(_outputPath), option.Extension, StringComparison.OrdinalIgnoreCase))
-        {
-            _outputPath = null;
-            OutputPathTextBox.Text = string.Empty;
-        }
-    }
-
-    private async void StartRecordingButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        if (_recordingSession is not null || _isStopping)
-        {
+            base.OnClosing(e);
             return;
         }
 
-        if (!await SelectOutputPathAsync(forcePrompt: string.IsNullOrWhiteSpace(_outputPath)))
-        {
-            return;
-        }
-
-        var encoderSettings = CaptureEncoderSettingsFromUi();
-        _encoderSettings = encoderSettings.Clone();
-        _encoderSettingsStore.Save(_encoderSettings);
-        _sessionEncoderSettings = encoderSettings.Clone();
-        ResetPreviewArea();
-
-        _recordingSession = new RecordingSession(SelectedEncoderOption, _outputPath!, encoderSettings);
-        _lastRecordingFaultMessage = null;
-        _recordingCpuFallbackActive = false;
-        _recordingFrameAcceptanceEnabled = false;
-        _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
-        _spoutPollingService.SetRecordingMode(true, SelectedEncoderOption.UsesRealtimeRgbIntermediate);
-        _recordingFrameAcceptanceEnabled = true;
-        DebugTrace.WriteLine(
-            "MainWindow",
-            $"start recording output={_outputPath} preferGpu={SelectedEncoderOption.UsesRealtimeRgbIntermediate}");
-        BeginRecordingLatencyScope();
-        _recordingStartedAt = DateTimeOffset.UtcNow;
-        _recordingTimer.Start();
-
-        RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
-            ? "録画を開始しました。RGB をリアルタイム圧縮し、alpha sidecar を一時保存しています。"
-            : SelectedEncoderOption.RequiresRealtimeEncoding
-                ? "録画を開始しました。ffmpeg へ直接エンコードしています。"
-            : "録画を開始しました。変化フレームのみを一時保存しています。";
-        PreviewStatusTextBlock.Text = "録画中はライブ入力プレビューを停止して録画を優先します。";
-        HeaderStatusTextBlock.Text = "録画中";
-
-        UpdateUiState();
-    }
-
-    private async void StopRecordingButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        if (_recordingSession is null || _isStopping)
-        {
-            return;
-        }
-
-        _isStopping = true;
-        _recordingTimer.Stop();
-        UpdateUiState();
+        _isClosing = true;
 
         try
         {
-            DebugTrace.WriteLine("MainWindow", "stop recording clicked");
-            HeaderStatusTextBlock.Text = "エンコード中";
-            RecorderStatusTextBlock.Text = SelectedEncoderOption.UsesRealtimeRgbIntermediate
-                ? "録画を停止しました。RGB を確定し、alpha sidecar を書き出しています。"
-                : SelectedEncoderOption.RequiresRealtimeEncoding
-                    ? "録画を停止しました。エンコーダーを終了して最終フレームを確定しています。"
-                : "録画を停止しました。可変fps動画を書き出しています。";
-
-            var outputPath = await _recordingSession.FinalizeAsync(_videoExportService, CancellationToken.None);
-            _lastRecordedFilePath = outputPath;
-            _recordingSession = null;
-            _lastRecordingFaultMessage = null;
-            _recordingCpuFallbackActive = false;
-            _recordingFrameAcceptanceEnabled = false;
+            _recordingTimer.Stop();
             _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
-            _spoutPollingService.SetRecordingMode(false, false);
+            _spoutPollingService.StatusChanged -= SpoutPollingService_OnStatusChanged;
+            CompositionTarget.Rendering -= CompositionTarget_OnRendering;
 
-            LoadPreview(outputPath);
-            RecorderStatusTextBlock.Text = $"保存完了: {outputPath}";
-            PreviewStatusTextBlock.Text = "プレビュー再生できます。";
-            HeaderStatusTextBlock.Text = "プレビュー可能";
-        }
-        catch (Exception ex)
-        {
-            var failureMessage =
-                ex.Message == "録画中にフレームを受信できませんでした。" &&
-                !string.IsNullOrWhiteSpace(_lastRecordingFaultMessage)
-                    ? _lastRecordingFaultMessage
-                    : ex.Message;
-            RecorderStatusTextBlock.Text = $"保存に失敗しました: {failureMessage}";
-            PreviewStatusTextBlock.Text = "保存失敗のためプレビューを開始できませんでした。";
-            HeaderStatusTextBlock.Text = "エラー";
-
-            if (_recordingSession is not null)
+            _encodeCancellationSource?.Cancel();
+            if (_encodeTask is not null)
             {
-                await _recordingSession.DisposeAsync();
-                _recordingSession = null;
+                try
+                {
+                    await _encodeTask.ConfigureAwait(true);
+                }
+                catch
+                {
+                    // Best-effort shutdown only.
+                }
             }
 
-            _recordingCpuFallbackActive = false;
-            _recordingFrameAcceptanceEnabled = false;
-
-            _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
-            _spoutPollingService.SetRecordingMode(false, false);
+            await AbortRecordingAsync(showError: false).ConfigureAwait(true);
+            await DisposeCapturedTakeAsync().ConfigureAwait(true);
         }
         finally
         {
             EndRecordingLatencyScope();
-            _recordingStartedAt = null;
-            _isStopping = false;
-            if (_recordingSession is null)
+            _encoderSettings.SelectedEncoderKind = _selectedEncoderOption.Kind;
+            _encoderSettingsStore.Save(_encoderSettings);
+
+            StopPreviewPlayback();
+            await _spoutPollingService.DisposeAsync().ConfigureAwait(true);
+
+            if (_mediaPlayer is not null)
             {
-                _recordingFrameAcceptanceEnabled = false;
-                _spoutPollingService.SetRecordingMode(false, false);
+                _mediaPlayer.TimeChanged -= MediaPlayer_OnTimeChanged;
+                _mediaPlayer.LengthChanged -= MediaPlayer_OnLengthChanged;
+                _mediaPlayer.EndReached -= MediaPlayer_OnEndReached;
+                _mediaPlayer.Dispose();
             }
-            UpdateRecordingElapsed();
+
+            _libVlc?.Dispose();
+            base.OnClosing(e);
+        }
+    }
+
+    private void RecordButton_OnClick(object sender, RoutedEventArgs e) => _ = StartRecordingAsync();
+
+    private void SettingsButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (_uiMode is not UiMode.NoSignal and not UiMode.Receiving)
+        {
+            return;
+        }
+
+        var dialog = new EncoderSettingsDialog(_encoderOptions, _selectedEncoderOption, _encoderSettings)
+        {
+            Owner = this
+        };
+
+        if (dialog.ShowDialog() == true)
+        {
+            _selectedEncoderOption = dialog.SelectedEncoderOption;
+            _encoderSettings = dialog.Settings;
+            _encoderSettings.SelectedEncoderKind = _selectedEncoderOption.Kind;
+            _encoderSettingsStore.Save(_encoderSettings);
             UpdateUiState();
         }
     }
 
-    private void RerecordButton_OnClick(object sender, RoutedEventArgs e)
+    private void DoneButton_OnClick(object sender, RoutedEventArgs e) => _ = StopRecordingAsync();
+
+    private void PauseResumeButton_OnClick(object sender, RoutedEventArgs e)
     {
-        if (_recordingSession is not null || _isStopping)
+        if (_uiMode == UiMode.Recording)
+        {
+            PauseRecording();
+        }
+        else if (_uiMode == UiMode.RecordingPaused)
+        {
+            ResumeRecording();
+        }
+    }
+
+    private void RemoveButton_OnClick(object sender, RoutedEventArgs e) => _ = RemoveCapturedTakeAsync();
+
+    private void BackwardButton_OnClick(object sender, RoutedEventArgs e) => StepPlayback(-5000);
+
+    private void PlayPauseButton_OnClick(object sender, RoutedEventArgs e) => TogglePlayback();
+
+    private void ForwardButton_OnClick(object sender, RoutedEventArgs e) => StepPlayback(5000);
+
+    private void EncodeButton_OnClick(object sender, RoutedEventArgs e) => _ = BeginEncodingAsync();
+
+    private async void CancelButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        await CancelEncodingAsync().ConfigureAwait(true);
+    }
+
+    private void ContinueButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (_capturedTake is null)
         {
             return;
         }
 
-        StopPreviewPlayback();
-        ResetPreviewArea();
-
-        RecorderStatusTextBlock.Text = "再録画の準備ができました。録画開始を押すと新しいファイルを書き出します。";
-        PreviewStatusTextBlock.Text = "プレビュー待機中です。";
-        HeaderStatusTextBlock.Text = _latestStatus?.IsConnected == true ? "受信中" : "入力待ち";
+        _uiMode = UiMode.PlaybackPaused;
         UpdateUiState();
-    }
-
-    private void PlayPreviewButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        if (_previewMedia is null || _mediaPlayer is null)
-        {
-            return;
-        }
-
-        _mediaPlayer.Play();
-        PreviewStatusTextBlock.Text = "プレビュー再生中です。";
-    }
-
-    private void PausePreviewButton_OnClick(object sender, RoutedEventArgs e)
-    {
-        if (_mediaPlayer is null)
-        {
-            return;
-        }
-
-        _mediaPlayer.Pause();
-        PreviewStatusTextBlock.Text = "プレビューを一時停止しました。";
-    }
-
-    private void SeekSlider_OnPreviewMouseLeftButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
-    {
-        _isSeekingPreview = true;
-    }
-
-    private void SeekSlider_OnPreviewMouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
-    {
-        if (_mediaPlayer is not null && _mediaPlayer.IsSeekable)
-        {
-            _mediaPlayer.Time = (long)SeekSlider.Value;
-        }
-
-        _isSeekingPreview = false;
-    }
-
-    private void MediaPlayer_OnLengthChanged(object? sender, MediaPlayerLengthChangedEventArgs e)
-    {
-        Dispatcher.Invoke(() =>
-        {
-            SeekSlider.Maximum = Math.Max(e.Length, 1);
-            PreviewTimeTextBlock.Text = $"{FormatTime(_mediaPlayer?.Time ?? 0)} / {FormatTime(e.Length)}";
-        });
-    }
-
-    private void MediaPlayer_OnTimeChanged(object? sender, MediaPlayerTimeChangedEventArgs e)
-    {
-        Dispatcher.Invoke(() =>
-        {
-            if (!_isSeekingPreview)
-            {
-                SeekSlider.Value = e.Time;
-            }
-
-            var total = _mediaPlayer?.Length ?? 0;
-            PreviewTimeTextBlock.Text = $"{FormatTime(e.Time)} / {FormatTime(total)}";
-        });
-    }
-
-    private void MediaPlayer_OnEndReached(object? sender, EventArgs e)
-    {
-        Dispatcher.Invoke(() =>
-        {
-            PreviewStatusTextBlock.Text = "プレビューの最後まで再生しました。";
-            SeekSlider.Value = SeekSlider.Maximum;
-        });
     }
 
     private void SpoutPollingService_OnStatusChanged(object? sender, CaptureStatus status)
@@ -357,28 +225,12 @@ public partial class MainWindow : Window
 
         _ = Dispatcher.BeginInvoke(() =>
         {
-            SenderNameTextBlock.Text = string.IsNullOrWhiteSpace(status.SenderName) ? "-" : status.SenderName;
-            SenderMetricsTextBlock.Text = status.Width > 0
-                ? $"{status.Width} x {status.Height} / {status.SenderFps:0.##} fps"
-                : "- / -";
-
-            LivePreviewBadgeTextBlock.Text = status.IsConnected ? "受信中" : "入力待ち";
-            HeaderStatusTextBlock.Text = _recordingSession is not null
-                ? "録画中"
-                : status.IsConnected
-                    ? "受信中"
-                    : "入力待ち";
-
-            if (_recordingSession is not null && !_isStopping && LooksLikeCaptureFault(status.Message))
+            if (_uiMode is UiMode.NoSignal or UiMode.Receiving)
             {
-                _lastRecordingFaultMessage = status.Message;
-                RecorderStatusTextBlock.Text = status.Message;
-                HeaderStatusTextBlock.Text = "エラー";
+                _uiMode = status.IsConnected ? UiMode.Receiving : UiMode.NoSignal;
             }
-            else if (_recordingSession is null && !_isStopping)
-            {
-                RecorderStatusTextBlock.Text = status.Message;
-            }
+
+            UpdateUiState();
         });
     }
 
@@ -386,42 +238,24 @@ public partial class MainWindow : Window
     {
         try
         {
-            DebugTrace.WriteLine(
-                "MainWindow",
-                $"frame arrived stopping={_isStopping} sessionPresent={_recordingSession is not null} gpu={frame.GpuTexture is not null} cpu={frame.PixelBuffer is not null}");
-            if (!_isStopping && _recordingSession is not null && _recordingFrameAcceptanceEnabled)
+            if (_recordingSession is null)
             {
-                DebugTrace.WriteLine("MainWindow", "append frame");
-                _recordingSession.AppendFrame(frame);
+                frame.Dispose();
                 return;
             }
 
-            DebugTrace.WriteLine(
-                "MainWindow",
-                $"dispose frame without append acceptanceEnabled={_recordingFrameAcceptanceEnabled}");
-            frame.Dispose();
+            _recordingSession.AppendFrame(frame);
         }
         catch (Exception ex)
         {
-            DebugTrace.WriteLine("MainWindow", $"append exception {ex.Message}");
             frame.Dispose();
-            if (TryFallbackRecordingToCpu(frame, ex))
-            {
-                return;
-            }
-
-            _lastRecordingFaultMessage = ex.Message;
-            _ = Dispatcher.BeginInvoke(() =>
-            {
-                RecorderStatusTextBlock.Text = $"録画を継続できませんでした: {ex.Message}";
-                HeaderStatusTextBlock.Text = "エラー";
-            });
+            _ = Dispatcher.BeginInvoke(async () => await AbortRecordingAsync(showError: true, errorMessage: ex.Message).ConfigureAwait(true));
         }
     }
 
     private void CompositionTarget_OnRendering(object? sender, EventArgs e)
     {
-        if (_recordingSession is not null || _isStopping)
+        if (_uiMode != UiMode.Receiving)
         {
             return;
         }
@@ -439,8 +273,376 @@ public partial class MainWindow : Window
 
         if (!rendered)
         {
+            UpdateStageVisibility();
+        }
+    }
+
+    private async Task StartRecordingAsync()
+    {
+        if (_recordingSession is not null || _capturedTake is not null || _uiMode == UiMode.Encoding)
+        {
             return;
         }
+
+        if (_latestStatus?.IsConnected != true)
+        {
+            return;
+        }
+
+        try
+        {
+            await DisposeCapturedTakeAsync().ConfigureAwait(true);
+
+            _pendingTakeDirectory = BuildTakeDirectory();
+            Directory.CreateDirectory(_pendingTakeDirectory);
+            _pendingPreviewPath = Path.Combine(_pendingTakeDirectory, $"preview{_selectedEncoderOption.Extension}");
+
+            _encoderSettings.SelectedEncoderKind = _selectedEncoderOption.Kind;
+            _encoderSettingsStore.Save(_encoderSettings);
+
+            _recordingSession = new RecordingSession(_selectedEncoderOption, _pendingPreviewPath, _encoderSettings);
+            _recordingStartedAt = DateTimeOffset.UtcNow;
+            _recordingPausedAt = null;
+            _recordingPausedAccumulated = TimeSpan.Zero;
+            _lastRenderedPreviewTicks = 0;
+            _uiMode = UiMode.Recording;
+
+            BeginRecordingLatencyScope();
+            SetRecordingInputActive(true);
+            _recordingTimer.Start();
+
+            UpdateUiState();
+        }
+        catch (Exception ex)
+        {
+            await AbortRecordingAsync(showError: true, errorMessage: ex.Message).ConfigureAwait(true);
+        }
+    }
+
+    private async Task StopRecordingAsync()
+    {
+        if (_recordingSession is null)
+        {
+            return;
+        }
+
+        var session = _recordingSession;
+        var takeDirectory = _pendingTakeDirectory;
+        var previewPath = _pendingPreviewPath;
+        _recordingSession = null;
+
+        _recordingTimer.Stop();
+        SetRecordingInputActive(false);
+
+        try
+        {
+            if (takeDirectory is null || previewPath is null)
+            {
+                throw new InvalidOperationException("録画の一時保存先が初期化されていません。");
+            }
+
+            var finalizedPreviewPath = await session.FinalizeAsync(_videoExportService, CancellationToken.None).ConfigureAwait(true);
+            var sidecarPath = BuildAlphaSidecarPath(finalizedPreviewPath);
+            if (!File.Exists(sidecarPath))
+            {
+                sidecarPath = null;
+            }
+
+            _capturedTake = new CapturedTake(
+                _selectedEncoderOption,
+                _encoderSettings,
+                takeDirectory,
+                finalizedPreviewPath,
+                sidecarPath);
+
+            _pendingTakeDirectory = null;
+            _pendingPreviewPath = null;
+            _uiMode = UiMode.PlaybackPaused;
+            LoadCapturedTakePreview(finalizedPreviewPath);
+            _lastExportPath = null;
+        }
+        catch (Exception ex)
+        {
+            await AbortRecordingAsync(showError: true, errorMessage: ex.Message).ConfigureAwait(true);
+            return;
+        }
+        finally
+        {
+            await TryDisposeSessionAsync(session).ConfigureAwait(true);
+            ClearRecordingState();
+            EndRecordingLatencyScope();
+            UpdateUiState();
+        }
+    }
+
+    private async Task AbortRecordingAsync(bool showError, string? errorMessage = null)
+    {
+        var session = _recordingSession;
+        if (session is not null)
+        {
+            _recordingSession = null;
+            _recordingTimer.Stop();
+            SetRecordingInputActive(false);
+            ClearRecordingState();
+
+            try
+            {
+                await session.DisposeAsync().ConfigureAwait(true);
+            }
+            catch
+            {
+                // Cleanup is best-effort.
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(_pendingTakeDirectory))
+        {
+            TryDeleteDirectory(_pendingTakeDirectory);
+        }
+
+        _pendingTakeDirectory = null;
+        _pendingPreviewPath = null;
+        EndRecordingLatencyScope();
+
+        if (showError && !string.IsNullOrWhiteSpace(errorMessage))
+        {
+            MessageBox.Show(this, errorMessage, "Spout Direct Saver", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+
+        if (_capturedTake is null)
+        {
+            _uiMode = _latestStatus?.IsConnected == true ? UiMode.Receiving : UiMode.NoSignal;
+        }
+
+        UpdateUiState();
+    }
+
+    private void PauseRecording()
+    {
+        if (_recordingSession is null || _uiMode != UiMode.Recording)
+        {
+            return;
+        }
+
+        _recordingSession.Pause();
+        _recordingPausedAt = DateTimeOffset.UtcNow;
+        _recordingTimer.Stop();
+        SetRecordingInputActive(false);
+        _uiMode = UiMode.RecordingPaused;
+        UpdateUiState();
+    }
+
+    private void ResumeRecording()
+    {
+        if (_recordingSession is null || _uiMode != UiMode.RecordingPaused || _recordingPausedAt is null)
+        {
+            return;
+        }
+
+        _recordingSession.Resume();
+        _recordingPausedAccumulated += DateTimeOffset.UtcNow - _recordingPausedAt.Value;
+        _recordingPausedAt = null;
+        SetRecordingInputActive(true);
+        _recordingTimer.Start();
+        _uiMode = UiMode.Recording;
+        UpdateUiState();
+    }
+
+    private async Task RemoveCapturedTakeAsync()
+    {
+        if (_capturedTake is null || _uiMode is UiMode.Encoding)
+        {
+            return;
+        }
+
+        StopPreviewPlayback();
+        await DisposeCapturedTakeAsync().ConfigureAwait(true);
+        _uiMode = _latestStatus?.IsConnected == true ? UiMode.Receiving : UiMode.NoSignal;
+        UpdateUiState();
+    }
+
+    private async Task BeginEncodingAsync()
+    {
+        if (_capturedTake is null || _uiMode is UiMode.Encoding)
+        {
+            return;
+        }
+
+        PausePlayback();
+
+        var dialog = new SaveFileDialog
+        {
+            Title = "Save Encoded File",
+            Filter = _capturedTake.EncoderOption.FileDialogFilter,
+            DefaultExt = _capturedTake.EncoderOption.Extension,
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = BuildSuggestedOutputName(_capturedTake.EncoderOption)
+        };
+
+        if (!string.IsNullOrWhiteSpace(_lastExportPath))
+        {
+            dialog.InitialDirectory = Path.GetDirectoryName(_lastExportPath);
+            dialog.FileName = Path.GetFileName(_lastExportPath);
+        }
+
+        var result = dialog.ShowDialog(this);
+        if (result != true)
+        {
+            _uiMode = UiMode.PlaybackPaused;
+            UpdateUiState();
+            return;
+        }
+
+        _lastExportPath = dialog.FileName;
+        _encodingProgressPercent = 0;
+        _uiMode = UiMode.Encoding;
+        UpdateUiState();
+
+        _encodeCancellationSource?.Dispose();
+        _encodeCancellationSource = new CancellationTokenSource();
+        var progress = new Progress<EncodeProgress>(HandleEncodeProgress);
+
+        _encodeTask = EncodeCapturedTakeAsync(dialog.FileName, progress, _encodeCancellationSource.Token);
+
+        try
+        {
+            await _encodeTask.ConfigureAwait(true);
+            _uiMode = UiMode.Encoded;
+        }
+        catch (OperationCanceledException)
+        {
+            _uiMode = UiMode.PlaybackPaused;
+        }
+        catch (Exception ex)
+        {
+            _uiMode = UiMode.PlaybackPaused;
+            MessageBox.Show(this, ex.Message, "Spout Direct Saver", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            _encodeTask = null;
+            _encodeCancellationSource?.Dispose();
+            _encodeCancellationSource = null;
+            UpdateUiState();
+        }
+    }
+
+    private async Task CancelEncodingAsync()
+    {
+        if (_uiMode != UiMode.Encoding)
+        {
+            return;
+        }
+
+        _encodeCancellationSource?.Cancel();
+        if (_encodeTask is not null)
+        {
+            try
+            {
+                await _encodeTask.ConfigureAwait(true);
+            }
+            catch
+            {
+                // The encode task handles its own terminal state.
+            }
+        }
+    }
+
+    private async Task EncodeCapturedTakeAsync(
+        string outputPath,
+        IProgress<EncodeProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        if (_capturedTake is null)
+        {
+            throw new InvalidOperationException("録画済みの take がありません。");
+        }
+
+        await _videoExportService.ExportCapturedTakeAsync(
+            _capturedTake,
+            outputPath,
+            progress,
+            cancellationToken).ConfigureAwait(true);
+    }
+
+    private void TogglePlayback()
+    {
+        if (_mediaPlayer is null || _capturedTake is null)
+        {
+            return;
+        }
+
+        if (_mediaPlayer.IsPlaying)
+        {
+            PausePlayback();
+        }
+        else
+        {
+            _mediaPlayer.Play();
+            _uiMode = UiMode.PlaybackPlaying;
+            UpdateUiState();
+        }
+    }
+
+    private void PausePlayback()
+    {
+        if (_mediaPlayer is null || _capturedTake is null)
+        {
+            return;
+        }
+
+        _mediaPlayer.Pause();
+        _uiMode = UiMode.PlaybackPaused;
+        UpdateUiState();
+    }
+
+    private void StepPlayback(int deltaMilliseconds)
+    {
+        if (_mediaPlayer is null || _capturedTake is null)
+        {
+            return;
+        }
+
+        var current = Math.Max(_mediaPlayer.Time, 0);
+        var length = Math.Max(_mediaPlayer.Length, 0);
+        if (length <= 0)
+        {
+            return;
+        }
+
+        var target = Math.Clamp(current + deltaMilliseconds, 0, length);
+        _mediaPlayer.Time = target;
+        if (_uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused)
+        {
+            SecondaryValueTextBlock.Text = FormatTime(TimeSpan.FromMilliseconds(target));
+        }
+    }
+
+    private void LoadCapturedTakePreview(string previewPath)
+    {
+        if (_mediaPlayer is null || _libVlc is null)
+        {
+            return;
+        }
+
+        StopPreviewPlayback();
+
+        _previewMedia = new Media(_libVlc, new Uri(previewPath, UriKind.Absolute));
+        _mediaPlayer.Play(_previewMedia);
+        _mediaPlayer.Pause();
+        _mediaPlayer.Time = 0;
+    }
+
+    private void StopPreviewPlayback()
+    {
+        if (_mediaPlayer is not null)
+        {
+            _mediaPlayer.Stop();
+        }
+
+        _previewMedia?.Dispose();
+        _previewMedia = null;
     }
 
     private void RenderLivePreview(LivePreviewFrame frame)
@@ -451,155 +653,272 @@ public partial class MainWindow : Window
 
         if (_liveBitmap is null || _liveBitmap.PixelWidth != width || _liveBitmap.PixelHeight != height)
         {
-            _liveBitmap = new WriteableBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
+            _liveBitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
             LivePreviewImage.Source = _liveBitmap;
         }
 
         _liveBitmap.WritePixels(new Int32Rect(0, 0, width, height), frame.PixelData, stride * height, stride);
-
-        LivePreviewPlaceholderBorder.Visibility = Visibility.Collapsed;
-        SenderNameTextBlock.Text = string.IsNullOrWhiteSpace(frame.SenderName) ? "-" : frame.SenderName;
-        SenderMetricsTextBlock.Text = $"{frame.Width} x {frame.Height} / {frame.SenderFps:0.##} fps";
+        LivePreviewImage.Visibility = Visibility.Visible;
+        NoSignalOverlayTextBlock.Visibility = Visibility.Collapsed;
     }
 
-    private Task<bool> SelectOutputPathAsync(bool forcePrompt)
+    private void MediaPlayer_OnTimeChanged(object? sender, MediaPlayerTimeChangedEventArgs e)
     {
-        var option = SelectedEncoderOption;
-        if (!forcePrompt &&
-            !string.IsNullOrWhiteSpace(_outputPath) &&
-            string.Equals(Path.GetExtension(_outputPath), option.Extension, StringComparison.OrdinalIgnoreCase))
-        {
-            return Task.FromResult(true);
-        }
-
-        var dialog = new SaveFileDialog
-        {
-            Title = "保存先を選択",
-            Filter = option.FileDialogFilter,
-            DefaultExt = option.Extension,
-            AddExtension = true,
-            OverwritePrompt = true,
-            FileName = BuildSuggestedOutputName(option)
-        };
-
-        if (!string.IsNullOrWhiteSpace(_outputPath))
-        {
-            dialog.InitialDirectory = Path.GetDirectoryName(_outputPath);
-            dialog.FileName = Path.GetFileNameWithoutExtension(_outputPath);
-        }
-
-        var result = dialog.ShowDialog(this);
-        if (result != true)
-        {
-            return Task.FromResult(false);
-        }
-
-        _outputPath = dialog.FileName;
-        OutputPathTextBox.Text = _outputPath;
-        return Task.FromResult(true);
-    }
-
-    private void LoadPreview(string outputPath)
-    {
-        if (_mediaPlayer is null || _libVlc is null)
+        if (_uiMode is not UiMode.PlaybackPlaying and not UiMode.PlaybackPaused)
         {
             return;
         }
 
-        StopPreviewPlayback();
-
-        _previewMedia = new Media(_libVlc, new Uri(outputPath));
-        _mediaPlayer.Play(_previewMedia);
-
-        PreviewPlaceholderBorder.Visibility = Visibility.Collapsed;
-        PreviewFileTextBlock.Text = outputPath;
-        SeekSlider.Value = 0;
-        PreviewStatusTextBlock.Text = "プレビューを読み込みました。";
+        _ = Dispatcher.BeginInvoke(UpdateStateMetrics);
     }
 
-    private void StopPreviewPlayback()
+    private void MediaPlayer_OnLengthChanged(object? sender, MediaPlayerLengthChangedEventArgs e)
     {
-        _mediaPlayer?.Stop();
-        _previewMedia?.Dispose();
-        _previewMedia = null;
-    }
-
-    private void ResetPreviewArea()
-    {
-        StopPreviewPlayback();
-
-        PreviewPlaceholderBorder.Visibility = Visibility.Visible;
-        PreviewFileTextBlock.Text = _lastRecordedFilePath is null
-            ? "まだ録画されていません"
-            : $"前回保存: {_lastRecordedFilePath}";
-        PreviewStatusTextBlock.Text = "プレビュー待機中です。";
-        PreviewTimeTextBlock.Text = "00:00:00.000 / 00:00:00.000";
-        SeekSlider.Maximum = 1;
-        SeekSlider.Value = 0;
-    }
-
-    private bool TryFallbackRecordingToCpu(FramePacket frame, Exception exception)
-    {
-        if (_isStopping ||
-            _recordingSession is null ||
-            _recordingCpuFallbackActive ||
-            !SelectedEncoderOption.UsesRealtimeRgbIntermediate ||
-            frame.GpuTexture is null ||
-            string.IsNullOrWhiteSpace(_outputPath))
+        if (_uiMode is not UiMode.PlaybackPlaying and not UiMode.PlaybackPaused)
         {
-            return false;
+            return;
         }
 
-        var failedSession = _recordingSession;
-        _recordingSession = new RecordingSession(
-            SelectedEncoderOption,
-            _outputPath!,
-            _sessionEncoderSettings ?? _encoderSettings);
-        _recordingCpuFallbackActive = true;
-        _lastRecordingFaultMessage = $"GPU 録画経路が利用できなかったため CPU 受信へフォールバックしました: {exception.Message}";
-        _spoutPollingService.SetRecordingMode(true, false);
+        _ = Dispatcher.BeginInvoke(UpdateStateMetrics);
+    }
+
+    private void MediaPlayer_OnEndReached(object? sender, EventArgs e)
+    {
+        if (_capturedTake is null)
+        {
+            return;
+        }
 
         _ = Dispatcher.BeginInvoke(() =>
         {
-            RecorderStatusTextBlock.Text = "GPU 録画経路が利用できなかったため、CPU 受信経由で録画を継続しています。";
-            PreviewStatusTextBlock.Text = "録画は継続中です。GPU texture 入力が使えない環境向けにフォールバックしました。";
-            HeaderStatusTextBlock.Text = "録画中";
+            _uiMode = UiMode.PlaybackPaused;
+            UpdateUiState();
+        });
+    }
+
+    private void BuildButtonContent()
+    {
+        RecordButton.Content = CreateButtonContent("⏺", "Record");
+        SettingsButton.Content = CreateButtonContent("⚙", "Settings");
+        DoneButton.Content = CreateButtonContent("✓", "Done");
+        PauseResumeButton.Content = CreateButtonContent("⏸", "Pause");
+        RemoveButton.Content = CreateButtonContent("⌦", "Remove");
+        BackwardButton.Content = CreateButtonContent("↺5", "Backward", 36);
+        PlayPauseButton.Content = CreateButtonContent("▶", "Play");
+        ForwardButton.Content = CreateButtonContent("5↻", "Forward", 36);
+        EncodeButton.Content = CreateButtonContent("↪", "Encode");
+        CancelButton.Content = CreateButtonContent("✕", "Cancel");
+        ContinueButton.Content = CreateButtonContent("✓", "Continue");
+    }
+
+    private static UIElement CreateButtonContent(string icon, string label, double iconFontSize = 42)
+    {
+        var panel = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = icon,
+            FontFamily = new FontFamily("Segoe UI Symbol"),
+            FontSize = iconFontSize,
+            FontWeight = FontWeights.Bold,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextAlignment = TextAlignment.Center
         });
 
-        _ = DisposeFailedSessionAsync(failedSession);
-        return true;
+        panel.Children.Add(new TextBlock
+        {
+            Text = label,
+            Margin = new Thickness(0, 4, 0, 0),
+            FontFamily = new FontFamily("Segoe UI"),
+            FontSize = 15,
+            FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextAlignment = TextAlignment.Center
+        });
+
+        return panel;
     }
 
     private void UpdateUiState()
     {
-        var hasPreview = _previewMedia is not null || !string.IsNullOrWhiteSpace(_lastRecordedFilePath);
-        var recording = _recordingSession is not null;
+        var isInitial = _uiMode is UiMode.NoSignal or UiMode.Receiving;
+        InitialMetricsPanel.Visibility = isInitial ? Visibility.Visible : Visibility.Collapsed;
+        StateMetricsPanel.Visibility = isInitial ? Visibility.Collapsed : Visibility.Visible;
 
-        StartRecordingButton.IsEnabled = !recording && !_isStopping;
-        StopRecordingButton.IsEnabled = recording && !_isStopping;
-        RerecordButton.IsEnabled = !recording && !_isStopping;
-        BrowseOutputButton.IsEnabled = !recording && !_isStopping;
-        FormatComboBox.IsEnabled = !recording && !_isStopping;
-        PlayPreviewButton.IsEnabled = !recording && !_isStopping && hasPreview;
-        PausePreviewButton.IsEnabled = !recording && !_isStopping && hasPreview;
-        SeekSlider.IsEnabled = !recording && !_isStopping && hasPreview;
-        EncoderSettingsRootPanel.IsEnabled = !recording && !_isStopping;
-        ApplyEncoderSettingsVisibility();
+        InitialActionsPanel.Visibility = isInitial ? Visibility.Visible : Visibility.Collapsed;
+        RecordingActionsPanel.Visibility = _uiMode is UiMode.Recording or UiMode.RecordingPaused
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        PlaybackActionsPanel.Visibility = _uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        EncodingActionsPanel.Visibility = _uiMode == UiMode.Encoding
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        EncodedActionsPanel.Visibility = _uiMode == UiMode.Encoded
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        var connected = _latestStatus?.IsConnected == true;
+        RecordButton.IsEnabled = isInitial && connected && _capturedTake is null && _recordingSession is null;
+        SettingsButton.IsEnabled = isInitial;
+
+        DoneButton.IsEnabled = _uiMode is UiMode.Recording or UiMode.RecordingPaused;
+        PauseResumeButton.IsEnabled = DoneButton.IsEnabled;
+        RemoveButton.IsEnabled = _capturedTake is not null && _uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused;
+        BackwardButton.IsEnabled = RemoveButton.IsEnabled;
+        PlayPauseButton.IsEnabled = RemoveButton.IsEnabled;
+        ForwardButton.IsEnabled = RemoveButton.IsEnabled;
+        EncodeButton.IsEnabled = RemoveButton.IsEnabled && _uiMode != UiMode.Encoding;
+        CancelButton.IsEnabled = _uiMode == UiMode.Encoding;
+        ContinueButton.IsEnabled = _uiMode == UiMode.Encoded;
+
+        PauseResumeButton.Content = CreateButtonContent(
+            _uiMode == UiMode.RecordingPaused ? "▶" : "⏸",
+            _uiMode == UiMode.RecordingPaused ? "Resume" : "Pause");
+
+        PlayPauseButton.Content = CreateButtonContent(
+            _uiMode == UiMode.PlaybackPlaying ? "⏸" : "▶",
+            _uiMode == UiMode.PlaybackPlaying ? "Pause" : "Play");
+
+        UpdateInitialMetrics();
+        UpdateStateMetrics();
+        UpdateStageVisibility();
+        UpdateEncodingProgressVisual();
+    }
+
+    private void UpdateInitialMetrics()
+    {
+        if (_uiMode is not UiMode.NoSignal and not UiMode.Receiving)
+        {
+            return;
+        }
+
+        if (_latestStatus is null || !_latestStatus.IsConnected)
+        {
+            ResolutionValueTextBlock.Text = "---";
+            FrameRateValueTextBlock.Text = "---";
+            SenderValueTextBlock.Text = "---";
+            return;
+        }
+
+        ResolutionValueTextBlock.Text = _latestStatus.Width > 0 && _latestStatus.Height > 0
+            ? $"{_latestStatus.Width}x{_latestStatus.Height}"
+            : "---";
+        FrameRateValueTextBlock.Text = _latestStatus.SenderFps > 0
+            ? _latestStatus.SenderFps.ToString("0.##", CultureInfo.InvariantCulture)
+            : "---";
+        SenderValueTextBlock.Text = string.IsNullOrWhiteSpace(_latestStatus.SenderName)
+            ? "---"
+            : _latestStatus.SenderName;
+    }
+
+    private void UpdateStateMetrics()
+    {
+        if (StateMetricsPanel.Visibility != Visibility.Visible)
+        {
+            return;
+        }
+
+        switch (_uiMode)
+        {
+            case UiMode.Recording:
+            case UiMode.RecordingPaused:
+                StateValueTextBlock.Text = _uiMode == UiMode.Recording ? "Recording" : "Paused";
+                SecondaryLabelTextBlock.Text = "Duration";
+                SecondaryValueTextBlock.Text = FormatTime(GetRecordingElapsed());
+                break;
+            case UiMode.PlaybackPlaying:
+            case UiMode.PlaybackPaused:
+                StateValueTextBlock.Text = "Playback";
+                SecondaryLabelTextBlock.Text = "Duration";
+                SecondaryValueTextBlock.Text = FormatTime(TimeSpan.FromMilliseconds(Math.Max(_mediaPlayer?.Time ?? 0, 0)));
+                break;
+            case UiMode.Encoding:
+            case UiMode.Encoded:
+                StateValueTextBlock.Text = _uiMode == UiMode.Encoding ? "Encoding" : "Encoded";
+                SecondaryLabelTextBlock.Text = "Progress";
+                SecondaryValueTextBlock.Text = $"{_encodingProgressPercent}%";
+                break;
+        }
+    }
+
+    private void UpdateStageVisibility()
+    {
+        var showLivePreview = _uiMode == UiMode.Receiving && _liveBitmap is not null;
+        LivePreviewImage.Visibility = showLivePreview ? Visibility.Visible : Visibility.Collapsed;
+        PlaybackVideoView.Visibility = _uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        NoSignalOverlayTextBlock.Visibility = _uiMode == UiMode.NoSignal ? Visibility.Visible : Visibility.Collapsed;
+        EncodingOverlayPanel.Visibility = _uiMode == UiMode.Encoding ? Visibility.Visible : Visibility.Collapsed;
+        DoneOverlayTextBlock.Visibility = _uiMode == UiMode.Encoded ? Visibility.Visible : Visibility.Collapsed;
+
+        if (_uiMode is UiMode.Recording or UiMode.RecordingPaused)
+        {
+            LivePreviewImage.Visibility = Visibility.Collapsed;
+            PlaybackVideoView.Visibility = Visibility.Collapsed;
+            NoSignalOverlayTextBlock.Visibility = Visibility.Collapsed;
+            EncodingOverlayPanel.Visibility = Visibility.Collapsed;
+            DoneOverlayTextBlock.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void UpdateEncodingProgressVisual()
+    {
+        EncodingProgressFill.Width = 360 * Math.Clamp(_encodingProgressPercent, 0, 100) / 100.0;
+    }
+
+    private void HandleEncodeProgress(EncodeProgress progress)
+    {
+        _encodingProgressPercent = progress.Percent;
+        if (_uiMode == UiMode.Encoding)
+        {
+            UpdateStateMetrics();
+            UpdateEncodingProgressVisual();
+        }
     }
 
     private void UpdateRecordingElapsed()
     {
-        if (_recordingStartedAt is null)
+        if (_uiMode is not UiMode.Recording and not UiMode.RecordingPaused)
         {
-            RecordingElapsedTextBlock.Text = "00:00:00.000";
             return;
         }
 
-        var elapsed = DateTimeOffset.UtcNow - _recordingStartedAt.Value;
-        RecordingElapsedTextBlock.Text = $"{elapsed:hh\\:mm\\:ss\\.fff}";
+        SecondaryValueTextBlock.Text = FormatTime(GetRecordingElapsed());
     }
 
-    private EncoderOption SelectedEncoderOption => (EncoderOption)(FormatComboBox.SelectedItem ?? _encoderOptions[0]);
+    private TimeSpan GetRecordingElapsed()
+    {
+        if (_recordingStartedAt is null)
+        {
+            return TimeSpan.Zero;
+        }
+
+        var now = _recordingPausedAt ?? DateTimeOffset.UtcNow;
+        var elapsed = now - _recordingStartedAt.Value - _recordingPausedAccumulated;
+        return elapsed < TimeSpan.Zero ? TimeSpan.Zero : elapsed;
+    }
+
+    private void SetRecordingInputActive(bool enabled)
+    {
+        _spoutPollingService.FrameArrived -= SpoutPollingService_OnFrameArrived;
+        if (enabled)
+        {
+            _spoutPollingService.FrameArrived += SpoutPollingService_OnFrameArrived;
+            _spoutPollingService.SetRecordingMode(true, _selectedEncoderOption.UsesRealtimeRgbIntermediate);
+        }
+        else
+        {
+            _spoutPollingService.SetRecordingMode(false, false);
+        }
+    }
 
     private void BeginRecordingLatencyScope()
     {
@@ -623,244 +942,102 @@ public partial class MainWindow : Window
         _recordingLatencyModeRestore = null;
     }
 
-    private static string BuildSuggestedOutputName(EncoderOption option)
+    private void ClearRecordingState()
     {
-        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        return $"spout_capture_{stamp}{option.Extension}";
+        _recordingStartedAt = null;
+        _recordingPausedAt = null;
+        _recordingPausedAccumulated = TimeSpan.Zero;
     }
 
-    private void EncoderSettingsSelection_OnChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private async Task DisposeCapturedTakeAsync()
     {
-        if (!_isUiInitialized)
+        var take = _capturedTake;
+        _capturedTake = null;
+
+        StopPreviewPlayback();
+
+        if (take is not null)
         {
-            return;
+            try
+            {
+                await take.DisposeAsync().ConfigureAwait(true);
+            }
+            catch
+            {
+                // Cleanup is best-effort.
+            }
         }
-
-        ApplyEncoderSettingsVisibility();
     }
 
-    private void EncoderSettingsToggle_OnChanged(object sender, RoutedEventArgs e)
-    {
-        if (!_isUiInitialized)
-        {
-            return;
-        }
-
-        ApplyEncoderSettingsVisibility();
-    }
-
-    private void EncoderSettingsSlider_OnChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
-    {
-        if (!_isUiInitialized)
-        {
-            return;
-        }
-
-        UpdateEncoderSettingsReadouts();
-        ApplyEncoderSettingsVisibility();
-    }
-
-    private void LoadEncoderSettingsIntoUi()
-    {
-        RgbRateControlComboBox.SelectedItem = _encoderSettings.Rgb.RateControlMode;
-        RgbQualityVsSpeedSlider.Value = _encoderSettings.Rgb.QualityVsSpeed;
-        RgbQualitySlider.Value = _encoderSettings.Rgb.Quality;
-        RgbTargetBitrateTextBox.Text = _encoderSettings.Rgb.TargetBitrateMbps.ToString(CultureInfo.InvariantCulture);
-        RgbBufferSizeTextBox.Text = _encoderSettings.Rgb.BufferSizeMb.ToString(CultureInfo.InvariantCulture);
-        RgbLowLatencyCheckBox.IsChecked = _encoderSettings.Rgb.LowLatency;
-        RgbUseConstantQpCheckBox.IsChecked = _encoderSettings.Rgb.UseConstantQp;
-        RgbConstantQpTextBox.Text = _encoderSettings.Rgb.ConstantQp.ToString(CultureInfo.InvariantCulture);
-        RgbMinQpTextBox.Text = _encoderSettings.Rgb.MinQp.ToString(CultureInfo.InvariantCulture);
-        RgbMaxQpTextBox.Text = _encoderSettings.Rgb.MaxQp.ToString(CultureInfo.InvariantCulture);
-        RgbGopSizeTextBox.Text = _encoderSettings.Rgb.GopSize.ToString(CultureInfo.InvariantCulture);
-        RgbContentTypeComboBox.SelectedItem = _encoderSettings.Rgb.ContentTypeHint;
-        RgbWorkerThreadsTextBox.Text = _encoderSettings.Rgb.WorkerThreads.ToString(CultureInfo.InvariantCulture);
-
-        AlphaPresetSlider.Value = _encoderSettings.Alpha.Preset.ToUiPresetLevel();
-        AlphaTuneComboBox.SelectedItem = _encoderSettings.Alpha.Tune;
-        AlphaRateControlComboBox.SelectedItem = _encoderSettings.Alpha.RateControlMode;
-        AlphaTargetBitrateTextBox.Text = _encoderSettings.Alpha.TargetBitrateMbps.ToString(CultureInfo.InvariantCulture);
-        AlphaConstantQualitySlider.Value = _encoderSettings.Alpha.ConstantQuality;
-        AlphaConstantQpSlider.Value = _encoderSettings.Alpha.ConstantQp;
-        AlphaMinQpTextBox.Text = _encoderSettings.Alpha.MinQp.ToString(CultureInfo.InvariantCulture);
-        AlphaMaxQpTextBox.Text = _encoderSettings.Alpha.MaxQp.ToString(CultureInfo.InvariantCulture);
-        AlphaLookaheadTextBox.Text = _encoderSettings.Alpha.LookaheadFrames.ToString(CultureInfo.InvariantCulture);
-        AlphaSpatialAqCheckBox.IsChecked = _encoderSettings.Alpha.SpatialAq;
-        AlphaTemporalAqCheckBox.IsChecked = _encoderSettings.Alpha.TemporalAq;
-        AlphaAqStrengthTextBox.Text = _encoderSettings.Alpha.AqStrength.ToString(CultureInfo.InvariantCulture);
-        AlphaZeroLatencyCheckBox.IsChecked = _encoderSettings.Alpha.ZeroLatency;
-        AlphaBFramesTextBox.Text = _encoderSettings.Alpha.BFrames.ToString(CultureInfo.InvariantCulture);
-        AlphaGopSizeTextBox.Text = _encoderSettings.Alpha.GopSize.ToString(CultureInfo.InvariantCulture);
-        AlphaProfileComboBox.SelectedItem = _encoderSettings.Alpha.Profile;
-        AlphaLevelComboBox.SelectedItem = _encoderSettings.Alpha.Level;
-
-        UpdateEncoderSettingsReadouts();
-        ApplyEncoderSettingsVisibility();
-    }
-
-    private EncoderSettingsRoot CaptureEncoderSettingsFromUi()
-    {
-        var settings = _encoderSettings.Clone();
-
-        settings.Rgb.RateControlMode = SelectedEnum(RgbRateControlComboBox, settings.Rgb.RateControlMode);
-        settings.Rgb.QualityVsSpeed = ReadSlider(RgbQualityVsSpeedSlider, settings.Rgb.QualityVsSpeed);
-        settings.Rgb.Quality = ReadSlider(RgbQualitySlider, settings.Rgb.Quality);
-        settings.Rgb.TargetBitrateMbps = ReadInt(RgbTargetBitrateTextBox, settings.Rgb.TargetBitrateMbps);
-        settings.Rgb.BufferSizeMb = ReadInt(RgbBufferSizeTextBox, settings.Rgb.BufferSizeMb);
-        settings.Rgb.LowLatency = RgbLowLatencyCheckBox.IsChecked ?? settings.Rgb.LowLatency;
-        settings.Rgb.UseConstantQp = RgbUseConstantQpCheckBox.IsChecked ?? settings.Rgb.UseConstantQp;
-        settings.Rgb.ConstantQp = ReadInt(RgbConstantQpTextBox, settings.Rgb.ConstantQp);
-        settings.Rgb.MinQp = ReadInt(RgbMinQpTextBox, settings.Rgb.MinQp);
-        settings.Rgb.MaxQp = ReadInt(RgbMaxQpTextBox, settings.Rgb.MaxQp);
-        settings.Rgb.GopSize = ReadInt(RgbGopSizeTextBox, settings.Rgb.GopSize);
-        settings.Rgb.ContentTypeHint = SelectedEnum(RgbContentTypeComboBox, settings.Rgb.ContentTypeHint);
-        settings.Rgb.WorkerThreads = ReadInt(RgbWorkerThreadsTextBox, settings.Rgb.WorkerThreads);
-
-        settings.Alpha.Preset = AlphaNvencValueExtensions.FromUiPresetLevel(
-            ReadSlider(AlphaPresetSlider, settings.Alpha.Preset.ToUiPresetLevel()));
-        settings.Alpha.Tune = SelectedEnum(AlphaTuneComboBox, settings.Alpha.Tune);
-        settings.Alpha.RateControlMode = SelectedEnum(AlphaRateControlComboBox, settings.Alpha.RateControlMode);
-        settings.Alpha.TargetBitrateMbps = ReadInt(AlphaTargetBitrateTextBox, settings.Alpha.TargetBitrateMbps);
-        settings.Alpha.ConstantQuality = ReadSlider(AlphaConstantQualitySlider, settings.Alpha.ConstantQuality);
-        settings.Alpha.ConstantQp = ReadSlider(AlphaConstantQpSlider, settings.Alpha.ConstantQp);
-        settings.Alpha.MinQp = ReadInt(AlphaMinQpTextBox, settings.Alpha.MinQp);
-        settings.Alpha.MaxQp = ReadInt(AlphaMaxQpTextBox, settings.Alpha.MaxQp);
-        settings.Alpha.LookaheadFrames = ReadInt(AlphaLookaheadTextBox, settings.Alpha.LookaheadFrames);
-        settings.Alpha.SpatialAq = AlphaSpatialAqCheckBox.IsChecked ?? settings.Alpha.SpatialAq;
-        settings.Alpha.TemporalAq = AlphaTemporalAqCheckBox.IsChecked ?? settings.Alpha.TemporalAq;
-        settings.Alpha.AqStrength = ReadInt(AlphaAqStrengthTextBox, settings.Alpha.AqStrength);
-        settings.Alpha.ZeroLatency = AlphaZeroLatencyCheckBox.IsChecked ?? settings.Alpha.ZeroLatency;
-        settings.Alpha.BFrames = ReadInt(AlphaBFramesTextBox, settings.Alpha.BFrames);
-        settings.Alpha.GopSize = ReadInt(AlphaGopSizeTextBox, settings.Alpha.GopSize);
-        settings.Alpha.Profile = SelectedEnum(AlphaProfileComboBox, settings.Alpha.Profile);
-        settings.Alpha.Level = SelectedEnum(AlphaLevelComboBox, settings.Alpha.Level);
-
-        settings.Normalize();
-        return settings;
-    }
-
-    private void ApplyEncoderSettingsVisibility()
-    {
-        var showEncoderSettings = SelectedEncoderOption.Kind == EncoderProfileKind.HevcNvencMp4AlphaMp4;
-        EncoderSettingsSectionBorder.Visibility = showEncoderSettings
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-
-        if (!showEncoderSettings)
-        {
-            return;
-        }
-
-        UpdateEncoderSettingsReadouts();
-
-        var rgbRateControl = SelectedEnum(RgbRateControlComboBox, RgbMediaFoundationRateControlMode.Quality);
-        RgbQualityPanel.Visibility = rgbRateControl == RgbMediaFoundationRateControlMode.Quality
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        RgbTargetBitratePanel.Visibility = rgbRateControl == RgbMediaFoundationRateControlMode.Cbr
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        RgbConstantQpPanel.Visibility = RgbUseConstantQpCheckBox.IsChecked == true
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-
-        var alphaRateControl = SelectedEnum(AlphaRateControlComboBox, AlphaNvencRateControlMode.Vbr);
-        AlphaTargetBitratePanel.Visibility =
-            alphaRateControl is AlphaNvencRateControlMode.Vbr or AlphaNvencRateControlMode.Cbr
-                ? Visibility.Visible
-                : Visibility.Collapsed;
-        AlphaConstantQualityPanel.Visibility = alphaRateControl == AlphaNvencRateControlMode.Vbr
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        AlphaConstantQpPanel.Visibility = alphaRateControl == AlphaNvencRateControlMode.ConstQp
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-
-        var useAq = AlphaSpatialAqCheckBox.IsChecked == true || AlphaTemporalAqCheckBox.IsChecked == true;
-        AlphaAqStrengthPanel.Visibility = useAq
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-    }
-
-    private void UpdateEncoderSettingsReadouts()
-    {
-        if (!_isUiInitialized)
-        {
-            return;
-        }
-
-        RgbQualityVsSpeedValueTextBlock.Text = ReadSlider(RgbQualityVsSpeedSlider, 16).ToString(CultureInfo.InvariantCulture);
-        RgbQualityValueTextBlock.Text = ReadSlider(RgbQualitySlider, 70).ToString(CultureInfo.InvariantCulture);
-        AlphaPresetValueTextBlock.Text = $"P{ReadSlider(AlphaPresetSlider, 3)} / {DescribeAlphaPreset(ReadSlider(AlphaPresetSlider, 3))}";
-        AlphaConstantQualityValueTextBlock.Text = ReadSlider(AlphaConstantQualitySlider, 19).ToString(CultureInfo.InvariantCulture);
-        AlphaConstantQpValueTextBlock.Text = ReadSlider(AlphaConstantQpSlider, 23).ToString(CultureInfo.InvariantCulture);
-    }
-
-    private static int ReadInt(System.Windows.Controls.TextBox textBox, int fallback)
-    {
-        var text = textBox.Text?.Trim();
-        return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
-            ? value
-            : fallback;
-    }
-
-    private static int ReadSlider(System.Windows.Controls.Slider slider, int fallback)
-    {
-        var value = (int)Math.Round(slider.Value);
-        return value >= 0 ? value : fallback;
-    }
-
-    private static string DescribeAlphaPreset(int value)
-    {
-        return value switch
-        {
-            1 => "Fastest",
-            2 => "Faster",
-            3 => "Fast",
-            4 => "Medium",
-            5 => "Good quality",
-            6 => "Better quality",
-            _ => "Best quality"
-        };
-    }
-
-    private static TEnum SelectedEnum<TEnum>(System.Windows.Controls.ComboBox comboBox, TEnum fallback)
-        where TEnum : struct, Enum
-    {
-        return comboBox.SelectedItem is TEnum selected ? selected : fallback;
-    }
-
-    private static string FormatTime(long milliseconds)
-    {
-        if (milliseconds < 0)
-        {
-            milliseconds = 0;
-        }
-
-        return TimeSpan.FromMilliseconds(milliseconds).ToString(@"hh\:mm\:ss\.fff");
-    }
-
-    private static bool LooksLikeCaptureFault(string? message)
-    {
-        if (string.IsNullOrWhiteSpace(message))
-        {
-            return false;
-        }
-
-        return message.Contains("失敗", StringComparison.Ordinal) ||
-               message.Contains("エラー", StringComparison.Ordinal) ||
-               message.Contains("フォールバック", StringComparison.Ordinal);
-    }
-
-    private static async Task DisposeFailedSessionAsync(RecordingSession failedSession)
+    private static async Task TryDisposeSessionAsync(RecordingSession session)
     {
         try
         {
-            await failedSession.DisposeAsync();
+            await session.DisposeAsync().ConfigureAwait(true);
         }
         catch
         {
-            // Ignore fallback cleanup failures so the replacement session can continue.
+            // Best-effort cleanup only.
         }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.Delete(path, true);
+        }
+        catch
+        {
+            // Best-effort cleanup only.
+        }
+    }
+
+    private static string BuildTakeDirectory()
+    {
+        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        return Path.Combine(AppDataPaths.CacheRootDirectory, "takes", $"{stamp}_{suffix}");
+    }
+
+    private static string BuildAlphaSidecarPath(string previewPath)
+    {
+        var directory = Path.GetDirectoryName(previewPath) ?? string.Empty;
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(previewPath);
+        return Path.Combine(directory, $"{fileNameWithoutExtension}.alpha.mp4");
+    }
+
+    private static string BuildSuggestedOutputName(EncoderOption option)
+    {
+        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+        return $"spout_capture_{stamp}{option.Extension}";
+    }
+
+    private EncoderOption ResolveEncoderOption(EncoderProfileKind kind)
+    {
+        foreach (var option in _encoderOptions)
+        {
+            if (option.Kind == kind)
+            {
+                return option;
+            }
+        }
+
+        return _encoderOptions[0];
+    }
+
+    private static string FormatTime(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero)
+        {
+            value = TimeSpan.Zero;
+        }
+
+        return value.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
     }
 }
