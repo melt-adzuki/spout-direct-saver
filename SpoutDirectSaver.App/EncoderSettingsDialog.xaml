@@ -11,7 +11,6 @@
         MinWidth="840"
         MinHeight="680"
         WindowStartupLocation="CenterOwner"
-        WindowStyle="None"
         ResizeMode="CanResize"
         Background="#303030"
         FontFamily="Segoe UI"
@@ -31,11 +30,34 @@
             <Setter Property="CaretBrush" Value="#EEF6FF" />
         </Style>
         <Style TargetType="ComboBox">
-            <Setter Property="Foreground" Value="#EEF6FF" />
-            <Setter Property="Background" Value="#0F1821" />
+            <Setter Property="Foreground" Value="#15212C" />
+            <Setter Property="Background" Value="#F1F4F7" />
             <Setter Property="BorderBrush" Value="#355165" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Padding" Value="8,4" />
+            <Setter Property="ItemTemplate">
+                <Setter.Value>
+                    <DataTemplate>
+                        <TextBlock Foreground="#15212C"
+                                   Text="{Binding}" />
+                    </DataTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="#15212C" />
+            <Setter Property="Background" Value="#F1F4F7" />
+            <Setter Property="Padding" Value="8,4" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Style.Triggers>
+                <Trigger Property="IsHighlighted" Value="True">
+                    <Setter Property="Background" Value="#CDE9FF" />
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#9ED3FF" />
+                    <Setter Property="Foreground" Value="#102234" />
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style TargetType="CheckBox">
             <Setter Property="Foreground" Value="#EAF2FB" />

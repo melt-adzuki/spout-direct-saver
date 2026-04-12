@@ -90,6 +90,7 @@ internal sealed class VideoExportService
         double outputFrameRate,
         string outputPath,
         CancellationToken cancellationToken,
+        IProgress<EncodeProgress>? progress = null,
         AlphaNvencEncoderSettings? settings = null)
     {
         await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
@@ -121,6 +122,8 @@ internal sealed class VideoExportService
                 frames,
                 checked((int)(width * height)),
                 outputFrameRate,
+                progress,
+                "Encoding alpha sidecar",
                 cancellationToken),
             cancellationToken).ConfigureAwait(false);
     }
@@ -182,6 +185,18 @@ internal sealed class VideoExportService
         double outputFrameRate,
         string outputPath,
         CancellationToken cancellationToken)
+        => await ExportAsync(encoderOption, spoolPath, frames, width, height, outputFrameRate, outputPath, cancellationToken, null).ConfigureAwait(false);
+
+    public async Task ExportAsync(
+        EncoderOption encoderOption,
+        string spoolPath,
+        IReadOnlyList<RecordedFrame> frames,
+        uint width,
+        uint height,
+        double outputFrameRate,
+        string outputPath,
+        CancellationToken cancellationToken,
+        IProgress<EncodeProgress>? progress)
     {
         await WaitForStableFileAsync(spoolPath, cancellationToken).ConfigureAwait(false);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
@@ -206,6 +221,8 @@ internal sealed class VideoExportService
                 frames,
                 checked((int)(width * height * 4)),
                 outputFrameRate,
+                progress,
+                "Encoding video",
                 cancellationToken),
             cancellationToken).ConfigureAwait(false);
     }
@@ -216,6 +233,8 @@ internal sealed class VideoExportService
         IReadOnlyList<RecordedFrame> frames,
         int frameSize,
         double outputFrameRate,
+        IProgress<EncodeProgress>? progress,
+        string phase,
         CancellationToken cancellationToken)
     {
         var rawBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
@@ -223,6 +242,9 @@ internal sealed class VideoExportService
         var emittedFrames = 0;
         var accumulatedTimelineFrames = 0.0;
         var hasPreviousDecodedFrame = false;
+        var lastReportedPercent = -1;
+        var totalFrames = Math.Max(frames.Count, 1);
+        var processedFrames = 0;
 
         try
         {
@@ -304,6 +326,13 @@ internal sealed class VideoExportService
                 }
 
                 emittedFrames = targetTotalFrames;
+                processedFrames++;
+                var percent = (int)Math.Round(processedFrames * 100.0 / totalFrames);
+                if (percent != lastReportedPercent)
+                {
+                    progress?.Report(new EncodeProgress(Math.Clamp(percent, 0, 100), phase, "Encoding..."));
+                    lastReportedPercent = percent;
+                }
             }
 
             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);

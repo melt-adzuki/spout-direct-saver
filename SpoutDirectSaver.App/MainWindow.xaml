@@ -3,7 +3,6 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
         mc:Ignorable="d"
         Title="Spout Direct Saver"
         Width="1024"
@@ -11,8 +10,7 @@
         MinWidth="1024"
         MinHeight="768"
         WindowStartupLocation="CenterScreen"
-        WindowStyle="None"
-        ResizeMode="NoResize"
+        ResizeMode="CanMinimize"
         Background="#434343"
         FontFamily="Segoe UI"
         UseLayoutRounding="True"
@@ -88,7 +86,7 @@
         </Style>
     </Window.Resources>
 
-    <Grid Background="#434343" ClipToBounds="True">
+    <Grid Background="#434343">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -164,23 +162,29 @@
         </Grid>
 
         <Grid Grid.Row="1"
-              Margin="128,18,128,0"
+              Margin="128,18,128,16"
               VerticalAlignment="Top">
             <Border Background="#252525"
                     CornerRadius="34"
                     Padding="12"
                     Height="430">
-                <Border Background="#666666"
+                <Border x:Name="PreviewViewportBorder"
+                        Background="#666666"
                         CornerRadius="24"
-                        ClipToBounds="True">
+                        ClipToBounds="True"
+                        SizeChanged="PreviewViewportBorder_OnSizeChanged">
                     <Grid>
                         <Image x:Name="LivePreviewImage"
                                Stretch="Uniform"
                                Visibility="Collapsed"
                                SnapsToDevicePixels="True" />
 
-                        <vlc:VideoView x:Name="PlaybackVideoView"
-                                       Visibility="Collapsed" />
+                        <Image x:Name="PlaybackImage"
+                               Visibility="Collapsed"
+                               Stretch="Uniform"
+                               IsHitTestVisible="False"
+                               SnapsToDevicePixels="True"
+                               RenderOptions.BitmapScalingMode="HighQuality" />
 
                         <Grid x:Name="OverlayHost"
                               IsHitTestVisible="False"
@@ -193,6 +197,27 @@
                                        Foreground="#F4F4F4"
                                        Text="NO SIGNAL"
                                        TextOptions.TextFormattingMode="Display" />
+
+                            <StackPanel x:Name="RecordingOverlayPanel"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        Visibility="Collapsed">
+                                <TextBlock x:Name="RecordingOverlayTitleTextBlock"
+                                           HorizontalAlignment="Center"
+                                           FontSize="42"
+                                           FontWeight="SemiBold"
+                                           Foreground="#F4F4F4"
+                                           Text="Recording in progress"
+                                           TextOptions.TextFormattingMode="Display" />
+                                <TextBlock x:Name="RecordingOverlayBodyTextBlock"
+                                           Margin="0,12,0,0"
+                                           HorizontalAlignment="Center"
+                                           FontSize="20"
+                                           FontWeight="SemiBold"
+                                           Foreground="#E2E2E2"
+                                           Text="Live preview is stopped while recording."
+                                           TextOptions.TextFormattingMode="Display" />
+                            </StackPanel>
 
                             <StackPanel x:Name="EncodingOverlayPanel"
                                         HorizontalAlignment="Center"

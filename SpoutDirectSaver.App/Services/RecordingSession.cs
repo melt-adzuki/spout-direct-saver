@@ -232,6 +232,10 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
+    public uint RecordedWidth => _recordedWidth;
+
+    public uint RecordedHeight => _recordedHeight;
+
     public void Pause()
     {
         lock (_gate)
@@ -266,12 +270,17 @@ internal sealed class RecordingSession : IAsyncDisposable
         }
     }
 
-    public async Task<string> FinalizeAsync(VideoExportService exportService, CancellationToken cancellationToken)
+    public async Task<string> FinalizeAsync(
+        VideoExportService exportService,
+        IProgress<EncodeProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         DebugTrace.WriteLine("RecordingSession", $"finalize start session={_traceId} temp={_temporaryDirectory}");
         RecordedFrame[] framesToEncode = [];
         RealtimeHybridWriter? realtimeWriter = null;
         RealtimeRgbNvencWriter? rgbIntermediateWriter = null;
+
+        progress?.Report(new EncodeProgress(0, "preparing", "Encoding..."));
 
         lock (_gate)
         {
@@ -315,7 +324,9 @@ internal sealed class RecordingSession : IAsyncDisposable
                     throw new InvalidOperationException("realtime エンコーダーが初期化されていません。");
                 }
 
-                return await realtimeWriter.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                var output = await realtimeWriter.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                progress?.Report(new EncodeProgress(100, "done", "Done!"));
+                return output;
             }
 
             if (_useRealtimeRgbIntermediate)
@@ -346,6 +357,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                         throw new InvalidOperationException("alpha track path が初期化されていません。");
                     }
 
+                    progress?.Report(new EncodeProgress(18, "alpha-sidecar", "Encoding alpha sidecar..."));
                     await exportService.ExportAlphaTrackAsync(
                         _spoolPath,
                         framesToEncode,
@@ -354,18 +366,22 @@ internal sealed class RecordingSession : IAsyncDisposable
                         GetOutputFrameRate(),
                         _alphaTrackPath,
                         cancellationToken,
+                        CreateScopedProgress(progress, 18, 78, "alpha-sidecar"),
                         _encoderSettings.Alpha).ConfigureAwait(false);
                 }
 
                 if (_disableHybridRgbIntermediate)
                 {
+                    progress?.Report(new EncodeProgress(88, "mux", "Encoding..."));
                     await exportService.RemuxSingleVideoAsync(
                         _alphaTrackPath!,
                         _outputPath,
                         cancellationToken).ConfigureAwait(false);
+                    progress?.Report(new EncodeProgress(100, "done", "Done!"));
                     return _outputPath;
                 }
 
+                progress?.Report(new EncodeProgress(88, "mux", "Encoding..."));
                 await exportService.RemuxSingleVideoAsync(
                     _rgbIntermediatePath!,
                     _outputPath,
@@ -378,6 +394,7 @@ internal sealed class RecordingSession : IAsyncDisposable
                     File.Copy(_alphaTrackPath!, alphaSidecarPath, overwrite: true);
                 }
 
+                progress?.Report(new EncodeProgress(100, "done", "Done!"));
                 return _outputPath;
             }
 
@@ -385,6 +402,7 @@ internal sealed class RecordingSession : IAsyncDisposable
             {
                 await Task.WhenAll(_compressionTasks).ConfigureAwait(false);
             }
+            progress?.Report(new EncodeProgress(15, "video", "Encoding video..."));
             await _writerTask.ConfigureAwait(false);
             _syncSpoolStream?.Dispose();
 
@@ -396,7 +414,9 @@ internal sealed class RecordingSession : IAsyncDisposable
                 _recordedHeight,
                 GetOutputFrameRate(),
                 _outputPath,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                CreateScopedProgress(progress, 15, 95, "video")).ConfigureAwait(false);
+            progress?.Report(new EncodeProgress(100, "done", "Done!"));
             return _outputPath;
         }
         finally
@@ -411,6 +431,29 @@ internal sealed class RecordingSession : IAsyncDisposable
             _syncSpoolStream?.Dispose();
             TryDeleteTemporaryDirectory();
         }
+    }
+
+    public Task<string> FinalizeAsync(VideoExportService exportService, CancellationToken cancellationToken)
+        => FinalizeAsync(exportService, null, cancellationToken);
+
+    private static IProgress<EncodeProgress>? CreateScopedProgress(
+        IProgress<EncodeProgress>? parent,
+        int startPercent,
+        int endPercent,
+        string phase)
+    {
+        if (parent is null)
+        {
+            return null;
+        }
+
+        return new Progress<EncodeProgress>(progress =>
+        {
+            var localPercent = Math.Clamp(progress.Percent, 0, 100);
+            var span = Math.Max(endPercent - startPercent, 0);
+            var percent = startPercent + (int)Math.Round(span * localPercent / 100.0);
+            parent.Report(new EncodeProgress(Math.Clamp(percent, 0, 100), phase, progress.Message));
+        });
     }
 
     public async ValueTask DisposeAsync()

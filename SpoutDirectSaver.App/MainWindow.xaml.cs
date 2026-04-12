@@ -1,7 +1,9 @@
 using System;
+using System.Buffers;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +13,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using LibVLCSharp.Shared;
+using MahApps.Metro.IconPacks;
 using Microsoft.Win32;
 using VLCMediaPlayer = LibVLCSharp.Shared.MediaPlayer;
 using SpoutDirectSaver.App.Models;
@@ -37,11 +40,15 @@ public partial class MainWindow : Window
     private readonly EncoderSettingsStore _encoderSettingsStore = new();
     private readonly DispatcherTimer _recordingTimer;
     private readonly EncoderOption[] _encoderOptions = EncoderOption.CreateDefaults();
+    private readonly VLCMediaPlayer.LibVLCVideoLockCb _playbackVideoLockCallback;
+    private readonly VLCMediaPlayer.LibVLCVideoUnlockCb _playbackVideoUnlockCallback;
+    private readonly VLCMediaPlayer.LibVLCVideoDisplayCb _playbackVideoDisplayCallback;
 
     private LibVLC? _libVlc;
     private VLCMediaPlayer? _mediaPlayer;
     private Media? _previewMedia;
     private WriteableBitmap? _liveBitmap;
+    private WriteableBitmap? _playbackBitmap;
     private RecordingSession? _recordingSession;
     private CapturedTake? _capturedTake;
     private string? _pendingTakeDirectory;
@@ -60,6 +67,21 @@ public partial class MainWindow : Window
     private GCLatencyMode? _recordingLatencyModeRestore;
     private bool _isClosing;
     private string? _lastExportPath;
+    private long _playbackPositionMilliseconds;
+    private long _playbackDurationMilliseconds;
+    private bool _playbackReachedEnd;
+    private IntPtr _playbackBuffer = IntPtr.Zero;
+    private IntPtr _playbackBufferRaw = IntPtr.Zero;
+    private int _playbackBufferSize;
+    private int _playbackBufferPitch;
+    private int _playbackBufferWidth;
+    private int _playbackBufferHeight;
+    private readonly object _playbackSurfaceGate = new();
+    private readonly object _playbackRenderGate = new();
+    private PlaybackFrameBuffer? _pendingPlaybackFrame;
+    private bool _playbackRenderQueued;
+
+    private readonly record struct PlaybackFrameBuffer(byte[] Buffer, int Width, int Height, int Pitch, int Size);
 
     public MainWindow()
     {
@@ -72,10 +94,13 @@ public partial class MainWindow : Window
 
         _libVlc = new LibVLC("--no-video-title-show");
         _mediaPlayer = new VLCMediaPlayer(_libVlc);
+        _playbackVideoLockCallback = PlaybackVideo_OnLock;
+        _playbackVideoUnlockCallback = PlaybackVideo_OnUnlock;
+        _playbackVideoDisplayCallback = PlaybackVideo_OnDisplay;
         _mediaPlayer.TimeChanged += MediaPlayer_OnTimeChanged;
         _mediaPlayer.LengthChanged += MediaPlayer_OnLengthChanged;
         _mediaPlayer.EndReached += MediaPlayer_OnEndReached;
-        PlaybackVideoView.MediaPlayer = _mediaPlayer;
+        _mediaPlayer.SetVideoCallbacks(_playbackVideoLockCallback, _playbackVideoUnlockCallback, _playbackVideoDisplayCallback);
 
         BuildButtonContent();
 
@@ -195,11 +220,20 @@ public partial class MainWindow : Window
 
     private void RemoveButton_OnClick(object sender, RoutedEventArgs e) => _ = RemoveCapturedTakeAsync();
 
-    private void BackwardButton_OnClick(object sender, RoutedEventArgs e) => StepPlayback(-5000);
+    private async void BackwardButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        await StepPlaybackAsync(-5000).ConfigureAwait(true);
+    }
 
-    private void PlayPauseButton_OnClick(object sender, RoutedEventArgs e) => TogglePlayback();
+    private async void PlayPauseButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        await TogglePlaybackAsync().ConfigureAwait(true);
+    }
 
-    private void ForwardButton_OnClick(object sender, RoutedEventArgs e) => StepPlayback(5000);
+    private async void ForwardButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        await StepPlaybackAsync(5000).ConfigureAwait(true);
+    }
 
     private void EncodeButton_OnClick(object sender, RoutedEventArgs e) => _ = BeginEncodingAsync();
 
@@ -341,7 +375,21 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("録画の一時保存先が初期化されていません。");
             }
 
-            var finalizedPreviewPath = await session.FinalizeAsync(_videoExportService, CancellationToken.None).ConfigureAwait(true);
+            _encodingProgressPercent = 0;
+            _uiMode = UiMode.Encoding;
+            UpdateUiState();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+
+            _encodeCancellationSource?.Dispose();
+            _encodeCancellationSource = new CancellationTokenSource();
+            var progress = new Progress<EncodeProgress>(HandleEncodeProgress);
+            var finalizeTask = session.FinalizeAsync(
+                _videoExportService,
+                progress,
+                _encodeCancellationSource.Token);
+            _encodeTask = finalizeTask;
+
+            var finalizedPreviewPath = await finalizeTask.ConfigureAwait(true);
             var sidecarPath = BuildAlphaSidecarPath(finalizedPreviewPath);
             if (!File.Exists(sidecarPath))
             {
@@ -353,22 +401,37 @@ public partial class MainWindow : Window
                 _encoderSettings,
                 takeDirectory,
                 finalizedPreviewPath,
-                sidecarPath);
+                sidecarPath,
+                session.RecordedWidth,
+                session.RecordedHeight);
 
             _pendingTakeDirectory = null;
             _pendingPreviewPath = null;
-            _uiMode = UiMode.PlaybackPaused;
-            LoadCapturedTakePreview(finalizedPreviewPath);
             _lastExportPath = null;
+            _uiMode = UiMode.PlaybackPaused;
+            UpdateUiState();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
+            await LoadCapturedTakePreviewAsync(finalizedPreviewPath, startPlaying: false).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException)
+        {
+            _uiMode = _latestStatus?.IsConnected == true ? UiMode.Receiving : UiMode.NoSignal;
+            UpdateUiState();
         }
         catch (Exception ex)
         {
-            await AbortRecordingAsync(showError: true, errorMessage: ex.Message).ConfigureAwait(true);
-            return;
+            _uiMode = _latestStatus?.IsConnected == true ? UiMode.Receiving : UiMode.NoSignal;
+            UpdateUiState();
+            MessageBox.Show(this, ex.Message, "Spout Direct Saver", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
+            _encodeTask = null;
+            _encodeCancellationSource?.Dispose();
+            _encodeCancellationSource = null;
             await TryDisposeSessionAsync(session).ConfigureAwait(true);
+            _pendingTakeDirectory = null;
+            _pendingPreviewPath = null;
             ClearRecordingState();
             EndRecordingLatencyScope();
             UpdateUiState();
@@ -461,18 +524,21 @@ public partial class MainWindow : Window
         UpdateUiState();
     }
 
-    private async Task BeginEncodingAsync()
+    private async Task BeginEncodingAsync(bool launchFromRecording = false)
     {
         if (_capturedTake is null || _uiMode is UiMode.Encoding)
         {
             return;
         }
 
-        PausePlayback();
+        if (!launchFromRecording)
+        {
+            PausePlayback();
+        }
 
         var dialog = new SaveFileDialog
         {
-            Title = "Save Encoded File",
+            Title = "Save Recording",
             Filter = _capturedTake.EncoderOption.FileDialogFilter,
             DefaultExt = _capturedTake.EncoderOption.Extension,
             AddExtension = true,
@@ -498,6 +564,7 @@ public partial class MainWindow : Window
         _encodingProgressPercent = 0;
         _uiMode = UiMode.Encoding;
         UpdateUiState();
+        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
 
         _encodeCancellationSource?.Dispose();
         _encodeCancellationSource = new CancellationTokenSource();
@@ -508,7 +575,8 @@ public partial class MainWindow : Window
         try
         {
             await _encodeTask.ConfigureAwait(true);
-            _uiMode = UiMode.Encoded;
+            await DisposeCapturedTakeAsync().ConfigureAwait(true);
+            _uiMode = _latestStatus?.IsConnected == true ? UiMode.Receiving : UiMode.NoSignal;
         }
         catch (OperationCanceledException)
         {
@@ -566,7 +634,7 @@ public partial class MainWindow : Window
             cancellationToken).ConfigureAwait(true);
     }
 
-    private void TogglePlayback()
+    private async Task TogglePlaybackAsync()
     {
         if (_mediaPlayer is null || _capturedTake is null)
         {
@@ -579,6 +647,13 @@ public partial class MainWindow : Window
         }
         else
         {
+            if (_playbackReachedEnd || IsPlaybackAtEnd())
+            {
+                await LoadCapturedTakePreviewAsync(_capturedTake.PreviewVideoPath, startPlaying: true).ConfigureAwait(true);
+                return;
+            }
+
+            _playbackReachedEnd = false;
             _mediaPlayer.Play();
             _uiMode = UiMode.PlaybackPlaying;
             UpdateUiState();
@@ -592,46 +667,75 @@ public partial class MainWindow : Window
             return;
         }
 
-        _mediaPlayer.Pause();
+        _playbackPositionMilliseconds = GetPlaybackPositionMilliseconds();
+        _playbackReachedEnd = false;
+        if (_mediaPlayer.IsPlaying)
+        {
+            _mediaPlayer.Pause();
+        }
+
         _uiMode = UiMode.PlaybackPaused;
         UpdateUiState();
     }
 
-    private void StepPlayback(int deltaMilliseconds)
+    private async Task StepPlaybackAsync(int deltaMilliseconds)
     {
         if (_mediaPlayer is null || _capturedTake is null)
         {
             return;
         }
 
-        var current = Math.Max(_mediaPlayer.Time, 0);
-        var length = Math.Max(_mediaPlayer.Length, 0);
+        var current = _playbackReachedEnd
+            ? GetPlaybackLengthMilliseconds()
+            : GetPlaybackPositionMilliseconds();
+        var length = GetPlaybackLengthMilliseconds();
         if (length <= 0)
         {
             return;
         }
 
         var target = Math.Clamp(current + deltaMilliseconds, 0, length);
-        _mediaPlayer.Time = target;
-        if (_uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused)
-        {
-            SecondaryValueTextBlock.Text = FormatTime(TimeSpan.FromMilliseconds(target));
-        }
+        await SeekPlaybackToAsync(target, shouldPlay: _uiMode == UiMode.PlaybackPlaying).ConfigureAwait(true);
     }
 
-    private void LoadCapturedTakePreview(string previewPath)
+    private async Task LoadCapturedTakePreviewAsync(string previewPath)
     {
-        if (_mediaPlayer is null || _libVlc is null)
+        await LoadCapturedTakePreviewAsync(previewPath, startPlaying: false).ConfigureAwait(true);
+    }
+
+    private async Task LoadCapturedTakePreviewAsync(string previewPath, bool startPlaying)
+    {
+        if (_mediaPlayer is null || _libVlc is null || _capturedTake is null)
         {
             return;
         }
 
         StopPreviewPlayback();
+        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
 
         _previewMedia = new Media(_libVlc, new Uri(previewPath, UriKind.Absolute));
+        await _previewMedia.Parse(MediaParseOptions.ParseLocal, 3000, CancellationToken.None).ConfigureAwait(true);
+        ConfigurePlaybackSurface(_capturedTake.VideoWidth, _capturedTake.VideoHeight);
+        _playbackPositionMilliseconds = 0;
+        _playbackDurationMilliseconds = 0;
+        _playbackReachedEnd = false;
         _mediaPlayer.Play(_previewMedia);
-        _mediaPlayer.Pause();
-        _mediaPlayer.Time = 0;
+
+        if (!startPlaying)
+        {
+            await Task.Delay(50).ConfigureAwait(true);
+            _mediaPlayer.Pause();
+            _mediaPlayer.SeekTo(TimeSpan.Zero);
+            _playbackPositionMilliseconds = 0;
+            _uiMode = UiMode.PlaybackPaused;
+        }
+        else
+        {
+            _uiMode = UiMode.PlaybackPlaying;
+        }
+
+        _playbackDurationMilliseconds = Math.Max(_previewMedia.Duration, 0);
+        UpdateUiState();
     }
 
     private void StopPreviewPlayback()
@@ -643,6 +747,10 @@ public partial class MainWindow : Window
 
         _previewMedia?.Dispose();
         _previewMedia = null;
+        DisposePlaybackSurface();
+        _playbackPositionMilliseconds = 0;
+        _playbackDurationMilliseconds = 0;
+        _playbackReachedEnd = false;
     }
 
     private void RenderLivePreview(LivePreviewFrame frame)
@@ -662,11 +770,173 @@ public partial class MainWindow : Window
         NoSignalOverlayTextBlock.Visibility = Visibility.Collapsed;
     }
 
+    private void ConfigurePlaybackSurface(uint width, uint height)
+    {
+        if (_mediaPlayer is null || width == 0 || height == 0)
+        {
+            return;
+        }
+
+        lock (_playbackSurfaceGate)
+        {
+            _playbackBufferWidth = (int)width;
+            _playbackBufferHeight = (int)height;
+            _playbackBufferPitch = checked((int)width * 4);
+            _playbackBufferSize = checked(_playbackBufferPitch * _playbackBufferHeight);
+
+            if (_playbackBufferRaw != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_playbackBufferRaw);
+                _playbackBufferRaw = IntPtr.Zero;
+            }
+
+            var allocationSize = _playbackBufferSize + 32;
+            _playbackBufferRaw = Marshal.AllocHGlobal(allocationSize);
+            _playbackBuffer = AlignPointer(_playbackBufferRaw, 32);
+
+            _playbackBitmap = new WriteableBitmap(_playbackBufferWidth, _playbackBufferHeight, 96, 96, PixelFormats.Bgra32, null);
+            PlaybackImage.Source = _playbackBitmap;
+
+            _mediaPlayer.SetVideoFormat("RV32", width, height, (uint)_playbackBufferPitch);
+        }
+    }
+
+    private void DisposePlaybackSurface()
+    {
+        lock (_playbackSurfaceGate)
+        {
+            PlaybackImage.Source = null;
+            _playbackBitmap = null;
+            _playbackBufferWidth = 0;
+            _playbackBufferHeight = 0;
+            _playbackBufferPitch = 0;
+            _playbackBufferSize = 0;
+            _playbackBuffer = IntPtr.Zero;
+
+            if (_playbackBufferRaw != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_playbackBufferRaw);
+                _playbackBufferRaw = IntPtr.Zero;
+            }
+        }
+
+        lock (_playbackRenderGate)
+        {
+            if (_pendingPlaybackFrame is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_pendingPlaybackFrame.Value.Buffer);
+                _pendingPlaybackFrame = null;
+            }
+
+            _playbackRenderQueued = false;
+        }
+    }
+
+    private IntPtr PlaybackVideo_OnLock(IntPtr opaque, IntPtr planes)
+    {
+        lock (_playbackSurfaceGate)
+        {
+            if (_playbackBuffer == IntPtr.Zero || planes == IntPtr.Zero)
+            {
+                return IntPtr.Zero;
+            }
+
+            Marshal.WriteIntPtr(planes, _playbackBuffer);
+            return _playbackBuffer;
+        }
+    }
+
+    private void PlaybackVideo_OnUnlock(IntPtr opaque, IntPtr picture, IntPtr planes)
+    {
+        // No-op. The UI thread copies the buffer during the display callback.
+    }
+
+    private void PlaybackVideo_OnDisplay(IntPtr opaque, IntPtr picture)
+    {
+        byte[]? frameCopy = null;
+        var frameWidth = 0;
+        var frameHeight = 0;
+        var framePitch = 0;
+        var frameSize = 0;
+
+        lock (_playbackSurfaceGate)
+        {
+            if (_playbackBitmap is null || _playbackBuffer == IntPtr.Zero || _playbackBufferSize <= 0)
+            {
+                return;
+            }
+
+            frameCopy = ArrayPool<byte>.Shared.Rent(_playbackBufferSize);
+            Marshal.Copy(_playbackBuffer, frameCopy, 0, _playbackBufferSize);
+            frameWidth = _playbackBufferWidth;
+            frameHeight = _playbackBufferHeight;
+            framePitch = _playbackBufferPitch;
+            frameSize = _playbackBufferSize;
+        }
+
+        lock (_playbackRenderGate)
+        {
+            if (_pendingPlaybackFrame is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_pendingPlaybackFrame.Value.Buffer);
+            }
+
+            _pendingPlaybackFrame = new PlaybackFrameBuffer(frameCopy!, frameWidth, frameHeight, framePitch, frameSize);
+            if (_playbackRenderQueued)
+            {
+                return;
+            }
+
+            _playbackRenderQueued = true;
+        }
+
+        Dispatcher.BeginInvoke(ProcessPlaybackRenderQueue, DispatcherPriority.Render);
+    }
+
+    private void ProcessPlaybackRenderQueue()
+    {
+        while (true)
+        {
+            PlaybackFrameBuffer? frame;
+
+            lock (_playbackRenderGate)
+            {
+                frame = _pendingPlaybackFrame;
+                _pendingPlaybackFrame = null;
+                if (frame is null)
+                {
+                    _playbackRenderQueued = false;
+                    return;
+                }
+            }
+
+            try
+            {
+                var bitmap = _playbackBitmap;
+                if (bitmap is not null && frame.Value.Size > 0)
+                {
+                    var rect = new Int32Rect(0, 0, frame.Value.Width, frame.Value.Height);
+                    bitmap.WritePixels(rect, frame.Value.Buffer, frame.Value.Pitch, 0);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(frame.Value.Buffer);
+            }
+        }
+    }
+
     private void MediaPlayer_OnTimeChanged(object? sender, MediaPlayerTimeChangedEventArgs e)
     {
         if (_uiMode is not UiMode.PlaybackPlaying and not UiMode.PlaybackPaused)
         {
             return;
+        }
+
+        _playbackPositionMilliseconds = Math.Max(e.Time, 0);
+        if (_playbackDurationMilliseconds > 0 && _playbackPositionMilliseconds < _playbackDurationMilliseconds)
+        {
+            _playbackReachedEnd = false;
         }
 
         _ = Dispatcher.BeginInvoke(UpdateStateMetrics);
@@ -679,6 +949,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        _playbackDurationMilliseconds = Math.Max(e.Length, 0);
         _ = Dispatcher.BeginInvoke(UpdateStateMetrics);
     }
 
@@ -691,6 +962,8 @@ public partial class MainWindow : Window
 
         _ = Dispatcher.BeginInvoke(() =>
         {
+            _playbackPositionMilliseconds = _playbackDurationMilliseconds;
+            _playbackReachedEnd = true;
             _uiMode = UiMode.PlaybackPaused;
             UpdateUiState();
         });
@@ -698,20 +971,20 @@ public partial class MainWindow : Window
 
     private void BuildButtonContent()
     {
-        RecordButton.Content = CreateButtonContent("⏺", "Record");
-        SettingsButton.Content = CreateButtonContent("⚙", "Settings");
-        DoneButton.Content = CreateButtonContent("✓", "Done");
-        PauseResumeButton.Content = CreateButtonContent("⏸", "Pause");
-        RemoveButton.Content = CreateButtonContent("⌦", "Remove");
-        BackwardButton.Content = CreateButtonContent("↺5", "Backward", 36);
-        PlayPauseButton.Content = CreateButtonContent("▶", "Play");
-        ForwardButton.Content = CreateButtonContent("5↻", "Forward", 36);
-        EncodeButton.Content = CreateButtonContent("↪", "Encode");
-        CancelButton.Content = CreateButtonContent("✕", "Cancel");
-        ContinueButton.Content = CreateButtonContent("✓", "Continue");
+        RecordButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.CameraVideoFill), "Record");
+        SettingsButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.GearFill), "Settings");
+        DoneButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.CheckLg), "Done");
+        PauseResumeButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.PauseFill), "Pause");
+        RemoveButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.Trash3Fill), "Remove");
+        BackwardButton.Content = CreateButtonContent(CreateCounterArrowIcon(PackIconBootstrapIconsKind.ArrowCounterclockwise, "5"), "Backward");
+        PlayPauseButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.PlayFill), "Play");
+        ForwardButton.Content = CreateButtonContent(CreateCounterArrowIcon(PackIconBootstrapIconsKind.ArrowClockwise, "5"), "Forward");
+        EncodeButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.FloppyFill), "Save");
+        CancelButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.XLg), "Cancel");
+        ContinueButton.Content = CreateButtonContent(CreateIcon(PackIconBootstrapIconsKind.CheckLg), "Continue");
     }
 
-    private static UIElement CreateButtonContent(string icon, string label, double iconFontSize = 42)
+    private static UIElement CreateButtonContent(UIElement icon, string label)
     {
         var panel = new StackPanel
         {
@@ -720,15 +993,7 @@ public partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center
         };
 
-        panel.Children.Add(new TextBlock
-        {
-            Text = icon,
-            FontFamily = new FontFamily("Segoe UI Symbol"),
-            FontSize = iconFontSize,
-            FontWeight = FontWeights.Bold,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            TextAlignment = TextAlignment.Center
-        });
+        panel.Children.Add(icon);
 
         panel.Children.Add(new TextBlock
         {
@@ -760,9 +1025,7 @@ public partial class MainWindow : Window
         EncodingActionsPanel.Visibility = _uiMode == UiMode.Encoding
             ? Visibility.Visible
             : Visibility.Collapsed;
-        EncodedActionsPanel.Visibility = _uiMode == UiMode.Encoded
-            ? Visibility.Visible
-            : Visibility.Collapsed;
+        EncodedActionsPanel.Visibility = Visibility.Collapsed;
 
         var connected = _latestStatus?.IsConnected == true;
         RecordButton.IsEnabled = isInitial && connected && _capturedTake is null && _recordingSession is null;
@@ -776,20 +1039,25 @@ public partial class MainWindow : Window
         ForwardButton.IsEnabled = RemoveButton.IsEnabled;
         EncodeButton.IsEnabled = RemoveButton.IsEnabled && _uiMode != UiMode.Encoding;
         CancelButton.IsEnabled = _uiMode == UiMode.Encoding;
-        ContinueButton.IsEnabled = _uiMode == UiMode.Encoded;
+        ContinueButton.IsEnabled = false;
 
         PauseResumeButton.Content = CreateButtonContent(
-            _uiMode == UiMode.RecordingPaused ? "▶" : "⏸",
+            CreateIcon(_uiMode == UiMode.RecordingPaused
+                ? PackIconBootstrapIconsKind.PlayFill
+                : PackIconBootstrapIconsKind.PauseFill),
             _uiMode == UiMode.RecordingPaused ? "Resume" : "Pause");
 
         PlayPauseButton.Content = CreateButtonContent(
-            _uiMode == UiMode.PlaybackPlaying ? "⏸" : "▶",
+            CreateIcon(_uiMode == UiMode.PlaybackPlaying
+                ? PackIconBootstrapIconsKind.PauseFill
+                : PackIconBootstrapIconsKind.PlayFill),
             _uiMode == UiMode.PlaybackPlaying ? "Pause" : "Play");
 
         UpdateInitialMetrics();
         UpdateStateMetrics();
         UpdateStageVisibility();
         UpdateEncodingProgressVisual();
+        _recordingTimer.IsEnabled = _uiMode is UiMode.Recording or UiMode.RecordingPaused or UiMode.PlaybackPlaying or UiMode.PlaybackPaused;
     }
 
     private void UpdateInitialMetrics()
@@ -837,7 +1105,7 @@ public partial class MainWindow : Window
             case UiMode.PlaybackPaused:
                 StateValueTextBlock.Text = "Playback";
                 SecondaryLabelTextBlock.Text = "Duration";
-                SecondaryValueTextBlock.Text = FormatTime(TimeSpan.FromMilliseconds(Math.Max(_mediaPlayer?.Time ?? 0, 0)));
+                SecondaryValueTextBlock.Text = FormatTime(TimeSpan.FromMilliseconds(GetPlaybackPositionMilliseconds()));
                 break;
             case UiMode.Encoding:
             case UiMode.Encoded:
@@ -852,21 +1120,38 @@ public partial class MainWindow : Window
     {
         var showLivePreview = _uiMode == UiMode.Receiving && _liveBitmap is not null;
         LivePreviewImage.Visibility = showLivePreview ? Visibility.Visible : Visibility.Collapsed;
-        PlaybackVideoView.Visibility = _uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused
+        PlaybackImage.Visibility = _uiMode is UiMode.PlaybackPlaying or UiMode.PlaybackPaused
             ? Visibility.Visible
             : Visibility.Collapsed;
         NoSignalOverlayTextBlock.Visibility = _uiMode == UiMode.NoSignal ? Visibility.Visible : Visibility.Collapsed;
+        RecordingOverlayPanel.Visibility = _uiMode is UiMode.Recording or UiMode.RecordingPaused
+            ? Visibility.Visible
+            : Visibility.Collapsed;
         EncodingOverlayPanel.Visibility = _uiMode == UiMode.Encoding ? Visibility.Visible : Visibility.Collapsed;
-        DoneOverlayTextBlock.Visibility = _uiMode == UiMode.Encoded ? Visibility.Visible : Visibility.Collapsed;
+        DoneOverlayTextBlock.Visibility = Visibility.Collapsed;
 
         if (_uiMode is UiMode.Recording or UiMode.RecordingPaused)
         {
             LivePreviewImage.Visibility = Visibility.Collapsed;
-            PlaybackVideoView.Visibility = Visibility.Collapsed;
+            PlaybackImage.Visibility = Visibility.Collapsed;
             NoSignalOverlayTextBlock.Visibility = Visibility.Collapsed;
-            EncodingOverlayPanel.Visibility = Visibility.Collapsed;
             DoneOverlayTextBlock.Visibility = Visibility.Collapsed;
+            RecordingOverlayTitleTextBlock.Text = _uiMode == UiMode.RecordingPaused
+                ? "Recording paused"
+                : "Recording in progress";
+            RecordingOverlayBodyTextBlock.Text = "Live preview is stopped while recording.";
         }
+    }
+
+    private void PreviewViewportBorder_OnSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (sender is not FrameworkElement element)
+        {
+            return;
+        }
+
+        var radius = 24.0;
+        element.Clip = new RectangleGeometry(new Rect(0, 0, element.ActualWidth, element.ActualHeight), radius, radius);
     }
 
     private void UpdateEncodingProgressVisual()
@@ -886,12 +1171,33 @@ public partial class MainWindow : Window
 
     private void UpdateRecordingElapsed()
     {
-        if (_uiMode is not UiMode.Recording and not UiMode.RecordingPaused)
+        if (_uiMode is UiMode.Recording or UiMode.RecordingPaused)
+        {
+            SecondaryValueTextBlock.Text = FormatTime(GetRecordingElapsed());
+            return;
+        }
+
+        if (_uiMode is not UiMode.PlaybackPlaying and not UiMode.PlaybackPaused)
         {
             return;
         }
 
-        SecondaryValueTextBlock.Text = FormatTime(GetRecordingElapsed());
+        _playbackPositionMilliseconds = GetPlaybackPositionMilliseconds();
+        _playbackDurationMilliseconds = GetPlaybackLengthMilliseconds();
+
+        if (_uiMode == UiMode.PlaybackPlaying &&
+            _playbackDurationMilliseconds > 0 &&
+            _playbackPositionMilliseconds >= _playbackDurationMilliseconds - 250 &&
+            _mediaPlayer is not null &&
+            !_mediaPlayer.IsPlaying)
+        {
+            _playbackReachedEnd = true;
+            _uiMode = UiMode.PlaybackPaused;
+            UpdateUiState();
+            return;
+        }
+
+        UpdateStateMetrics();
     }
 
     private TimeSpan GetRecordingElapsed()
@@ -1016,6 +1322,122 @@ public partial class MainWindow : Window
     {
         var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
         return $"spout_capture_{stamp}{option.Extension}";
+    }
+
+    private async Task SeekPlaybackToAsync(long targetMilliseconds, bool shouldPlay)
+    {
+        if (_mediaPlayer is null || _previewMedia is null || _capturedTake is null)
+        {
+            return;
+        }
+
+        var length = GetPlaybackLengthMilliseconds();
+        if (length <= 0)
+        {
+            return;
+        }
+
+        var clampedTarget = Math.Clamp(targetMilliseconds, 0, length);
+        var effectiveTarget = Math.Min(clampedTarget, Math.Max(length - 1, 0));
+
+        _playbackReachedEnd = false;
+        _playbackPositionMilliseconds = clampedTarget;
+
+        _mediaPlayer.SeekTo(TimeSpan.FromMilliseconds(effectiveTarget));
+        await Task.Delay(40).ConfigureAwait(true);
+
+        if (shouldPlay)
+        {
+            _mediaPlayer.Play();
+            _uiMode = UiMode.PlaybackPlaying;
+        }
+        else
+        {
+            if (_mediaPlayer.IsPlaying)
+            {
+                _mediaPlayer.Pause();
+            }
+
+            _uiMode = UiMode.PlaybackPaused;
+        }
+
+        UpdateUiState();
+    }
+
+    private long GetPlaybackPositionMilliseconds()
+    {
+        if (_playbackReachedEnd)
+        {
+            return GetPlaybackLengthMilliseconds();
+        }
+
+        return Math.Max(_playbackPositionMilliseconds, Math.Max(_mediaPlayer?.Time ?? 0, 0));
+    }
+
+    private long GetPlaybackLengthMilliseconds()
+    {
+        return Math.Max(_playbackDurationMilliseconds, Math.Max(_mediaPlayer?.Length ?? 0, 0));
+    }
+
+    private bool IsPlaybackAtEnd()
+    {
+        var length = GetPlaybackLengthMilliseconds();
+        if (length <= 0)
+        {
+            return false;
+        }
+
+        return GetPlaybackPositionMilliseconds() >= length - 250;
+    }
+
+    private static IntPtr AlignPointer(IntPtr pointer, int alignment)
+    {
+        var value = pointer.ToInt64();
+        var aligned = (value + alignment - 1) & -alignment;
+        return new IntPtr(aligned);
+    }
+
+    private static UIElement CreateIcon(PackIconBootstrapIconsKind kind, double size = 42)
+    {
+        return new PackIconBootstrapIcons
+        {
+            Kind = kind,
+            Width = size,
+            Height = size,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+    }
+
+    private static UIElement CreateCounterArrowIcon(PackIconBootstrapIconsKind kind, string counterText)
+    {
+        var grid = new Grid
+        {
+            Width = 48,
+            Height = 48
+        };
+
+        grid.Children.Add(new PackIconBootstrapIcons
+        {
+            Kind = kind,
+            Width = 40,
+            Height = 40,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        grid.Children.Add(new TextBlock
+        {
+            Text = counterText,
+            Margin = new Thickness(0, 1, 0, 0),
+            FontSize = 15,
+            FontWeight = FontWeights.Bold,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextAlignment = TextAlignment.Center
+        });
+
+        return grid;
     }
 
     private EncoderOption ResolveEncoderOption(EncoderProfileKind kind)

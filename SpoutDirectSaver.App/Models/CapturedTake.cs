@@ -11,13 +11,17 @@ internal sealed class CapturedTake : IAsyncDisposable
         EncoderSettingsRoot encoderSettings,
         string takeDirectory,
         string previewVideoPath,
-        string? previewSidecarPath)
+        string? previewSidecarPath,
+        uint videoWidth,
+        uint videoHeight)
     {
         EncoderOption = encoderOption;
         EncoderSettings = encoderSettings.Clone();
         TakeDirectory = takeDirectory;
         PreviewVideoPath = previewVideoPath;
         PreviewSidecarPath = previewSidecarPath;
+        VideoWidth = videoWidth;
+        VideoHeight = videoHeight;
         CreatedAt = DateTimeOffset.UtcNow;
     }
 
@@ -30,6 +34,10 @@ internal sealed class CapturedTake : IAsyncDisposable
     public string PreviewVideoPath { get; }
 
     public string? PreviewSidecarPath { get; }
+
+    public uint VideoWidth { get; }
+
+    public uint VideoHeight { get; }
 
     public DateTimeOffset CreatedAt { get; }
 
